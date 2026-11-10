@@ -113,19 +113,30 @@ def process_single_question(
     prompt_builder: PromptBuilder,
     max_retries: int,
     timeout: float,
+    parser: Optional[SchemaParser] = None,
 ) -> Any:
     """Process a single question through agent generation, execution, and self-correction."""
     q_id = q_data.get("id") or q_data.get("question_id") or "unknown"
     question_text = q_data.get("question") or q_data.get("text") or ""
+
+    # Dynamically resolve business_id context if present
+    biz_id = q_data.get("business_id") or q_data.get("db_id")
+    if biz_id and parser:
+        active_context = parser.parse(business_id=biz_id)
+        active_schema_str = active_context.to_prompt_context()
+    else:
+        active_context = dataset_context
+        active_schema_str = schema_prompt_str
+
     # Extract reference as_of_date if specified at question level, otherwise use dataset default
-    q_as_of = q_data.get("as_of_date") or dataset_context.as_of_date
+    q_as_of = q_data.get("as_of_date") or active_context.as_of_date
 
     # 1. Compose user prompt
     user_prompt = prompt_builder.build_user_prompt(
         question=question_text,
-        schema_context=schema_prompt_str,
+        schema_context=active_schema_str,
         as_of_date=q_as_of,
-        file_map=dataset_context.file_map,
+        file_map=active_context.file_map,
     )
     system_prompt = prompt_builder.build_system_prompt()
 
@@ -135,8 +146,8 @@ def process_single_question(
     # 3. Sandboxed execution
     exec_result = executor.execute(
         code=code,
-        data_dir=dataset_context.data_dir,
-        file_map=dataset_context.file_map,
+        data_dir=active_context.data_dir,
+        file_map=active_context.file_map,
         as_of_date=q_as_of,
         timeout_seconds=timeout,
     )
@@ -235,6 +246,7 @@ def main() -> None:
                     prompt_builder=prompt_builder,
                     max_retries=args.max_retries,
                     timeout=args.timeout,
+                    parser=parser,
                 )
             except Exception as e:
                 logger.error(f"Unexpected exception processing {q_id}: {e}")

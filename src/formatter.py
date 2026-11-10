@@ -76,17 +76,19 @@ def unwrap_container(val: Any) -> Any:
             if val.empty:
                 return None
             if val.shape == (1, 1):
-                return val.iloc[0, 0]
-            if val.shape[0] == 1:
+                val = val.iloc[0, 0]
+            elif val.shape[0] == 1:
                 return val.iloc[0].to_dict()
-            return val.to_dict(orient="records")
+            else:
+                return val.to_dict(orient="records")
 
         if isinstance(val, pd.Series):
             if val.empty:
                 return None
             if len(val) == 1:
-                return val.iloc[0]
-            return val.tolist()
+                val = val.iloc[0]
+            else:
+                return val.tolist()
 
     if _HAS_NUMPY:
         if isinstance(val, np.generic):
