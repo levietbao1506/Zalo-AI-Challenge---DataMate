@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from src.agent import VLLMAgent
 from src.executor import SandboxedExecutor
-from src.formatter import format_scalar
+from src.formatter import format_output, format_scalar, format_submission_record
 from src.prompt_builder import PromptBuilder
 from src.schema_parser import DatasetContext, SchemaParser
 
@@ -157,10 +157,16 @@ def process_single_question(
         timeout_seconds=timeout,
     )
 
-    # 5. Normalize output per competition rules
-    # If execution failed after retries, format_scalar will fall back to abstain (None/null)
+    # 5. Normalize output per competition rules (Step 5 Formatter & Abstain)
+    # If execution failed after retries, format_output will fall back to "abstain"
     raw_result = exec_result.result if exec_result.success else None
-    formatted_answer = format_scalar(raw_result, round_decimals=2, abstain_fallback=None)
+    formatted_answer = format_output(
+        val=raw_result,
+        success=exec_result.success,
+        round_decimals=2,
+        abstain_token="abstain",
+        clean_text=False,
+    )
 
     return formatted_answer
 
@@ -237,14 +243,17 @@ def main() -> None:
             except Exception as e:
                 logger.error(f"Unexpected exception processing {q_id}: {e}")
                 # Safe abstain on catastrophic failure to avoid penalized accuracy penalty
-                answer = None
+                answer = "abstain"
 
-            if answer is None:
+            if answer is None or answer == "abstain":
                 abstained_count += 1
+                answer = "abstain"
             else:
                 answered_count += 1
 
-            record = {"id": q_id, "answer": answer}
+            # Format dictionary containing id, type, answer
+            q_type = q_data.get("type")
+            record = format_submission_record(q_id=q_id, answer=answer, q_type=q_type, abstain_token="abstain")
             out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
             out_f.flush()
 
