@@ -70,8 +70,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--max_retries",
         type=int,
-        default=1,
-        help="Maximum self-correction retries for code execution errors (default: 1)",
+        default=3,
+        help="Maximum self-correction retries for code execution errors (default: 3)",
     )
     parser.add_argument(
         "--dry_run",
@@ -143,33 +143,19 @@ def process_single_question(
     # 2. Agent generates code
     code = agent.generate_code(user_prompt, system_prompt=system_prompt)
 
-    # 3. Sandboxed execution
-    exec_result = executor.execute(
-        code=code,
+    # 3. Sandboxed execution with self-correction retry loop (up to max_retries = 3)
+    exec_result = executor.execute_with_self_correction(
+        agent=agent,
+        initial_code=code,
+        question=question_text,
+        prompt_builder=prompt_builder,
+        system_prompt=system_prompt,
         data_dir=active_context.data_dir,
         file_map=active_context.file_map,
         as_of_date=q_as_of,
+        max_retries=max_retries,
         timeout_seconds=timeout,
     )
-
-    # 4. Self-correction retry loop if execution encounters syntax/runtime error
-    attempts_left = max_retries
-    while not exec_result.success and attempts_left > 0:
-        logger.info(f"Question [{q_id}] failed. Retrying with error feedback ({attempts_left} left)...")
-        retry_prompt = prompt_builder.build_retry_prompt(
-            question=question_text,
-            previous_code=code,
-            error_traceback=exec_result.error or "Unknown error",
-        )
-        code = agent.generate_code(retry_prompt, system_prompt=system_prompt)
-        exec_result = executor.execute(
-            code=code,
-            data_dir=dataset_context.data_dir,
-            file_map=dataset_context.file_map,
-            as_of_date=q_as_of,
-            timeout_seconds=timeout,
-        )
-        attempts_left -= 1
 
     # 5. Normalize output per competition rules
     # If execution failed after retries, format_scalar will fall back to abstain (None/null)

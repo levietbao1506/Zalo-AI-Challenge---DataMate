@@ -242,16 +242,24 @@ class PromptBuilder:
         Returns:
             Refinement prompt string.
         """
+        # Extract a short error message (e.g. KeyError: 'revenue')
+        error_msg = error_traceback.strip().splitlines()[-1] if error_traceback.strip() else "Unknown error"
+        if ":" in error_traceback.strip().splitlines()[0]:
+            first_line = error_traceback.strip().splitlines()[0]
+            if any(first_line.startswith(err) for err in ("KeyError", "IndexError", "TypeError", "ValueError", "SyntaxError", "ZeroDivisionError", "NameError")):
+                error_msg = first_line
+
         # Truncate traceback if overly long to prevent token overflow
         tb_snippet = error_traceback.strip()
         if len(tb_snippet) > 1200:
             tb_snippet = tb_snippet[-1200:]
 
         return (
-            f"Mã Python trước đó của bạn đã gặp lỗi khi thực thi cho câu hỏi: \"{question}\"\n\n"
+            f"Đoạn code trên bị lỗi: {error_msg}. Hãy viết lại code sửa lỗi.\n\n"
+            f"**CÂU HỎI:** \"{question}\"\n\n"
             f"**MÃ ĐÃ CHẠY:**\n```python\n{previous_code}\n```\n\n"
-            f"**THÔNG BÁO LỖI (TRACEBACK):**\n```\n{tb_snippet}\n```\n\n"
-            "Hãy phân tích lỗi trên, sửa lại toàn bộ mã Python và gán kết quả vào `result`.\n"
+            f"**CHI TIẾT LỖI:**\n```\n{tb_snippet}\n```\n\n"
+            "Hãy phân tích lỗi trên, sửa lại toàn bộ mã Python (dùng pandas) và gán kết quả vào `result`.\n"
             "Nếu sau khi xem xét bạn nhận thấy dữ liệu thực sự không hỗ trợ trả lời câu hỏi, hãy gán `result = None`.\n"
-            "Chỉ trả về khối mã ```python ... ``` duy nhất."
+            "Chỉ in ra code trong thẻ ```python ... ```, không giải thích."
         )

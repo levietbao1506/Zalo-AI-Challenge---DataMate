@@ -1,10 +1,11 @@
-"""Sandboxed Python Execution Environment for Tabular QA Scripts.
+"""Sandboxed Python Execution Environment & Self-Correction Engine (Bước 4).
 
 Executes generated Pandas, DuckDB, and SQLite scripts safely with:
-- Global scope pre-population (pd, duckdb, sqlite3, calendar_utils, datetime, etc.).
-- Execution timeouts via threading to prevent infinite loops.
-- Safety guards against system modification, file deletion, and shell execution.
-- Captures stdout and tracebacks for agent self-correction.
+- Code extraction from LLM completions (bounded by backticks).
+- Execution via exec() in an isolated namespace containing data files, calendar tools, and libraries.
+- Try...except safety trapping for runtime exceptions (KeyError, ZeroDivisionError, etc.).
+- Resource timeouts via worker threads to prevent infinite loops.
+- Self-Correction loop: feedback error message and re-prompt LLM up to 3 times.
 """
 
 from __future__ import annotations
@@ -15,30 +16,32 @@ from datetime import date, datetime as dt, timedelta
 import io
 import logging
 import math
+from pathlib import Path
 import re
 import sys
 import threading
 import time
 import traceback
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Union
+import unicodedata
 
 try:
     import pandas as pd
     _HAS_PANDAS = True
 except ImportError:
-    _HAS_PANDAS = None
+    _HAS_PANDAS = False
 
 try:
     import numpy as np
     _HAS_NUMPY = True
 except ImportError:
-    _HAS_NUMPY = None
+    _HAS_NUMPY = False
 
 try:
     import duckdb
     _HAS_DUCKDB = True
 except ImportError:
-    _HAS_DUCKDB = None
+    _HAS_DUCKDB = False
 
 import sqlite3
 from src import calendar_utils
@@ -60,14 +63,74 @@ def _safe_import(name: str, *args: Any, **kwargs: Any) -> Any:
     return __import__(name, *args, **kwargs)
 
 
+def extract_python_code(text: str) -> str:
+    """Extract clean executable Python code from LLM completion text (bounded by backticks).
+
+    Handles:
+    - Standard markdown ```python ... ``` or ```py ... ```
+    - Generic ``` ... ```
+    - Unclosed ```python blocks
+    - Raw code fallback
+
+    Args:
+        text: Raw text response from LLM.
+
+    Returns:
+        Clean Python code string.
+    """
+    if not text:
+        return "result = None"
+
+    # 1. Match ```python ... ``` or ```py ... ```
+    m_py = re.search(r"```(?:python|py)\s*\n(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if m_py:
+        return m_py.group(1).strip()
+
+    # 2. Match generic ``` ... ```
+    m_generic = re.search(r"```\s*\n(.*?)```", text, re.DOTALL)
+    if m_generic:
+        return m_generic.group(1).strip()
+
+    # 3. Handle unclosed ```python block
+    if "```" in text:
+        parts = text.split("```")
+        if len(parts) >= 2:
+            code_part = parts[1]
+            if code_part.lower().startswith("python"):
+                code_part = code_part[6:].lstrip("\r\n")
+            elif code_part.lower().startswith("py"):
+                code_part = code_part[2:].lstrip("\r\n")
+            if code_part.strip():
+                return code_part.strip()
+
+    # 4. Fallback: filter lines
+    lines = text.splitlines()
+    code_lines: List[str] = []
+    in_block = False
+    for line in lines:
+        if line.strip().startswith("```"):
+            in_block = not in_block
+            continue
+        if in_block:
+            code_lines.append(line)
+
+    if code_lines:
+        return "\n".join(code_lines).strip()
+
+    return text.strip()
+
+
 @dataclass
 class ExecutionResult:
     """Encapsulates outcome of sandboxed code execution."""
     success: bool
     result: Any = None
     error: Optional[str] = None
+    error_type: Optional[str] = None
+    error_msg: Optional[str] = None
     stdout: Optional[str] = None
     duration_seconds: float = 0.0
+    attempts_used: int = 1
 
 
 class SandboxedExecutor:
@@ -86,11 +149,6 @@ class SandboxedExecutor:
         safe_builtins = dict(__builtins__) if isinstance(__builtins__, dict) else dict(__builtins__.__dict__)
         safe_builtins["__import__"] = _safe_import
 
-        # Disallow dangerous builtins if present
-        for dangerous in ("eval", "exec", "breakpoint"):
-            # keep eval/exec accessible if internal or selectively replace
-            pass
-
         resolved_as_of = calendar_utils.resolve_as_of_date(as_of_date)
 
         env_globals: Dict[str, Any] = {
@@ -103,6 +161,7 @@ class SandboxedExecutor:
             # Standard math & date tools
             "math": math,
             "re": re,
+            "unicodedata": unicodedata,
             "datetime": datetime,
             "date": date,
             "dt": dt,
@@ -125,7 +184,7 @@ class SandboxedExecutor:
             "result": None,
         }
 
-        # Convenience aliases for file paths directly in globals (e.g. customers_csv = '/path/to/customers.csv')
+        # Convenience aliases for file paths directly in globals (e.g. orders_csv = '/path/to/orders.csv')
         if file_map:
             for fname, fpath in file_map.items():
                 clean_var = re.sub(r"[^a-zA-Z0-9_]", "_", fname)
@@ -141,7 +200,7 @@ class SandboxedExecutor:
         as_of_date: Optional[Union[str, date]] = None,
         timeout_seconds: Optional[float] = None,
     ) -> ExecutionResult:
-        """Run code in sandbox with timeout and exception trapping.
+        """Run code in an isolated sandbox with timeout and exception trapping.
 
         Args:
             code: Python code string.
@@ -154,6 +213,7 @@ class SandboxedExecutor:
             ExecutionResult containing execution status, result, error, and stdout.
         """
         timeout = timeout_seconds if timeout_seconds is not None else self.default_timeout_seconds
+        clean_code = extract_python_code(code)
         start_time = time.perf_counter()
 
         def _run_worker() -> ExecutionResult:
@@ -170,18 +230,20 @@ class SandboxedExecutor:
             sys.stdout = captured_stdout
 
             try:
-                # Syntax check first
-                compiled = compile(code, "<agent_script>", "exec")
+                # 1. Compile check
+                compiled = compile(clean_code, "<agent_script>", "exec")
+
+                # 2. Execute within isolated namespace
                 exec(compiled, global_scope, local_scope)
 
-                # Extract result: look in local_scope first, then global_scope
+                # 3. Extract result: check local_scope first, then global_scope
                 extracted_result = None
                 if "result" in local_scope and local_scope["result"] is not None:
                     extracted_result = local_scope["result"]
                 elif "result" in global_scope and global_scope["result"] is not None:
                     extracted_result = global_scope["result"]
                 else:
-                    # If result was not explicitly assigned, check captured stdout for a single line output
+                    # If result was not explicitly assigned, check captured stdout for output
                     stdout_content = captured_stdout.getvalue().strip()
                     if stdout_content:
                         lines = stdout_content.splitlines()
@@ -198,11 +260,16 @@ class SandboxedExecutor:
             except Exception as exc:
                 duration = time.perf_counter() - start_time
                 tb = traceback.format_exc()
-                logger.debug(f"Code execution encountered exception:\n{tb}")
+                err_type = type(exc).__name__
+                err_msg = str(exc) or "Lỗi không xác định"
+                logger.debug(f"Code execution encountered exception ({err_type}): {err_msg}")
+
                 return ExecutionResult(
                     success=False,
                     result=None,
-                    error=f"{type(exc).__name__}: {str(exc)}\n{tb}",
+                    error=f"{err_type}: {err_msg}\n{tb}",
+                    error_type=err_type,
+                    error_msg=f"{err_type}: {err_msg}",
                     stdout=captured_stdout.getvalue(),
                     duration_seconds=duration,
                 )
@@ -228,6 +295,8 @@ class SandboxedExecutor:
                 success=False,
                 result=None,
                 error=f"TimeoutError: Execution exceeded time limit of {timeout:.1f}s",
+                error_type="TimeoutError",
+                error_msg=f"Quá thời gian thực thi ({timeout:.1f}s)",
                 duration_seconds=duration,
             )
 
@@ -236,10 +305,13 @@ class SandboxedExecutor:
 
         if worker_res["exception"] is not None:
             duration = time.perf_counter() - start_time
+            exc = worker_res["exception"]
             return ExecutionResult(
                 success=False,
                 result=None,
-                error=str(worker_res["exception"]),
+                error=str(exc),
+                error_type=type(exc).__name__,
+                error_msg=str(exc),
                 duration_seconds=duration,
             )
 
@@ -247,5 +319,102 @@ class SandboxedExecutor:
             success=False,
             result=None,
             error="Unknown execution error: worker thread did not return a result.",
+            error_type="WorkerError",
+            error_msg="Lỗi tiến trình thực thi",
             duration_seconds=time.perf_counter() - start_time,
         )
+
+    def execute_with_self_correction(
+        self,
+        agent: Any,
+        initial_code: str,
+        question: str,
+        prompt_builder: Any,
+        system_prompt: Optional[str] = None,
+        data_dir: Optional[str] = None,
+        file_map: Optional[Dict[str, str]] = None,
+        as_of_date: Optional[Union[str, date]] = None,
+        max_retries: int = 3,
+        timeout_seconds: Optional[float] = None,
+    ) -> ExecutionResult:
+        """Execute code with self-correction feedback loop up to max_retries (max 3 times).
+
+        If exec() encounters an exception (e.g. KeyError), captures the error message,
+        appends 'Đoạn code trên bị lỗi: {error_msg}. Hãy viết lại code sửa lỗi',
+        and prompts LLM to regenerate code.
+
+        Args:
+            agent: Agent instance with generate_code() method.
+            initial_code: Initial code generated by LLM.
+            question: Vietnamese natural language question.
+            prompt_builder: PromptBuilder instance with build_retry_prompt().
+            system_prompt: System prompt for LLM instructions.
+            data_dir: Directory containing tabular data.
+            file_map: Map of filenames to paths.
+            as_of_date: Reference date.
+            max_retries: Maximum self-correction retry attempts (default: 3).
+            timeout_seconds: Execution timeout per run.
+
+        Returns:
+            ExecutionResult from the final or successful attempt.
+        """
+        current_code = initial_code
+        attempts_left = max_retries
+        attempts_used = 1
+
+        exec_res = self.execute(
+            code=current_code,
+            data_dir=data_dir,
+            file_map=file_map,
+            as_of_date=as_of_date,
+            timeout_seconds=timeout_seconds,
+        )
+
+        while not exec_res.success and attempts_left > 0:
+            error_msg = exec_res.error_msg or (exec_res.error.splitlines()[0] if exec_res.error else "Unknown error")
+            logger.info(
+                f"Self-correction: Code failed with [{error_msg}]. "
+                f"Retrying with error feedback ({attempts_left} attempts left)..."
+            )
+
+            # Build retry prompt with the required Vietnamese error notification
+            retry_prompt = prompt_builder.build_retry_prompt(
+                question=question,
+                previous_code=current_code,
+                error_traceback=exec_res.error or error_msg,
+            )
+
+            # Generate corrected code
+            current_code = agent.generate_code(retry_prompt, system_prompt=system_prompt)
+            attempts_used += 1
+
+            # Re-execute corrected code
+            exec_res = self.execute(
+                code=current_code,
+                data_dir=data_dir,
+                file_map=file_map,
+                as_of_date=as_of_date,
+                timeout_seconds=timeout_seconds,
+            )
+            attempts_left -= 1
+
+        exec_res.attempts_used = attempts_used
+        return exec_res
+
+
+def execute_sandboxed_code(
+    code: str,
+    data_dir: Optional[str] = None,
+    file_map: Optional[Dict[str, str]] = None,
+    as_of_date: Optional[Union[str, date]] = None,
+    timeout_seconds: float = 15.0,
+) -> ExecutionResult:
+    """Convenience standalone function to execute code in sandbox."""
+    executor = SandboxedExecutor(default_timeout_seconds=timeout_seconds)
+    return executor.execute(
+        code=code,
+        data_dir=data_dir,
+        file_map=file_map,
+        as_of_date=as_of_date,
+        timeout_seconds=timeout_seconds,
+    )
