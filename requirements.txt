@@ -1,0 +1,5 @@
+duckdb
+lunarcalendar
+pandas
+pydantic
+vllm
