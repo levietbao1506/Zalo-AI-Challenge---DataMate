@@ -12,7 +12,7 @@ QUESTIONS_FILE="${QUESTIONS_FILE:-${DATA_DIR}/questions.jsonl}"
 OUTPUT_FILE="${OUTPUT_FILE:-/app/submission.jsonl}"
 MODEL_PATH="${MODEL_PATH:-/app/model}"
 TIMEOUT="${TIMEOUT:-15}"
-MAX_RETRIES="${MAX_RETRIES:-1}"
+MAX_RETRIES="${MAX_RETRIES:-3}"
 
 # Parse optional command line arguments
 while [[ $# -gt 0 ]]; do
