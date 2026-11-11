@@ -1,0 +1,153 @@
+"""End-to-End Pipeline & Integration Unit Tests (Bước 6: Tích hợp Pipeline & Kiểm thử)."""
+
+import json
+from pathlib import Path
+import tempfile
+import time
+import unittest
+
+from src.evaluator import (
+    evaluate_submission,
+    is_answer_match,
+)
+from src.main import (
+    load_questions,
+    main,
+    process_single_question,
+)
+from src.agent import VLLMAgent
+from src.executor import SandboxedExecutor
+from src.prompt_builder import PromptBuilder
+from src.schema_parser import SchemaParser
+
+
+class TestPipelineE2E(unittest.TestCase):
+    """Test suite for end-to-end integration, batch processing, and evaluation."""
+
+    def setUp(self):
+        self.sample_data_dir = Path("./data/sample_dataset").resolve()
+        self.questions_file = self.sample_data_dir / "questions.jsonl"
+        self.ground_truth_file = self.sample_data_dir / "ground_truth.jsonl"
+
+    def test_load_questions(self):
+        """Ensure load_questions reads all valid records and ignores blank/corrupt lines."""
+        with tempfile.NamedTemporaryFile("w+", encoding="utf-8", delete=False) as f:
+            f.write('{"id": "q1", "question": "Hôm nay là ngày mấy?"}\n')
+            f.write("\n")  # Blank line
+            f.write('{"id": "q2", "question": "Doanh số chi nhánh HN?"}\n')
+            f.write("malformed json line\n")  # Corrupted line
+            f.flush()
+            temp_path = Path(f.name)
+
+        try:
+            loaded = load_questions(temp_path)
+            self.assertEqual(len(loaded), 2)
+            self.assertEqual(loaded[0]["id"], "q1")
+            self.assertEqual(loaded[1]["id"], "q2")
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    def test_process_single_question_full_loop(self):
+        """Test single question execution through Prompt -> Agent -> Sandbox -> Formatter."""
+        parser = SchemaParser(self.sample_data_dir)
+        context = parser.parse()
+        schema_str = context.to_prompt_context()
+
+        agent = VLLMAgent(dry_run=True)
+        executor = SandboxedExecutor(default_timeout_seconds=5.0)
+        prompt_builder = PromptBuilder()
+
+        q_data = {
+            "id": "test_q",
+            "as_of_date": "2024-06-15",
+            "question": "Có bao nhiêu đơn hàng thành công?",
+        }
+
+        answer = process_single_question(
+            q_data=q_data,
+            dataset_context=context,
+            schema_prompt_str=schema_str,
+            agent=agent,
+            executor=executor,
+            prompt_builder=prompt_builder,
+            max_retries=3,
+            timeout=5.0,
+            parser=parser,
+        )
+
+        # In dry_run mock mode, it safely falls back to abstain
+        self.assertIn(answer, ("abstain", None))
+
+    def test_evaluator_is_answer_match(self):
+        """Test match logic for numbers, strings, and abstain fallback."""
+        # 1. Float with tolerance <= 0.01
+        self.assertTrue(is_answer_match(123.456, 123.46))
+        self.assertTrue(is_answer_match(100.0, 100))
+        self.assertFalse(is_answer_match(123.45, 125.00))
+
+        # 2. String with NFC & case-insensitive matching
+        self.assertTrue(is_answer_match("Hà Nội", "hà nội"))
+        self.assertTrue(is_answer_match("  Đà Nẵng!  ", "đà nẵng"))
+        self.assertFalse(is_answer_match("Hà Nội", "Sài Gòn"))
+
+        # 3. Abstain matching
+        self.assertTrue(is_answer_match("abstain", "abstain"))
+        self.assertTrue(is_answer_match(None, "abstain"))
+        self.assertTrue(is_answer_match("abstain", None))
+        self.assertFalse(is_answer_match("hà nội", "abstain"))
+
+        # 4. Boolean matching
+        self.assertTrue(is_answer_match(True, True))
+        self.assertFalse(is_answer_match(True, False))
+
+    def test_end_to_end_batch_inference_and_latency(self):
+        """Run full 15 questions batch pipeline, check submission output and latency."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_file = Path(tmp_dir) / "submission.jsonl"
+
+            start_t = time.time()
+            # Run main program via sys.argv mock
+            import sys
+            test_args = [
+                "main.py",
+                "--data_dir", str(self.sample_data_dir),
+                "--questions_file", str(self.questions_file),
+                "--output_file", str(out_file),
+                "--dry_run",
+            ]
+            old_argv = sys.argv
+            sys.argv = test_args
+            try:
+                main()
+            finally:
+                sys.argv = old_argv
+
+            duration = time.time() - start_t
+
+            # Verify submission.jsonl exists and has 15 lines
+            self.assertTrue(out_file.exists())
+            lines = out_file.read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(lines), 15)
+
+            # Check JSON schema of each line
+            for line in lines:
+                rec = json.loads(line)
+                self.assertIn("id", rec)
+                self.assertIn("type", rec)
+                self.assertIn("answer", rec)
+
+            # Evaluate submission against ground truth
+            eval_summary = evaluate_submission(
+                submission_file=out_file,
+                ground_truth_file=self.ground_truth_file,
+                total_duration_seconds=duration,
+            )
+
+            self.assertEqual(eval_summary["total_questions"], 15)
+            self.assertGreater(eval_summary["average_latency_seconds"], 0.0)
+            self.assertLess(eval_summary["average_latency_seconds"], 5.0)  # fast batch latency
+            self.assertGreaterEqual(eval_summary["penalized_score"], 0.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

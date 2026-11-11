@@ -10,3 +10,7 @@ wheels/
 .venv
 .python-version
 pyproject.toml
+
+# Submission and temporary files
+submission.jsonl
+*.log

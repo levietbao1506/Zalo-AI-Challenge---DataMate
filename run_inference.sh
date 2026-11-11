@@ -12,7 +12,7 @@ QUESTIONS_FILE="${QUESTIONS_FILE:-${DATA_DIR}/questions.jsonl}"
 OUTPUT_FILE="${OUTPUT_FILE:-/app/submission.jsonl}"
 MODEL_PATH="${MODEL_PATH:-/app/model}"
 TIMEOUT="${TIMEOUT:-15}"
-MAX_RETRIES="${MAX_RETRIES:-1}"
+MAX_RETRIES="${MAX_RETRIES:-3}"
 
 # Parse optional command line arguments
 while [[ $# -gt 0 ]]; do
@@ -78,6 +78,8 @@ export TOKENIZERS_PARALLELISM=false
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export OMP_NUM_THREADS=4
 export PYTHONDONTWRITEBYTECODE=1
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 
 # Check CUDA status if nvidia-smi is available
 if command -v nvidia-smi &> /dev/null; then

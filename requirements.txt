@@ -1,5 +1,7 @@
 duckdb
 lunarcalendar
+openpyxl
 pandas
 pydantic
 vllm
+

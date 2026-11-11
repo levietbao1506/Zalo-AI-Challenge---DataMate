@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from src.agent import VLLMAgent
 from src.executor import SandboxedExecutor
-from src.formatter import format_scalar
+from src.formatter import format_output, format_scalar, format_submission_record
 from src.prompt_builder import PromptBuilder
 from src.schema_parser import DatasetContext, SchemaParser
 
@@ -70,8 +70,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--max_retries",
         type=int,
-        default=1,
-        help="Maximum self-correction retries for code execution errors (default: 1)",
+        default=3,
+        help="Maximum self-correction retries for code execution errors (default: 3)",
     )
     parser.add_argument(
         "--dry_run",
@@ -113,57 +113,60 @@ def process_single_question(
     prompt_builder: PromptBuilder,
     max_retries: int,
     timeout: float,
+    parser: Optional[SchemaParser] = None,
 ) -> Any:
     """Process a single question through agent generation, execution, and self-correction."""
     q_id = q_data.get("id") or q_data.get("question_id") or "unknown"
     question_text = q_data.get("question") or q_data.get("text") or ""
+
+    # Dynamically resolve business_id context if present
+    biz_id = q_data.get("business_id") or q_data.get("db_id")
+    if biz_id and parser:
+        active_context = parser.parse(business_id=biz_id)
+        active_schema_str = active_context.to_prompt_context()
+    else:
+        active_context = dataset_context
+        active_schema_str = schema_prompt_str
+
     # Extract reference as_of_date if specified at question level, otherwise use dataset default
-    q_as_of = q_data.get("as_of_date") or dataset_context.as_of_date
+    q_as_of = q_data.get("as_of_date") or active_context.as_of_date
 
     # 1. Compose user prompt
     user_prompt = prompt_builder.build_user_prompt(
         question=question_text,
-        schema_context=schema_prompt_str,
+        schema_context=active_schema_str,
         as_of_date=q_as_of,
-        file_map=dataset_context.file_map,
+        file_map=active_context.file_map,
     )
     system_prompt = prompt_builder.build_system_prompt()
 
     # 2. Agent generates code
     code = agent.generate_code(user_prompt, system_prompt=system_prompt)
 
-    # 3. Sandboxed execution
-    exec_result = executor.execute(
-        code=code,
-        data_dir=dataset_context.data_dir,
-        file_map=dataset_context.file_map,
+    # 3. Sandboxed execution with self-correction retry loop (up to max_retries = 3)
+    exec_result = executor.execute_with_self_correction(
+        agent=agent,
+        initial_code=code,
+        question=question_text,
+        prompt_builder=prompt_builder,
+        system_prompt=system_prompt,
+        data_dir=active_context.data_dir,
+        file_map=active_context.file_map,
         as_of_date=q_as_of,
+        max_retries=max_retries,
         timeout_seconds=timeout,
     )
 
-    # 4. Self-correction retry loop if execution encounters syntax/runtime error
-    attempts_left = max_retries
-    while not exec_result.success and attempts_left > 0:
-        logger.info(f"Question [{q_id}] failed. Retrying with error feedback ({attempts_left} left)...")
-        retry_prompt = prompt_builder.build_retry_prompt(
-            question=question_text,
-            previous_code=code,
-            error_traceback=exec_result.error or "Unknown error",
-        )
-        code = agent.generate_code(retry_prompt, system_prompt=system_prompt)
-        exec_result = executor.execute(
-            code=code,
-            data_dir=dataset_context.data_dir,
-            file_map=dataset_context.file_map,
-            as_of_date=q_as_of,
-            timeout_seconds=timeout,
-        )
-        attempts_left -= 1
-
-    # 5. Normalize output per competition rules
-    # If execution failed after retries, format_scalar will fall back to abstain (None/null)
+    # 5. Normalize output per competition rules (Step 5 Formatter & Abstain)
+    # If execution failed after retries, format_output will fall back to "abstain"
     raw_result = exec_result.result if exec_result.success else None
-    formatted_answer = format_scalar(raw_result, round_decimals=2, abstain_fallback=None)
+    formatted_answer = format_output(
+        val=raw_result,
+        success=exec_result.success,
+        round_decimals=2,
+        abstain_token="abstain",
+        clean_text=False,
+    )
 
     return formatted_answer
 
@@ -235,18 +238,22 @@ def main() -> None:
                     prompt_builder=prompt_builder,
                     max_retries=args.max_retries,
                     timeout=args.timeout,
+                    parser=parser,
                 )
             except Exception as e:
                 logger.error(f"Unexpected exception processing {q_id}: {e}")
                 # Safe abstain on catastrophic failure to avoid penalized accuracy penalty
-                answer = None
+                answer = "abstain"
 
-            if answer is None:
+            if answer is None or answer == "abstain":
                 abstained_count += 1
+                answer = "abstain"
             else:
                 answered_count += 1
 
-            record = {"id": q_id, "answer": answer}
+            # Format dictionary containing id, type, answer
+            q_type = q_data.get("type")
+            record = format_submission_record(q_id=q_id, answer=answer, q_type=q_type, abstain_token="abstain")
             out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
             out_f.flush()
 

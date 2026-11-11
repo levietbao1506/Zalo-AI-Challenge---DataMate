@@ -1,9 +1,34 @@
-"""Unit tests for SandboxedExecutor environment."""
+"""Unit tests for SandboxedExecutor environment & Self-Correction Engine (Bước 4)."""
 
 from datetime import date
+from typing import Optional
 import unittest
 
-from src.executor import SandboxedExecutor
+import pandas as pd
+
+from src.executor import (
+    ExecutionResult,
+    SandboxedExecutor,
+    execute_sandboxed_code,
+    extract_python_code,
+)
+from src.prompt_builder import PromptBuilder
+
+
+class MockAgentForCorrection:
+    """Mock agent designed to simulate self-correction code generation."""
+
+    def __init__(self, code_sequence: list[str]):
+        self.code_sequence = code_sequence
+        self.call_count = 0
+        self.captured_prompts: list[str] = []
+
+    def generate_code(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        self.captured_prompts.append(prompt)
+        idx = min(self.call_count, len(self.code_sequence) - 1)
+        code = self.code_sequence[idx]
+        self.call_count += 1
+        return code
 
 
 class TestSandboxedExecutor(unittest.TestCase):
@@ -11,6 +36,30 @@ class TestSandboxedExecutor(unittest.TestCase):
 
     def setUp(self):
         self.executor = SandboxedExecutor(default_timeout_seconds=5.0)
+        self.prompt_builder = PromptBuilder()
+
+    def test_extract_python_code(self):
+        """Test extraction of python code from markdown backticks."""
+        raw_llm = (
+            "Chào bạn, đây là đoạn code bạn cần:\n"
+            "```python\n"
+            "import pandas as pd\n"
+            "result = 123.45\n"
+            "```\n"
+            "Hy vọng giúp ích!"
+        )
+        code = extract_python_code(raw_llm)
+        self.assertEqual(code, "import pandas as pd\nresult = 123.45")
+
+        # Generic markdown
+        self.assertEqual(extract_python_code("```\nresult = 'ABC'\n```"), "result = 'ABC'")
+
+        # Unclosed backtick
+        unclosed = "```python\nresult = 999"
+        self.assertEqual(extract_python_code(unclosed), "result = 999")
+
+        # Empty fallback
+        self.assertEqual(extract_python_code(""), "result = None")
 
     def test_basic_execution(self):
         """Simple code assigning result should succeed."""
@@ -19,6 +68,19 @@ class TestSandboxedExecutor(unittest.TestCase):
         self.assertTrue(exec_res.success)
         self.assertEqual(exec_res.result, 35)
         self.assertIsNone(exec_res.error)
+
+    def test_file_map_and_variable_alias_injection(self):
+        """FILE_MAP and clean filename aliases should be available in execution globals."""
+        code = """
+import pandas as pd
+df = pd.DataFrame({'val': [10, 20, 30]})
+# Access via orders_csv alias
+result = orders_csv
+"""
+        file_map = {"orders.csv": "/app/data/retail/orders.csv"}
+        exec_res = self.executor.execute(code, file_map=file_map)
+        self.assertTrue(exec_res.success)
+        self.assertEqual(exec_res.result, "/app/data/retail/orders.csv")
 
     def test_calendar_utils_injection(self):
         """calendar_utils functions and as_of_date should be directly accessible."""
@@ -52,14 +114,24 @@ conn.close()
         self.assertFalse(exec_res.success)
         self.assertIsNone(exec_res.result)
         self.assertIn("SyntaxError", exec_res.error)
+        self.assertEqual(exec_res.error_type, "SyntaxError")
 
     def test_runtime_error_trapping(self):
-        """ZeroDivisionError and runtime exceptions should be safely caught."""
-        code = "result = 10 / 0"
-        exec_res = self.executor.execute(code)
-        self.assertFalse(exec_res.success)
-        self.assertIsNone(exec_res.result)
-        self.assertIn("ZeroDivisionError", exec_res.error)
+        """KeyError and ZeroDivisionError exceptions should be safely caught."""
+        # Zero division
+        exec_div = self.executor.execute("result = 10 / 0")
+        self.assertFalse(exec_div.success)
+        self.assertEqual(exec_div.error_type, "ZeroDivisionError")
+
+        # KeyError
+        code_key = """
+data = {'a': 1}
+result = data['non_existent_key']
+"""
+        exec_key = self.executor.execute(code_key)
+        self.assertFalse(exec_key.success)
+        self.assertEqual(exec_key.error_type, "KeyError")
+        self.assertIn("KeyError", exec_key.error_msg)
 
     def test_timeout_trapping(self):
         """Infinite loop should terminate gracefully within specified timeout."""
@@ -71,7 +143,7 @@ while True:
         exec_res = self.executor.execute(code, timeout_seconds=0.5)
         self.assertFalse(exec_res.success)
         self.assertIsNone(exec_res.result)
-        self.assertIn("TimeoutError", exec_res.error)
+        self.assertEqual(exec_res.error_type, "TimeoutError")
 
     def test_blocked_module_import(self):
         """Attempting to import restricted system modules should raise ImportError."""
@@ -81,7 +153,7 @@ result = os.listdir('.')
 """
         exec_res = self.executor.execute(code)
         self.assertFalse(exec_res.success)
-        self.assertIn("ImportError", exec_res.error)
+        self.assertEqual(exec_res.error_type, "ImportError")
         self.assertIn("restricted", exec_res.error)
 
     def test_stdout_capture(self):
@@ -93,6 +165,57 @@ print("Computed output: 999")
         self.assertTrue(exec_res.success)
         self.assertIn("Computed output: 999", exec_res.stdout)
         self.assertEqual(exec_res.result, "Computed output: 999")
+
+    def test_self_correction_success_on_retry(self):
+        """Test self-correction: turn 1 fails with KeyError, turn 2 corrects code and succeeds."""
+        # Initial code has a bug (KeyError)
+        bad_code = "data = {'total_rev': 500}\nresult = data['wrong_key']"
+        # Corrected code fixes the key
+        good_code = "data = {'total_rev': 500}\nresult = data['total_rev']"
+
+        mock_agent = MockAgentForCorrection([good_code])
+
+        exec_res = self.executor.execute_with_self_correction(
+            agent=mock_agent,
+            initial_code=bad_code,
+            question="Tính tổng doanh thu?",
+            prompt_builder=self.prompt_builder,
+            max_retries=3,
+        )
+
+        self.assertTrue(exec_res.success)
+        self.assertEqual(exec_res.result, 500)
+        self.assertEqual(exec_res.attempts_used, 2)
+        # Verify the feedback message contained the required text
+        self.assertEqual(len(mock_agent.captured_prompts), 1)
+        retry_prompt = mock_agent.captured_prompts[0]
+        self.assertIn("Đoạn code trên bị lỗi: KeyError", retry_prompt)
+        self.assertIn("Hãy viết lại code sửa lỗi", retry_prompt)
+
+    def test_self_correction_max_3_retries_limit(self):
+        """Test self-correction terminates after exactly max 3 retries if code keeps failing."""
+        always_bad_code = "result = 1 / 0"
+        mock_agent = MockAgentForCorrection([always_bad_code, always_bad_code, always_bad_code, always_bad_code])
+
+        exec_res = self.executor.execute_with_self_correction(
+            agent=mock_agent,
+            initial_code=always_bad_code,
+            question="Tính chia cho 0?",
+            prompt_builder=self.prompt_builder,
+            max_retries=3,
+        )
+
+        self.assertFalse(exec_res.success)
+        self.assertIsNone(exec_res.result)
+        # 1 initial + 3 retries = 4 attempts total
+        self.assertEqual(exec_res.attempts_used, 4)
+        self.assertEqual(mock_agent.call_count, 3)
+
+    def test_standalone_execute_sandboxed_code(self):
+        """Test convenience helper function execute_sandboxed_code."""
+        res = execute_sandboxed_code("result = 7 * 8")
+        self.assertTrue(res.success)
+        self.assertEqual(res.result, 56)
 
 
 if __name__ == "__main__":

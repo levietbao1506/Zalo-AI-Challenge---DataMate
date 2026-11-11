@@ -1,0 +1,15 @@
+{"id": "q_01", "type": "number", "expected_answer": 3}
+{"id": "q_02", "type": "number", "expected_answer": 700000}
+{"id": "q_03", "type": "number", "expected_answer": 800000}
+{"id": "q_04", "type": "number", "expected_answer": 8}
+{"id": "q_05", "type": "number", "expected_answer": 1500000}
+{"id": "q_06", "type": "number", "expected_answer": 75}
+{"id": "q_07", "type": "string", "expected_answer": "nguyễn văn an"}
+{"id": "q_08", "type": "number", "expected_answer": 2}
+{"id": "q_09", "type": "number", "expected_answer": 750000}
+{"id": "q_10", "type": "abstain", "expected_answer": "abstain"}
+{"id": "q_11", "type": "abstain", "expected_answer": "abstain"}
+{"id": "q_12", "type": "number", "expected_answer": 3}
+{"id": "q_13", "type": "number", "expected_answer": 833333.33}
+{"id": "q_14", "type": "string", "expected_answer": "bình giữ nhiệt"}
+{"id": "q_15", "type": "abstain", "expected_answer": "abstain"}
