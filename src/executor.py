@@ -22,14 +22,17 @@ import sys
 import threading
 import time
 import traceback
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 import unicodedata
 
-try:
-    import pandas as pd
-    _HAS_PANDAS = True
-except ImportError:
-    _HAS_PANDAS = False
+import pandas as pd
+
+_HAS_PANDAS = True
+
+EMPTY_RESULT_FEEDBACK = (
+    "Đoạn code trên chạy thành công nhưng kết quả trả về bị rỗng. "
+    "Hãy kiểm tra lại điều kiện lọc (filter) ngày tháng hoặc định dạng chuỗi."
+)
 
 try:
     import numpy as np
@@ -98,7 +101,53 @@ def extract_code(llm_response: str) -> str:
     return llm_response.strip()
 
 
-def execute_local(code_str: str, data_dir: str) -> Tuple[bool, Any, str]:
+def is_empty_result(result: Any) -> bool:
+    """Check whether an extracted execution result is logically empty.
+
+    Returns ``True`` for ``None``, empty Pandas DataFrames/Series, empty NumPy arrays,
+    scalar NaN values, empty strings ``""`` (including whitespace-only), empty lists ``[]``,
+    empty dictionaries ``{}``, empty tuples/sets.
+
+    Critically, explicit intentional abstain tokens ``"unanswerable"`` and ``"abstain"``
+    are considered valid answers and return ``False``. Numeric ``0`` / ``0.0`` and boolean
+    ``False`` also return ``False``.
+
+    Args:
+        result: Extracted ``final_result`` value returned by executed script.
+
+    Returns:
+        ``True`` if ``result`` represents logically empty data; ``False`` otherwise.
+    """
+    if result is None:
+        return True
+
+    if isinstance(result, str):
+        if result in ("unanswerable", "abstain"):
+            return False
+        return result.strip() == ""
+
+    if isinstance(result, pd.DataFrame):
+        return bool(result.empty)
+
+    if isinstance(result, pd.Series):
+        return bool(result.empty)
+
+    if isinstance(result, (list, dict, tuple, set)):
+        return len(result) == 0
+
+    if _HAS_NUMPY and isinstance(result, np.ndarray):
+        return result.size == 0
+
+    if result is pd.NA or result is pd.NaT:
+        return True
+
+    if isinstance(result, float) or (_HAS_NUMPY and isinstance(result, np.floating)):
+        return math.isnan(result)
+
+    return False
+
+
+def execute_local(code_str: str, data_dir: str) -> tuple[bool, Any, str]:
     """Execute a Python code string in an isolated namespace and capture `final_result`.
 
     Injects ``{"data_dir": data_dir}`` into the execution namespace so scripts can
@@ -129,12 +178,13 @@ def execute_with_retry(
     generate_fn: Callable[[str], str],
     data_dir: str,
     max_retries: int = 3,
-) -> Tuple[bool, Any, str]:
+) -> tuple[bool, Any, str]:
     """Run LLM code generation and local sandbox execution with a self-correction retry loop.
 
     Calls ``generate_fn(current_prompt)``, extracts Python code via :func:`extract_code`,
-    and runs it via :func:`execute_local`. If execution fails, appends the Vietnamese
-    error-feedback prompt and retries up to ``max_retries`` times.
+    and runs it via :func:`execute_local`. Retries up to ``max_retries`` times both on
+    runtime/syntax exceptions and on logically empty results detected by
+    :func:`is_empty_result`.
 
     Args:
         initial_prompt: Initial prompt passed to ``generate_fn``.
@@ -143,8 +193,8 @@ def execute_with_retry(
         max_retries: Maximum number of attempts before giving up. Defaults to 3.
 
     Returns:
-        Tuple of ``(success, final_result, error_message)`` from the first successful
-        attempt or the final failed attempt.
+        Tuple of ``(success, final_result, error_message)`` from the first valid
+        non-empty execution, or ``(False, None, error_message)`` if retries are exhausted.
     """
     current_prompt = initial_prompt
     error_msg = ""
@@ -152,12 +202,16 @@ def execute_with_retry(
     for _ in range(max_retries):
         llm_response = generate_fn(current_prompt)
         code_str = extract_code(llm_response)
-        success, final_result, error_msg = execute_local(code_str, data_dir)
+        success, result, error_msg = execute_local(code_str, data_dir)
+
+        if success and not is_empty_result(result):
+            return (True, result, "")
 
         if success:
-            return (True, final_result, "")
-
-        current_prompt += f"\nĐoạn code trên bị lỗi: {error_msg}. Hãy viết lại code sửa lỗi."
+            error_msg = EMPTY_RESULT_FEEDBACK
+            current_prompt += f"\n{EMPTY_RESULT_FEEDBACK}"
+        else:
+            current_prompt += f"\nĐoạn code trên bị lỗi: {error_msg}. Hãy viết lại code sửa lỗi."
 
     return (False, None, error_msg)
 
@@ -444,9 +498,9 @@ class SandboxedExecutor:
     ) -> ExecutionResult:
         """Execute code with self-correction feedback loop up to max_retries (max 3 times).
 
-        If exec() encounters an exception (e.g. KeyError), captures the error message,
-        appends 'Đoạn code trên bị lỗi: {error_msg}. Hãy viết lại code sửa lỗi',
-        and prompts LLM to regenerate code.
+        If exec() encounters an exception (e.g. KeyError) or produces a logically
+        empty result detected by :func:`is_empty_result`, captures the feedback and
+        prompts the LLM to regenerate code.
 
         Args:
             agent: Agent instance with generate_code() method.
@@ -475,18 +529,26 @@ class SandboxedExecutor:
             timeout_seconds=timeout_seconds,
         )
 
-        while not exec_res.success and attempts_left > 0:
-            error_msg = exec_res.error_msg or (exec_res.error.splitlines()[0] if exec_res.error else "Unknown error")
-            logger.info(
-                f"Self-correction: Code failed with [{error_msg}]. "
-                f"Retrying with error feedback ({attempts_left} attempts left)..."
-            )
+        while (not exec_res.success or is_empty_result(exec_res.result)) and attempts_left > 0:
+            if not exec_res.success:
+                error_msg = exec_res.error_msg or (exec_res.error.splitlines()[0] if exec_res.error else "Unknown error")
+                error_feedback = exec_res.error or error_msg
+                logger.info(
+                    f"Self-correction: Code failed with [{error_msg}]. "
+                    f"Retrying with error feedback ({attempts_left} attempts left)..."
+                )
+            else:
+                error_feedback = EMPTY_RESULT_FEEDBACK
+                logger.info(
+                    "Self-correction: Code returned empty result. "
+                    f"Retrying with logical-error feedback ({attempts_left} attempts left)..."
+                )
 
             # Build retry prompt with the required Vietnamese error notification
             retry_prompt = prompt_builder.build_retry_prompt(
                 question=question,
                 previous_code=current_code,
-                error_traceback=exec_res.error or error_msg,
+                error_traceback=error_feedback,
             )
 
             # Generate corrected code
@@ -502,6 +564,13 @@ class SandboxedExecutor:
                 timeout_seconds=timeout_seconds,
             )
             attempts_left -= 1
+
+        if exec_res.success and is_empty_result(exec_res.result):
+            exec_res.success = False
+            exec_res.result = None
+            exec_res.error_type = "EmptyResultError"
+            exec_res.error_msg = EMPTY_RESULT_FEEDBACK
+            exec_res.error = EMPTY_RESULT_FEEDBACK
 
         exec_res.attempts_used = attempts_used
         return exec_res
