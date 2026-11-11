@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass, field
+from functools import lru_cache
 import json
 import logging
 import math
@@ -709,6 +710,77 @@ def parse_table_head(
         return []
 
 
+def _scan_directory_context(
+    target_dir: Path,
+    business_id: Optional[str] = None,
+    readme_base_dir: Optional[Path] = None,
+    n_rows: int = 5,
+) -> DatasetContext:
+    """Scan a resolved dataset directory for README, metadata, and tabular schemas."""
+    if not target_dir.exists():
+        logger.warning(f"Target directory {target_dir} does not exist.")
+        return DatasetContext(data_dir=str(target_dir), business_id=business_id)
+
+    readme_root = readme_base_dir if readme_base_dir is not None else target_dir
+    readme_content = read_business_readme(business_id=business_id, data_dir=readme_root)
+    as_of_date = extract_as_of_date(readme_content)
+
+    for meta_name in ("metadata.json", "meta.json"):
+        meta_path = target_dir / meta_name
+        if meta_path.is_file():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                if not as_of_date and "as_of_date" in meta:
+                    as_of_date = str(meta["as_of_date"])
+            except Exception as e:
+                logger.debug(f"Error reading {meta_path}: {e}")
+
+    tables: List[TableSchema] = []
+    file_map: Dict[str, str] = {}
+
+    for file in sorted(target_dir.iterdir()):
+        if file.is_dir() or file.name.startswith("."):
+            continue
+
+        ext = file.suffix.lower()
+        if ext in (".csv", ".xlsx", ".xls", ".sqlite", ".db", ".sqlite3"):
+            file_map[file.name] = str(file.resolve())
+            tables.extend(parse_table_head(file, n_rows=n_rows))
+
+    return DatasetContext(
+        data_dir=str(target_dir),
+        business_id=business_id,
+        readme_content=readme_content if readme_content else None,
+        as_of_date=as_of_date,
+        tables=tables,
+        file_map=file_map,
+    )
+
+
+@lru_cache(maxsize=256)
+def get_business_schema(
+    business_dir: str,
+    max_readme_chars: int = 1500,
+    n_rows: int = 5,
+) -> str:
+    """Read tabular files and README inside ``business_dir`` and return a cached schema string.
+
+    Decorated with ``@lru_cache(maxsize=256)`` so repeated calls for the same
+    ``business_dir`` immediately return the cached string without hitting disk.
+
+    Args:
+        business_dir: Path to the directory containing README.md and CSV/XLSX/SQLite files.
+        max_readme_chars: Maximum characters of README to include in prompt (default: 1500).
+        n_rows: Number of sample rows to extract per table (default: 5).
+
+    Returns:
+        Formatted schema string ready to inject into ``PromptBuilder``.
+    """
+    target_dir = Path(business_dir).resolve()
+    context = _scan_directory_context(target_dir=target_dir, business_id=None, n_rows=n_rows)
+    return context.to_prompt_context(max_readme_chars=max_readme_chars)
+
+
 def build_schema_string(
     business_id: Optional[str] = None,
     data_dir: Union[str, Path] = "./data",
@@ -728,8 +800,15 @@ def build_schema_string(
     Returns:
         Neat schema string ready to be injected into PromptBuilder.
     """
+    if not business_id:
+        return get_business_schema(
+            str(Path(data_dir).resolve()),
+            max_readme_chars=max_readme_chars,
+            n_rows=n_rows,
+        )
+
     parser = SchemaParser(data_dir=data_dir)
-    context = parser.parse(business_id=business_id)
+    context = parser.parse(business_id=business_id, n_rows=n_rows)
     return context.to_prompt_context(max_readme_chars=max_readme_chars)
 
 
@@ -792,49 +871,11 @@ class SchemaParser:
             return self._cached_contexts[cache_key]
 
         target_dir = self.get_business_dir(business_id)
-        if not target_dir.exists():
-            logger.warning(f"Target directory {target_dir} does not exist.")
-            ctx = DatasetContext(data_dir=str(target_dir), business_id=business_id)
-            self._cached_contexts[cache_key] = ctx
-            return ctx
-
-        # 1. Read README.md for business context
-        readme_content = read_business_readme(business_id=business_id, data_dir=self.data_dir)
-        as_of_date = extract_as_of_date(readme_content)
-
-        # Also check metadata.json if exists
-        for meta_name in ("metadata.json", "meta.json"):
-            meta_path = target_dir / meta_name
-            if meta_path.is_file():
-                try:
-                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                    if not as_of_date and "as_of_date" in meta:
-                        as_of_date = str(meta["as_of_date"])
-                except Exception as e:
-                    logger.debug(f"Error reading {meta_path}: {e}")
-
-        # 2. Inspect and parse all tabular files in target directory
-        tables: List[TableSchema] = []
-        file_map: Dict[str, str] = {}
-
-        # Scan files (non-recursive in target_dir to avoid indexing sub-businesses)
-        for file in sorted(target_dir.iterdir()):
-            if file.is_dir() or file.name.startswith("."):
-                continue
-
-            ext = file.suffix.lower()
-            if ext in (".csv", ".xlsx", ".xls", ".sqlite", ".db", ".sqlite3"):
-                file_map[file.name] = str(file.resolve())
-                parsed_schemas = parse_table_head(file, n_rows=n_rows)
-                tables.extend(parsed_schemas)
-
-        context = DatasetContext(
-            data_dir=str(target_dir),
+        context = _scan_directory_context(
+            target_dir=target_dir,
             business_id=business_id,
-            readme_content=readme_content if readme_content else None,
-            as_of_date=as_of_date,
-            tables=tables,
-            file_map=file_map,
+            readme_base_dir=self.data_dir,
+            n_rows=n_rows,
         )
 
         self._cached_contexts[cache_key] = context

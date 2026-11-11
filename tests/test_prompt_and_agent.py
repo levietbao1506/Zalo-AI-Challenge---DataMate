@@ -1,9 +1,12 @@
 """Unit tests for Step 3: LLM Engine (vLLM Agent) and PromptBuilder."""
 
+from types import SimpleNamespace
 import unittest
+from unittest.mock import MagicMock
 
 from src.agent import (
     DEFAULT_TEMPERATURE,
+    CodeAgent,
     VLLMAgent,
 )
 from src.executor import SandboxedExecutor
@@ -187,6 +190,35 @@ class TestVLLMAgent(unittest.TestCase):
         res = executor.execute(code)
         self.assertTrue(res.success)
         self.assertIsNone(res.result)  # Default abstain
+
+    def test_code_agent_batch_generation_preserves_order(self):
+        """Verify CodeAgent.generate_code_batch passes prompt list to llm.generate and preserves order."""
+        agent = CodeAgent(dry_run=True)
+        self.assertIs(VLLMAgent, CodeAgent)
+        self.assertEqual(agent.generate_code_batch([]), [])
+
+        # Simulate active vLLM engine via mock
+        agent.dry_run = False
+        agent.sampling_params = object()
+        agent.llm = MagicMock()
+        agent.llm.generate.return_value = [
+            SimpleNamespace(outputs=[SimpleNamespace(text="```python\nfinal_result = 1\n```")]),
+            SimpleNamespace(outputs=[SimpleNamespace(text="```python\nfinal_result = 2\n```")]),
+            SimpleNamespace(outputs=[SimpleNamespace(text="```python\nfinal_result = 3\n```")]),
+        ]
+
+        prompts = ["prompt_0", "prompt_1", "prompt_2"]
+        results = agent.generate_code_batch(prompts)
+
+        agent.llm.generate.assert_called_once_with(prompts, agent.sampling_params)
+        self.assertEqual(
+            results,
+            [
+                "```python\nfinal_result = 1\n```",
+                "```python\nfinal_result = 2\n```",
+                "```python\nfinal_result = 3\n```",
+            ],
+        )
 
 
 if __name__ == "__main__":

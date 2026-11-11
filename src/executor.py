@@ -147,30 +147,89 @@ def is_empty_result(result: Any) -> bool:
     return False
 
 
-def execute_local(code_str: str, data_dir: str) -> tuple[bool, Any, str]:
-    """Execute a Python code string in an isolated namespace and capture `final_result`.
+def _build_local_namespace(
+    data_dir: str,
+    file_map: Optional[Dict[str, str]] = None,
+    as_of_date: Optional[Union[str, date]] = None,
+) -> Dict[str, Any]:
+    """Build isolated execution namespace containing data context and analytical libraries."""
+    namespace: Dict[str, Any] = {
+        "data_dir": data_dir,
+        "DATA_DIR": data_dir,
+        "FILE_MAP": file_map or {},
+        "as_of_date": calendar_utils.resolve_as_of_date(as_of_date),
+        "pd": pd,
+        "np": np if _HAS_NUMPY else None,
+        "duckdb": duckdb if _HAS_DUCKDB else None,
+        "sqlite3": sqlite3,
+        "math": math,
+        "re": re,
+        "unicodedata": unicodedata,
+        "datetime": datetime,
+        "date": date,
+        "dt": dt,
+        "timedelta": timedelta,
+        "calendar_utils": calendar_utils,
+    }
+    if file_map:
+        for fname, fpath in file_map.items():
+            clean_var = re.sub(r"[^a-zA-Z0-9_]", "_", fname)
+            namespace[clean_var] = fpath
+    return namespace
 
-    Injects ``{"data_dir": data_dir}`` into the execution namespace so scripts can
-    locate tabular datasets. Any exception raised during compilation or execution
-    is caught safely.
+
+def execute_local(
+    code_str: str,
+    data_dir: str,
+    file_map: Optional[Dict[str, str]] = None,
+    as_of_date: Optional[Union[str, date]] = None,
+    timeout_seconds: Optional[float] = None,
+) -> tuple[bool, Any, str]:
+    """Execute a Python code string in an isolated namespace and capture ``final_result``.
+
+    Injects ``{"data_dir": data_dir, ...}`` (plus ``FILE_MAP``, ``as_of_date``,
+    ``calendar_utils``, and Pandas/DuckDB/SQLite utilities) into the execution
+    namespace so generated scripts can locate and query tabular datasets safely.
 
     Args:
         code_str: Python code string to execute.
         data_dir: Path to the directory containing tabular data files.
+        file_map: Optional mapping from filenames to absolute file paths.
+        as_of_date: Optional reference date for relative-date resolution.
+        timeout_seconds: Optional worker-thread timeout in seconds.
 
     Returns:
         Tuple of ``(success, final_result, error_message)`` where:
             - ``success`` is True if execution completed without exceptions.
-            - ``final_result`` is the value of ``namespace.get('final_result')`` (or None on error).
+            - ``final_result`` is the extracted ``final_result`` (or ``result`` fallback), else None.
             - ``error_message`` is ``""`` on success, or ``str(e)`` on failure.
     """
-    namespace: Dict[str, Any] = {"data_dir": data_dir}
-    try:
-        exec(code_str, namespace)
-        final_result = namespace.get("final_result")
-        return (True, final_result, "")
-    except Exception as e:
-        return (False, None, str(e))
+    namespace = _build_local_namespace(data_dir=data_dir, file_map=file_map, as_of_date=as_of_date)
+
+    def _run() -> tuple[bool, Any, str]:
+        try:
+            exec(code_str, namespace)
+            extracted = namespace["final_result"] if "final_result" in namespace else namespace.get("result")
+            return (True, extracted, "")
+        except Exception as e:
+            return (False, None, str(e))
+
+    if timeout_seconds is None:
+        return _run()
+
+    holder: Dict[str, tuple[bool, Any, str]] = {}
+
+    def _target() -> None:
+        holder["out"] = _run()
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout_seconds)
+
+    if thread.is_alive():
+        return (False, None, f"TimeoutError: Execution exceeded time limit of {timeout_seconds:.1f}s")
+
+    return holder.get("out", (False, None, "Worker execution failed without returning a result."))
 
 
 def execute_with_retry(
@@ -178,6 +237,9 @@ def execute_with_retry(
     generate_fn: Callable[[str], str],
     data_dir: str,
     max_retries: int = 3,
+    file_map: Optional[Dict[str, str]] = None,
+    as_of_date: Optional[Union[str, date]] = None,
+    timeout_seconds: Optional[float] = None,
 ) -> tuple[bool, Any, str]:
     """Run LLM code generation and local sandbox execution with a self-correction retry loop.
 
@@ -191,6 +253,9 @@ def execute_with_retry(
         generate_fn: Callable accepting a prompt string and returning the LLM text response.
         data_dir: Path to the directory containing tabular data files.
         max_retries: Maximum number of attempts before giving up. Defaults to 3.
+        file_map: Optional mapping from filenames to absolute file paths.
+        as_of_date: Optional reference date for relative-date resolution.
+        timeout_seconds: Optional worker-thread timeout in seconds.
 
     Returns:
         Tuple of ``(success, final_result, error_message)`` from the first valid
@@ -202,7 +267,13 @@ def execute_with_retry(
     for _ in range(max_retries):
         llm_response = generate_fn(current_prompt)
         code_str = extract_code(llm_response)
-        success, result, error_msg = execute_local(code_str, data_dir)
+        success, result, error_msg = execute_local(
+            code_str,
+            data_dir,
+            file_map=file_map,
+            as_of_date=as_of_date,
+            timeout_seconds=timeout_seconds,
+        )
 
         if success and not is_empty_result(result):
             return (True, result, "")

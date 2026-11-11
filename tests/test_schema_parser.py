@@ -23,6 +23,7 @@ from src.schema_parser import (
     extract_as_of_date,
     extract_columns_and_types,
     format_table_schema,
+    get_business_schema,
     parse_csv_head,
     parse_excel_head,
     parse_sqlite_head,
@@ -242,6 +243,32 @@ class TestSchemaParser(unittest.TestCase):
         self.assertIn("[Examples: 'Trà sữa trân châu', 'Cà phê sữa', 'Bạc xỉu']", enriched_text)
         self.assertIn("[Examples: 'Hoàn thành', 'Đang giao', 'Đã hủy']", enriched_text)
         self.assertIn("- revenue (float64)", enriched_text)
+
+    def test_get_business_schema_lru_cache_avoids_disk_io(self):
+        """Repeated get_business_schema calls for the same dir must return from lru_cache without hitting disk."""
+        get_business_schema.cache_clear()
+        biz_dir = self.base_dir / "cached_biz"
+        biz_dir.mkdir(parents=True)
+        (biz_dir / "README.md").write_text("# Cached Biz\nas_of_date: 2026-03-15", encoding="utf-8")
+        csv_file = biz_dir / "orders.csv"
+        pd.DataFrame({"order_id": [1, 2], "amount": [100.0, 200.0]}).to_csv(csv_file, index=False)
+
+        first_schema = get_business_schema(str(biz_dir))
+        info_after_first = get_business_schema.cache_info()
+        self.assertEqual(info_after_first.maxsize, 256)
+        self.assertEqual(info_after_first.misses, 1)
+        self.assertEqual(info_after_first.hits, 0)
+
+        # Remove files from disk; a cached call must still return the exact same schema string
+        csv_file.unlink()
+        (biz_dir / "README.md").unlink()
+
+        second_schema = get_business_schema(str(biz_dir))
+        info_after_second = get_business_schema.cache_info()
+        self.assertEqual(second_schema, first_schema)
+        self.assertEqual(info_after_second.hits, 1)
+        self.assertEqual(info_after_second.misses, 1)
+        get_business_schema.cache_clear()
 
 
 if __name__ == "__main__":
