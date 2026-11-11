@@ -9,7 +9,10 @@ import pandas as pd
 from src.executor import (
     ExecutionResult,
     SandboxedExecutor,
+    execute_local,
     execute_sandboxed_code,
+    execute_with_retry,
+    extract_code,
     extract_python_code,
 )
 from src.prompt_builder import PromptBuilder
@@ -216,6 +219,75 @@ print("Computed output: 999")
         res = execute_sandboxed_code("result = 7 * 8")
         self.assertTrue(res.success)
         self.assertEqual(res.result, 56)
+
+    def test_extract_code_function(self):
+        """Test extract_code handles python markdown fences and raw code."""
+        llm_output = "Đây là mã Python:\n```python\n  final_result = 42  \n```\nChúc may mắn."
+        self.assertEqual(extract_code(llm_output), "final_result = 42")
+
+        # Raw code without markdown formatting
+        raw_code = "   x = 10\nfinal_result = x * 2   "
+        self.assertEqual(extract_code(raw_code), "x = 10\nfinal_result = x * 2")
+
+    def test_execute_local_success_and_data_dir_injection(self):
+        """Test execute_local injects data_dir and extracts final_result."""
+        code = "import os\nfinal_result = os.path.join(data_dir, 'orders.csv')"
+        success, result, err = execute_local(code, "/app/data")
+        self.assertTrue(success)
+        self.assertTrue(result.endswith("orders.csv"))
+        self.assertEqual(err, "")
+
+    def test_execute_local_exception_catching(self):
+        """Test execute_local catches exceptions safely and returns (False, None, str(e))."""
+        success, result, err = execute_local("x = 1 / 0\nfinal_result = x", "/app/data")
+        self.assertFalse(success)
+        self.assertIsNone(result)
+        self.assertIn("division by zero", err)
+
+    def test_execute_with_retry_self_correction(self):
+        """Test execute_with_retry appends exact Vietnamese error prompt and succeeds on retry."""
+        prompts_seen = []
+        responses = [
+            "```python\nfinal_result = missing_var\n```",
+            "```python\nfinal_result = 123\n```",
+        ]
+
+        def mock_generate(prompt: str) -> str:
+            prompts_seen.append(prompt)
+            return responses[len(prompts_seen) - 1]
+
+        success, result, err = execute_with_retry(
+            initial_prompt="Tính tổng doanh thu",
+            generate_fn=mock_generate,
+            data_dir="./data",
+            max_retries=3,
+        )
+        self.assertTrue(success)
+        self.assertEqual(result, 123)
+        self.assertEqual(err, "")
+        self.assertEqual(len(prompts_seen), 2)
+        self.assertIn("\nĐoạn code trên bị lỗi: ", prompts_seen[1])
+        self.assertIn(". Hãy viết lại code sửa lỗi.", prompts_seen[1])
+
+    def test_execute_with_retry_exhausted(self):
+        """Test execute_with_retry returns (False, None, error_msg) when max_retries is exhausted."""
+        calls = 0
+
+        def always_fail(prompt: str) -> str:
+            nonlocal calls
+            calls += 1
+            return "```python\nfinal_result = 1 / 0\n```"
+
+        success, result, err = execute_with_retry(
+            initial_prompt="Initial",
+            generate_fn=always_fail,
+            data_dir="./data",
+            max_retries=3,
+        )
+        self.assertFalse(success)
+        self.assertIsNone(result)
+        self.assertIn("division by zero", err)
+        self.assertEqual(calls, 3)
 
 
 if __name__ == "__main__":

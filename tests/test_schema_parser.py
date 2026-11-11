@@ -8,6 +8,12 @@ import unittest
 
 import pandas as pd
 
+try:
+    import openpyxl  # noqa: F401
+    _HAS_OPENPYXL = True
+except ImportError:
+    _HAS_OPENPYXL = False
+
 from src.schema_parser import (
     DatasetContext,
     SchemaParser,
@@ -16,11 +22,14 @@ from src.schema_parser import (
     clean_sample_records,
     extract_as_of_date,
     extract_columns_and_types,
+    format_table_schema,
     parse_csv_head,
     parse_excel_head,
     parse_sqlite_head,
     parse_table_head,
     read_business_readme,
+    sample_unique_values,
+    strip_dataframe_whitespace,
 )
 
 
@@ -106,6 +115,8 @@ class TestSchemaParser(unittest.TestCase):
 
     def test_parse_excel_head_multi_sheet(self):
         """Ensure parse_excel_head reads 5 rows from each sheet in an Excel workbook."""
+        if not _HAS_OPENPYXL:
+            self.skipTest("openpyxl is not installed in this environment.")
         xlsx_file = self.base_dir / "company_data.xlsx"
         df_orders = pd.DataFrame({
             "order_id": [101, 102, 103, 104, 105, 106],
@@ -185,6 +196,52 @@ class TestSchemaParser(unittest.TestCase):
         # 4. Helper function test
         direct_str = build_schema_string("retail_01", data_dir=self.base_dir)
         self.assertEqual(prompt_str, direct_str)
+
+    def test_strip_dataframe_whitespace(self):
+        """Ensure strip_dataframe_whitespace trims leading/trailing whitespace on string/object columns."""
+        df = pd.DataFrame({
+            "order_id": [1, 2, 3],
+            "product_name": ["  Trà sữa trân châu  ", " Cà phê sữa", None],
+            "status": ["Hoàn thành  ", "  Đang giao ", "Đã hủy"],
+            "revenue": [35000.0, 25000.0, 30000.0],
+        })
+        cleaned = strip_dataframe_whitespace(df)
+        self.assertEqual(cleaned["product_name"].iloc[0], "Trà sữa trân châu")
+        self.assertEqual(cleaned["product_name"].iloc[1], "Cà phê sữa")
+        self.assertTrue(pd.isna(cleaned["product_name"].iloc[2]))
+        self.assertEqual(cleaned["status"].tolist(), ["Hoàn thành", "Đang giao", "Đã hủy"])
+
+    def test_sample_unique_values_and_enriched_formatting(self):
+        """Ensure unique values are ranked by frequency (dropping NaNs) and formatted cleanly."""
+        csv_file = self.base_dir / "orders.csv"
+        rows = [
+            {"order_id": 1, "product_name": "  Trà sữa trân châu  ", "status": " Hoàn thành", "revenue": 45000.0},
+            {"order_id": 2, "product_name": "Trà sữa trân châu", "status": "Hoàn thành ", "revenue": 45000.0},
+            {"order_id": 3, "product_name": "Cà phê sữa ", "status": "Hoàn thành", "revenue": 29000.0},
+            {"order_id": 4, "product_name": "Cà phê sữa", "status": "Đang giao", "revenue": 29000.0},
+            {"order_id": 5, "product_name": " Bạc xỉu ", "status": "Đang giao", "revenue": 32000.0},
+            {"order_id": 6, "product_name": None, "status": "Đã hủy ", "revenue": 0.0},
+            {"order_id": 7, "product_name": "Trà đào", "status": None, "revenue": 35000.0},
+        ]
+        pd.DataFrame(rows).to_csv(csv_file, index=False, encoding="utf-8-sig")
+
+        schema = parse_csv_head(csv_file, n_rows=5, top_n_examples=3)
+        # Whitespace was stripped in sample_rows as well
+        self.assertEqual(schema.sample_rows[0]["product_name"], "Trà sữa trân châu")
+        self.assertEqual(schema.sample_rows[0]["status"], "Hoàn thành")
+
+        # Top 3 unique values ordered by frequency, NaNs dropped
+        self.assertEqual(schema.column_examples["product_name"], ["Trà sữa trân châu", "Cà phê sữa", "Bạc xỉu"])
+        self.assertEqual(schema.column_examples["status"], ["Hoàn thành", "Đang giao", "Đã hủy"])
+        self.assertNotIn("order_id", schema.column_examples)
+        self.assertNotIn("revenue", schema.column_examples)
+
+        enriched_text = format_table_schema(schema)
+        self.assertIn("Table: orders.csv", enriched_text)
+        self.assertIn("- order_id (int64)", enriched_text)
+        self.assertIn("[Examples: 'Trà sữa trân châu', 'Cà phê sữa', 'Bạc xỉu']", enriched_text)
+        self.assertIn("[Examples: 'Hoàn thành', 'Đang giao', 'Đã hủy']", enriched_text)
+        self.assertIn("- revenue (float64)", enriched_text)
 
 
 if __name__ == "__main__":

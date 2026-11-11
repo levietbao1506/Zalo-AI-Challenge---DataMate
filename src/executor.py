@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import unicodedata
 
 try:
@@ -61,6 +61,105 @@ def _safe_import(name: str, *args: Any, **kwargs: Any) -> Any:
     if root_module in BLOCKED_MODULES:
         raise ImportError(f"Import of '{name}' is restricted in sandboxed execution.")
     return __import__(name, *args, **kwargs)
+
+
+def extract_code(llm_response: str) -> str:
+    """Parse and extract the Python code block from an LLM response.
+
+    Specifically extracts text between ````python` and ```` (or generic ```` fences).
+    Strips leading and trailing whitespace. If no markdown code fences are found,
+    assumes the entire response is Python code and returns it stripped.
+
+    Args:
+        llm_response: Raw completion string returned by the LLM.
+
+    Returns:
+        Clean Python code string ready for execution.
+    """
+    if not llm_response:
+        return ""
+
+    # 1. Match ```python ... ``` (case-insensitive)
+    m_py = re.search(r"```python\s*\n?(.*?)```", llm_response, re.DOTALL | re.IGNORECASE)
+    if m_py:
+        return m_py.group(1).strip()
+
+    # 2. Match generic ``` ... ```
+    m_generic = re.search(r"```\s*\n?(.*?)```", llm_response, re.DOTALL)
+    if m_generic:
+        return m_generic.group(1).strip()
+
+    # 3. Handle unclosed opening fence (e.g. truncated at stop token)
+    m_unclosed = re.match(r"^\s*```(?:python|py)?\s*\n?(.*)$", llm_response, re.DOTALL | re.IGNORECASE)
+    if m_unclosed:
+        return m_unclosed.group(1).strip()
+
+    # 4. No markdown formatting found: return entire response stripped
+    return llm_response.strip()
+
+
+def execute_local(code_str: str, data_dir: str) -> Tuple[bool, Any, str]:
+    """Execute a Python code string in an isolated namespace and capture `final_result`.
+
+    Injects ``{"data_dir": data_dir}`` into the execution namespace so scripts can
+    locate tabular datasets. Any exception raised during compilation or execution
+    is caught safely.
+
+    Args:
+        code_str: Python code string to execute.
+        data_dir: Path to the directory containing tabular data files.
+
+    Returns:
+        Tuple of ``(success, final_result, error_message)`` where:
+            - ``success`` is True if execution completed without exceptions.
+            - ``final_result`` is the value of ``namespace.get('final_result')`` (or None on error).
+            - ``error_message`` is ``""`` on success, or ``str(e)`` on failure.
+    """
+    namespace: Dict[str, Any] = {"data_dir": data_dir}
+    try:
+        exec(code_str, namespace)
+        final_result = namespace.get("final_result")
+        return (True, final_result, "")
+    except Exception as e:
+        return (False, None, str(e))
+
+
+def execute_with_retry(
+    initial_prompt: str,
+    generate_fn: Callable[[str], str],
+    data_dir: str,
+    max_retries: int = 3,
+) -> Tuple[bool, Any, str]:
+    """Run LLM code generation and local sandbox execution with a self-correction retry loop.
+
+    Calls ``generate_fn(current_prompt)``, extracts Python code via :func:`extract_code`,
+    and runs it via :func:`execute_local`. If execution fails, appends the Vietnamese
+    error-feedback prompt and retries up to ``max_retries`` times.
+
+    Args:
+        initial_prompt: Initial prompt passed to ``generate_fn``.
+        generate_fn: Callable accepting a prompt string and returning the LLM text response.
+        data_dir: Path to the directory containing tabular data files.
+        max_retries: Maximum number of attempts before giving up. Defaults to 3.
+
+    Returns:
+        Tuple of ``(success, final_result, error_message)`` from the first successful
+        attempt or the final failed attempt.
+    """
+    current_prompt = initial_prompt
+    error_msg = ""
+
+    for _ in range(max_retries):
+        llm_response = generate_fn(current_prompt)
+        code_str = extract_code(llm_response)
+        success, final_result, error_msg = execute_local(code_str, data_dir)
+
+        if success:
+            return (True, final_result, "")
+
+        current_prompt += f"\nĐoạn code trên bị lỗi: {error_msg}. Hãy viết lại code sửa lỗi."
+
+    return (False, None, error_msg)
 
 
 def extract_python_code(text: str) -> str:
@@ -177,11 +276,13 @@ class SandboxedExecutor:
             "get_tet_date": calendar_utils.get_tet_date,
             # Data context
             "DATA_DIR": data_dir,
+            "data_dir": data_dir,
             "FILE_MAP": file_map or {},
             "as_of_date": resolved_as_of,
             "AS_OF_DATE": str(resolved_as_of),
             # Default placeholder for result
             "result": None,
+            "final_result": None,
         }
 
         # Convenience aliases for file paths directly in globals (e.g. orders_csv = '/path/to/orders.csv')
@@ -236,14 +337,18 @@ class SandboxedExecutor:
                 # 2. Execute within isolated namespace
                 exec(compiled, global_scope, local_scope)
 
-                # 3. Extract result: check local_scope first, then global_scope
+                # 3. Extract result: look for final_result first, then result
                 extracted_result = None
-                if "result" in local_scope and local_scope["result"] is not None:
-                    extracted_result = local_scope["result"]
-                elif "result" in global_scope and global_scope["result"] is not None:
-                    extracted_result = global_scope["result"]
-                else:
-                    # If result was not explicitly assigned, check captured stdout for output
+                for var_name in ("final_result", "result"):
+                    if var_name in local_scope and local_scope[var_name] is not None:
+                        extracted_result = local_scope[var_name]
+                        break
+                    if var_name in global_scope and global_scope[var_name] is not None:
+                        extracted_result = global_scope[var_name]
+                        break
+
+                if extracted_result is None:
+                    # If neither was explicitly assigned, check captured stdout for output
                     stdout_content = captured_stdout.getvalue().strip()
                     if stdout_content:
                         lines = stdout_content.splitlines()
