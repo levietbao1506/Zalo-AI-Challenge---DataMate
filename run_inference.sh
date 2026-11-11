@@ -78,6 +78,8 @@ export TOKENIZERS_PARALLELISM=false
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export OMP_NUM_THREADS=4
 export PYTHONDONTWRITEBYTECODE=1
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 
 # Check CUDA status if nvidia-smi is available
 if command -v nvidia-smi &> /dev/null; then
