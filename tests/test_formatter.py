@@ -101,6 +101,8 @@ class TestFormatter(unittest.TestCase):
         self.assertEqual(format_scalar(None), DEFAULT_ABSTAIN_VALUE)
         self.assertEqual(format_scalar("ABSTAIN"), DEFAULT_ABSTAIN_VALUE)
         self.assertEqual(format_scalar("abstain"), DEFAULT_ABSTAIN_VALUE)
+        self.assertEqual(format_scalar("unanswerable"), DEFAULT_ABSTAIN_VALUE)
+        self.assertEqual(format_scalar("UNANSWERABLE"), DEFAULT_ABSTAIN_VALUE)
         self.assertEqual(format_scalar("null"), DEFAULT_ABSTAIN_VALUE)
         self.assertEqual(format_scalar("None"), DEFAULT_ABSTAIN_VALUE)
         self.assertEqual(format_scalar(""), DEFAULT_ABSTAIN_VALUE)
