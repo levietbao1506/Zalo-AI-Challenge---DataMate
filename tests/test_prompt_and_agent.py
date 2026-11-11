@@ -1,9 +1,12 @@
 """Unit tests for Step 3: LLM Engine (vLLM Agent) and PromptBuilder."""
 
+from types import SimpleNamespace
 import unittest
+from unittest.mock import MagicMock
 
 from src.agent import (
     DEFAULT_TEMPERATURE,
+    CodeAgent,
     VLLMAgent,
 )
 from src.executor import SandboxedExecutor
@@ -81,13 +84,40 @@ class TestPromptBuilder(unittest.TestCase):
         self.assertIn("remove_accents", FEW_SHOT_EXAMPLES)
         self.assertIn("da nang", FEW_SHOT_EXAMPLES)
 
-        # Ví dụ 3: Excel với sheet
+        # Ví dụ 4: Excel với sheet
         self.assertIn("Đọc file Excel nhiều sheets", FEW_SHOT_EXAMPLES)
         self.assertIn("sheet_name=\"Orders\"", FEW_SHOT_EXAMPLES)
 
-        # Ví dụ 4: Penalized Accuracy safe abstain
+        # Ví dụ 5: Penalized Accuracy safe abstain
         self.assertIn("Trường hợp dữ liệu không tồn tại -> Abstain để tránh bị trừ điểm", FEW_SHOT_EXAMPLES)
         self.assertIn("result = None", FEW_SHOT_EXAMPLES)
+
+    def test_chain_of_thought_and_unanswerable_prompts(self):
+        """Ensure SYSTEM_PROMPT and all FEW_SHOT_EXAMPLES enforce CoT and Unanswerable rules."""
+        import re
+
+        # 1. System Prompt CoT and Unanswerable requirements
+        self.assertIn(
+            "Trước khi viết code, bạn BẮT BUỘC phải viết 1-2 dòng comment bắt đầu bằng `# Phân tích: ` để giải thích ngắn gọn cách bạn sẽ lọc dữ liệu và tính toán.",
+            SYSTEM_PROMPT,
+        )
+        self.assertIn(
+            "Nếu lược đồ dữ liệu (schema) hoàn toàn không có bảng hoặc cột thông tin nào liên quan để trả lời câu hỏi, không được đoán mò. Hãy viết comment phân tích và gán `final_result = \"unanswerable\"`.",
+            SYSTEM_PROMPT,
+        )
+
+        # 2. Example 3 (Unanswerable) presence in FEW_SHOT_EXAMPLES
+        self.assertIn("cho biết tên nhân viên bán được nhiều hàng nhất", FEW_SHOT_EXAMPLES)
+        self.assertIn('final_result = "unanswerable"', FEW_SHOT_EXAMPLES)
+
+        # 3. Every python block in FEW_SHOT_EXAMPLES must start with "# Phân tích: "
+        code_blocks = re.findall(r"```python\n(.*?)```", FEW_SHOT_EXAMPLES, re.DOTALL)
+        self.assertGreaterEqual(len(code_blocks), 5)
+        for block in code_blocks:
+            self.assertTrue(
+                block.lstrip().startswith("# Phân tích: "),
+                f"Code block does not start with '# Phân tích: ':\n{block[:80]}",
+            )
 
     def test_retry_prompt_formatting(self):
         """Ensure retry prompt formats code and error traceback for self-correction."""
@@ -160,6 +190,35 @@ class TestVLLMAgent(unittest.TestCase):
         res = executor.execute(code)
         self.assertTrue(res.success)
         self.assertIsNone(res.result)  # Default abstain
+
+    def test_code_agent_batch_generation_preserves_order(self):
+        """Verify CodeAgent.generate_code_batch passes prompt list to llm.generate and preserves order."""
+        agent = CodeAgent(dry_run=True)
+        self.assertIs(VLLMAgent, CodeAgent)
+        self.assertEqual(agent.generate_code_batch([]), [])
+
+        # Simulate active vLLM engine via mock
+        agent.dry_run = False
+        agent.sampling_params = object()
+        agent.llm = MagicMock()
+        agent.llm.generate.return_value = [
+            SimpleNamespace(outputs=[SimpleNamespace(text="```python\nfinal_result = 1\n```")]),
+            SimpleNamespace(outputs=[SimpleNamespace(text="```python\nfinal_result = 2\n```")]),
+            SimpleNamespace(outputs=[SimpleNamespace(text="```python\nfinal_result = 3\n```")]),
+        ]
+
+        prompts = ["prompt_0", "prompt_1", "prompt_2"]
+        results = agent.generate_code_batch(prompts)
+
+        agent.llm.generate.assert_called_once_with(prompts, agent.sampling_params)
+        self.assertEqual(
+            results,
+            [
+                "```python\nfinal_result = 1\n```",
+                "```python\nfinal_result = 2\n```",
+                "```python\nfinal_result = 3\n```",
+            ],
+        )
 
 
 if __name__ == "__main__":

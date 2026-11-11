@@ -146,7 +146,7 @@ def is_abstain_signal(val: Any, success: bool = True) -> bool:
     # String explicit abstain tokens
     if isinstance(val, str):
         s = val.strip().lower()
-        if s in ("abstain", "none", "null", "nan", "không có", "không xác định", "n/a", "na", ""):
+        if s in ("abstain", "unanswerable", "none", "null", "nan", "không có", "không xác định", "n/a", "na", ""):
             return True
 
     return False

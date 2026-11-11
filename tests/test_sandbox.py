@@ -7,10 +7,15 @@ import unittest
 import pandas as pd
 
 from src.executor import (
+    EMPTY_RESULT_FEEDBACK,
     ExecutionResult,
     SandboxedExecutor,
+    execute_local,
     execute_sandboxed_code,
+    execute_with_retry,
+    extract_code,
     extract_python_code,
+    is_empty_result,
 )
 from src.prompt_builder import PromptBuilder
 
@@ -216,6 +221,187 @@ print("Computed output: 999")
         res = execute_sandboxed_code("result = 7 * 8")
         self.assertTrue(res.success)
         self.assertEqual(res.result, 56)
+
+    def test_extract_code_function(self):
+        """Test extract_code handles python markdown fences and raw code."""
+        llm_output = "Đây là mã Python:\n```python\n  final_result = 42  \n```\nChúc may mắn."
+        self.assertEqual(extract_code(llm_output), "final_result = 42")
+
+        # Raw code without markdown formatting
+        raw_code = "   x = 10\nfinal_result = x * 2   "
+        self.assertEqual(extract_code(raw_code), "x = 10\nfinal_result = x * 2")
+
+    def test_execute_local_success_and_data_dir_injection(self):
+        """Test execute_local injects data_dir and extracts final_result."""
+        code = "import os\nfinal_result = os.path.join(data_dir, 'orders.csv')"
+        success, result, err = execute_local(code, "/app/data")
+        self.assertTrue(success)
+        self.assertTrue(result.endswith("orders.csv"))
+        self.assertEqual(err, "")
+
+    def test_execute_local_exception_catching(self):
+        """Test execute_local catches exceptions safely and returns (False, None, str(e))."""
+        success, result, err = execute_local("x = 1 / 0\nfinal_result = x", "/app/data")
+        self.assertFalse(success)
+        self.assertIsNone(result)
+        self.assertIn("division by zero", err)
+
+    def test_execute_with_retry_self_correction(self):
+        """Test execute_with_retry appends exact Vietnamese error prompt and succeeds on retry."""
+        prompts_seen = []
+        responses = [
+            "```python\nfinal_result = missing_var\n```",
+            "```python\nfinal_result = 123\n```",
+        ]
+
+        def mock_generate(prompt: str) -> str:
+            prompts_seen.append(prompt)
+            return responses[len(prompts_seen) - 1]
+
+        success, result, err = execute_with_retry(
+            initial_prompt="Tính tổng doanh thu",
+            generate_fn=mock_generate,
+            data_dir="./data",
+            max_retries=3,
+        )
+        self.assertTrue(success)
+        self.assertEqual(result, 123)
+        self.assertEqual(err, "")
+        self.assertEqual(len(prompts_seen), 2)
+        self.assertIn("\nĐoạn code trên bị lỗi: ", prompts_seen[1])
+        self.assertIn(". Hãy viết lại code sửa lỗi.", prompts_seen[1])
+
+    def test_execute_with_retry_exhausted(self):
+        """Test execute_with_retry returns (False, None, error_msg) when max_retries is exhausted."""
+        calls = 0
+
+        def always_fail(prompt: str) -> str:
+            nonlocal calls
+            calls += 1
+            return "```python\nfinal_result = 1 / 0\n```"
+
+        success, result, err = execute_with_retry(
+            initial_prompt="Initial",
+            generate_fn=always_fail,
+            data_dir="./data",
+            max_retries=3,
+        )
+        self.assertFalse(success)
+        self.assertIsNone(result)
+        self.assertIn("division by zero", err)
+        self.assertEqual(calls, 3)
+
+    def test_is_empty_result_detection_and_valid_exceptions(self):
+        """Test is_empty_result catches empty structures while allowing abstain tokens and zeros."""
+        self.assertTrue(is_empty_result(None))
+        self.assertTrue(is_empty_result(""))
+        self.assertTrue(is_empty_result([]))
+        self.assertTrue(is_empty_result({}))
+        self.assertTrue(is_empty_result(pd.DataFrame()))
+        self.assertTrue(is_empty_result(pd.Series(dtype=object)))
+        self.assertTrue(is_empty_result(float("nan")))
+
+        # Critical exception: intentional unanswerable/abstain tokens are valid
+        self.assertFalse(is_empty_result("unanswerable"))
+        self.assertFalse(is_empty_result("abstain"))
+
+        # Valid non-empty scalars & collections (including numeric zero & False)
+        self.assertFalse(is_empty_result(0))
+        self.assertFalse(is_empty_result(0.0))
+        self.assertFalse(is_empty_result(False))
+        self.assertFalse(is_empty_result("Hà Nội"))
+        self.assertFalse(is_empty_result([1, 2]))
+        self.assertFalse(is_empty_result({"a": 1}))
+        self.assertFalse(is_empty_result(pd.DataFrame({"val": [10]})))
+
+    def test_execute_with_retry_empty_result_triggers_retry(self):
+        """Empty filtered results must trigger retry with the exact Vietnamese logical-error prompt."""
+        prompts_seen = []
+        responses = [
+            "```python\nimport pandas as pd\nfinal_result = pd.DataFrame()\n```",
+            "```python\nfinal_result = 450.5\n```",
+        ]
+
+        def mock_generate(prompt: str) -> str:
+            prompts_seen.append(prompt)
+            return responses[len(prompts_seen) - 1]
+
+        success, result, err = execute_with_retry(
+            initial_prompt="Doanh thu tháng này?",
+            generate_fn=mock_generate,
+            data_dir="./data",
+            max_retries=3,
+        )
+        self.assertTrue(success)
+        self.assertEqual(result, 450.5)
+        self.assertEqual(err, "")
+        self.assertEqual(len(prompts_seen), 2)
+        self.assertTrue(
+            prompts_seen[1].endswith(
+                "\nĐoạn code trên chạy thành công nhưng kết quả trả về bị rỗng. "
+                "Hãy kiểm tra lại điều kiện lọc (filter) ngày tháng hoặc định dạng chuỗi."
+            )
+        )
+
+    def test_execute_with_retry_allows_unanswerable_and_abstain_without_retry(self):
+        """Intentional 'unanswerable' and 'abstain' strings must immediately succeed without retrying."""
+        for token in ("unanswerable", "abstain"):
+            calls = 0
+
+            def mock_generate(_prompt: str, tok: str = token) -> str:
+                nonlocal calls
+                calls += 1
+                return f'```python\nfinal_result = "{tok}"\n```'
+
+            success, result, err = execute_with_retry(
+                initial_prompt="Question?",
+                generate_fn=mock_generate,
+                data_dir="./data",
+                max_retries=3,
+            )
+            self.assertTrue(success)
+            self.assertEqual(result, token)
+            self.assertEqual(err, "")
+            self.assertEqual(calls, 1)
+
+    def test_execute_with_retry_empty_result_exhausted(self):
+        """Exhausting retries on empty results returns (False, None, feedback_msg)."""
+        calls = 0
+
+        def always_empty(_prompt: str) -> str:
+            nonlocal calls
+            calls += 1
+            return "```python\nfinal_result = []\n```"
+
+        success, result, err = execute_with_retry(
+            initial_prompt="Initial",
+            generate_fn=always_empty,
+            data_dir="./data",
+            max_retries=3,
+        )
+        self.assertFalse(success)
+        self.assertIsNone(result)
+        self.assertEqual(err, EMPTY_RESULT_FEEDBACK)
+        self.assertEqual(calls, 3)
+
+    def test_sandboxed_self_correction_retries_on_empty_result(self):
+        """SandboxedExecutor.execute_with_self_correction should also recover from empty DataFrame output."""
+        bad_empty_code = "import pandas as pd\nfinal_result = pd.DataFrame()"
+        fixed_code = "final_result = 'Cà phê sữa'"
+        mock_agent = MockAgentForCorrection([fixed_code])
+
+        exec_res = self.executor.execute_with_self_correction(
+            agent=mock_agent,
+            initial_code=bad_empty_code,
+            question="Sản phẩm bán chạy?",
+            prompt_builder=self.prompt_builder,
+            max_retries=3,
+        )
+        self.assertTrue(exec_res.success)
+        self.assertEqual(exec_res.result, "Cà phê sữa")
+        self.assertEqual(exec_res.attempts_used, 2)
+        self.assertEqual(len(mock_agent.captured_prompts), 1)
+        self.assertIn(EMPTY_RESULT_FEEDBACK, mock_agent.captured_prompts[0])
 
 
 if __name__ == "__main__":

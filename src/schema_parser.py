@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass, field
+from functools import lru_cache
 import json
 import logging
 import math
@@ -32,19 +33,42 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TableSchema:
-    """Represents schema, column types, and sample preview of a single tabular resource."""
+    """Represents schema, column types, categorical examples, and sample preview of a single tabular resource."""
     name: str
     source_type: str  # 'csv', 'xlsx', 'sqlite'
     file_path: str
     columns: List[str] = field(default_factory=list)
     column_types: Dict[str, str] = field(default_factory=dict)
+    raw_column_types: Dict[str, str] = field(default_factory=dict)
+    column_examples: Dict[str, List[str]] = field(default_factory=dict)
     sample_rows: List[Dict[str, Any]] = field(default_factory=list)
     total_rows: Optional[int] = None
     sheet_name: Optional[str] = None
     extra_notes: Optional[str] = None
 
+    def format_enriched_schema(self) -> str:
+        """Render clean enriched schema string with top unique examples for categorical/string columns.
+
+        Format:
+            Table: orders.csv
+            - order_id (int64)
+            - product_name (object) [Examples: 'Trà sữa trân châu', 'Cà phê sữa', 'Bạc xỉu']
+            - status (object) [Examples: 'Hoàn thành', 'Đang giao', 'Đã hủy']
+            - revenue (float64)
+        """
+        lines = [f"Table: {self.name}"]
+        for col in self.columns:
+            dtype_str = self.raw_column_types.get(col) or self.column_types.get(col, "object")
+            examples = self.column_examples.get(col)
+            if examples:
+                formatted_vals = ", ".join(repr(str(v)) for v in examples)
+                lines.append(f"- {col} ({dtype_str}) [Examples: {formatted_vals}]")
+            else:
+                lines.append(f"- {col} ({dtype_str})")
+        return "\n".join(lines)
+
     def to_markdown(self) -> str:
-        """Format table schema and sample preview as clean, token-efficient Markdown."""
+        """Format table schema, categorical examples, and sample preview as clean Markdown."""
         lines = [f"### Table: `{self.name}` ({self.source_type.upper()})"]
         lines.append(f"- **File Path**: `{self.file_path}`")
         if self.sheet_name:
@@ -52,9 +76,14 @@ class TableSchema:
         if self.total_rows is not None:
             lines.append(f"- **Approx Rows**: {self.total_rows}")
 
-        # Columns & Types
+        # Columns & Types inline summary
         col_type_str = ", ".join(f"`{col}` ({self.column_types.get(col, 'string')})" for col in self.columns)
         lines.append(f"- **Columns & Types**: {col_type_str}")
+
+        # Enriched Schema block with categorical examples
+        if self.columns:
+            lines.append("\n**Enriched Schema & Unique Value Examples:**")
+            lines.append(self.format_enriched_schema())
 
         # Sample rows table (head 5)
         if self.sample_rows and self.columns:
@@ -135,10 +164,90 @@ class DatasetContext:
         """Alias for to_prompt_context()."""
         return self.to_prompt_context(max_readme_chars=max_readme_chars)
 
+    def to_enriched_schema_string(self) -> str:
+        """Return only the clean enriched schema representation across all tables."""
+        return "\n\n".join(table.format_enriched_schema() for table in self.tables)
+
 
 # ---------------------------------------------------------------------------
-# Core Schema Parsing Functions
+# Core Schema Parsing & Enrichment Functions
 # ---------------------------------------------------------------------------
+
+def strip_dataframe_whitespace(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Apply `.str.strip()` to all string/object columns in a Pandas DataFrame.
+
+    Ensures hidden leading or trailing spaces in CSV/Excel cells do not break
+    exact string matching or skew categorical unique value counts.
+
+    Args:
+        df: Input Pandas DataFrame.
+
+    Returns:
+        DataFrame with whitespace stripped from all string/object columns.
+    """
+    cleaned = df.copy()
+    for col in cleaned.columns:
+        series = cleaned[col]
+        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+            non_null = series.dropna()
+            if non_null.empty or non_null.map(lambda v: isinstance(v, str)).all():
+                cleaned[col] = series.str.strip()
+            else:
+                cleaned[col] = series.apply(lambda v: v.strip() if isinstance(v, str) else v)
+    return cleaned
+
+
+def sample_unique_values(
+    df: "pd.DataFrame",
+    top_n: int = 5,
+    max_val_len: int = 80,
+) -> Dict[str, List[str]]:
+    """Calculate top-N most frequent unique values for every object/string column.
+
+    Drops NaNs/nulls and empty strings prior to ranking by frequency.
+
+    Args:
+        df: Cleaned Pandas DataFrame.
+        top_n: Number of top frequent unique examples to extract (default: 5).
+        max_val_len: Maximum character length per example value.
+
+    Returns:
+        Dictionary mapping string/object column names to lists of top unique values.
+    """
+    examples: Dict[str, List[str]] = {}
+    for col in df.columns:
+        series = df[col]
+        if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+            continue
+
+        non_null = series.dropna()
+        if non_null.empty:
+            continue
+
+        # Convert to stripped string and ignore blank entries
+        str_series = non_null.astype(str).str.strip()
+        str_series = str_series[str_series != ""]
+        if str_series.empty:
+            continue
+
+        top_values = str_series.value_counts().head(top_n).index.tolist()
+        formatted_vals: List[str] = []
+        for val in top_values:
+            val_str = str(val).replace("\n", " ").strip()
+            if len(val_str) > max_val_len:
+                val_str = val_str[: max_val_len - 3] + "..."
+            formatted_vals.append(val_str)
+
+        if formatted_vals:
+            examples[str(col)] = formatted_vals
+
+    return examples
+
+
+def format_table_schema(table: TableSchema) -> str:
+    """Format a TableSchema object into a clean enriched schema text block."""
+    return table.format_enriched_schema()
+
 
 def extract_columns_and_types(df: "pd.DataFrame") -> Dict[str, str]:
     """Extract column names and normalize their data types from a Pandas DataFrame.
@@ -279,25 +388,32 @@ def extract_as_of_date(text: str) -> Optional[str]:
     return None
 
 
-def parse_csv_head(file_path: Union[str, Path], n_rows: int = 5) -> TableSchema:
-    """Read top 5 rows (head) of a CSV file using Pandas without full file loading.
+def parse_csv_head(
+    file_path: Union[str, Path],
+    n_rows: int = 5,
+    stats_rows: int = 5000,
+    top_n_examples: int = 5,
+) -> TableSchema:
+    """Read schema, top unique categorical examples, and head(5) rows of a CSV file.
 
-    Extracts column names, data types, and top 5 sample rows.
-    Supports encoding fallback (utf-8-sig, utf-8, latin-1, cp1252) and auto delimiter detection.
+    Applies whitespace stripping across all string/object columns prior to sampling
+    the top 3-5 most frequent non-null values and top sample records.
 
     Args:
         file_path: Path to the .csv file.
-        n_rows: Number of top rows to read (default: 5).
+        n_rows: Number of top rows to keep in sample_rows (default: 5).
+        stats_rows: Maximum rows to inspect for categorical frequency enrichment (default: 5000).
+        top_n_examples: Top N frequent unique values to capture per string/object column (default: 5).
 
     Returns:
-        TableSchema containing columns, types, and sample rows.
+        Enriched TableSchema containing columns, types, categorical examples, and sample rows.
     """
     path = Path(file_path).resolve()
     if not path.exists():
         logger.warning(f"CSV file not found: {path}")
         return TableSchema(name=path.name, source_type="csv", file_path=str(path))
 
-    # Fast row count estimation without loading dataframe
+    # Fast row count estimation without loading full dataframe
     try:
         with open(path, "rb") as f:
             total_rows = sum(1 for _ in f) - 1
@@ -306,22 +422,29 @@ def parse_csv_head(file_path: Union[str, Path], n_rows: int = 5) -> TableSchema:
     except Exception:
         total_rows = None
 
+    read_limit = max(n_rows, stats_rows) if stats_rows else n_rows
+
     if _HAS_PANDAS:
         for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
             try:
-                # 1. Read first n_rows with standard comma
-                df = pd.read_csv(path, nrows=n_rows, encoding=enc)
+                # 1. Read sample window with standard comma
+                df = pd.read_csv(path, nrows=read_limit, encoding=enc)
 
                 # Check if file uses semicolon or tab delimiter instead of comma
                 if len(df.columns) == 1 and total_rows and total_rows > 0:
                     first_col = str(df.columns[0])
                     if ";" in first_col:
-                        df = pd.read_csv(path, nrows=n_rows, encoding=enc, sep=";")
+                        df = pd.read_csv(path, nrows=read_limit, encoding=enc, sep=";")
                     elif "\t" in first_col:
-                        df = pd.read_csv(path, nrows=n_rows, encoding=enc, sep="\t")
+                        df = pd.read_csv(path, nrows=read_limit, encoding=enc, sep="\t")
+
+                # 2. Clean leading/trailing whitespace on all string/object columns
+                df = strip_dataframe_whitespace(df)
 
                 columns = [str(c) for c in df.columns]
                 col_types = extract_columns_and_types(df)
+                raw_col_types = {str(col): str(dtype) for col, dtype in df.dtypes.items()}
+                col_examples = sample_unique_values(df, top_n=top_n_examples)
                 sample_rows = clean_sample_records(df, n_rows=n_rows)
 
                 return TableSchema(
@@ -330,6 +453,8 @@ def parse_csv_head(file_path: Union[str, Path], n_rows: int = 5) -> TableSchema:
                     file_path=str(path),
                     columns=columns,
                     column_types=col_types,
+                    raw_column_types=raw_col_types,
+                    column_examples=col_examples,
                     sample_rows=sample_rows,
                     total_rows=total_rows,
                 )
@@ -338,20 +463,39 @@ def parse_csv_head(file_path: Union[str, Path], n_rows: int = 5) -> TableSchema:
 
     # Pure Python fallback if Pandas is unavailable or failed
     try:
+        from collections import Counter
         with open(path, mode="r", encoding="utf-8-sig", errors="replace") as f:
             reader = csv.DictReader(f)
             columns = [str(c) for c in (reader.fieldnames or [])]
             sample_rows = []
+            col_counters: Dict[str, Counter] = {c: Counter() for c in columns}
             for idx, row in enumerate(reader):
-                if idx >= n_rows:
+                if idx >= read_limit:
                     break
-                sample_rows.append(row)
+                cleaned_row = {
+                    str(k): (v.strip() if isinstance(v, str) else v)
+                    for k, v in row.items()
+                }
+                if idx < n_rows:
+                    sample_rows.append(cleaned_row)
+                for c in columns:
+                    val = cleaned_row.get(c)
+                    if val is not None and str(val).strip() != "":
+                        col_counters[c][str(val).strip()] += 1
+
+        col_examples = {
+            c: [val for val, _ in col_counters[c].most_common(top_n_examples)]
+            for c in columns
+            if col_counters[c]
+        }
         return TableSchema(
             name=path.name,
             source_type="csv",
             file_path=str(path),
             columns=columns,
             column_types={c: "string" for c in columns},
+            raw_column_types={c: "object" for c in columns},
+            column_examples=col_examples,
             sample_rows=sample_rows,
             total_rows=total_rows,
         )
@@ -360,17 +504,25 @@ def parse_csv_head(file_path: Union[str, Path], n_rows: int = 5) -> TableSchema:
         return TableSchema(name=path.name, source_type="csv", file_path=str(path))
 
 
-def parse_excel_head(file_path: Union[str, Path], n_rows: int = 5) -> List[TableSchema]:
-    """Read top 5 rows (head) of each sheet in an Excel (.xlsx, .xls) file using Pandas.
+def parse_excel_head(
+    file_path: Union[str, Path],
+    n_rows: int = 5,
+    stats_rows: int = 5000,
+    top_n_examples: int = 5,
+) -> List[TableSchema]:
+    """Read schema, categorical examples, and head(5) rows of each sheet in an Excel workbook.
 
-    Extracts sheet names, column names, data types, and top 5 sample rows.
+    Applies whitespace stripping across all string/object columns before calculating
+    top unique values and sample records.
 
     Args:
         file_path: Path to .xlsx or .xls file.
-        n_rows: Number of top rows to read (default: 5).
+        n_rows: Number of top rows to keep in sample_rows (default: 5).
+        stats_rows: Maximum rows to read per sheet for frequency sampling (default: 5000).
+        top_n_examples: Top N frequent unique values per string/object column (default: 5).
 
     Returns:
-        List of TableSchema (one per sheet in workbook).
+        List of enriched TableSchema (one per sheet in workbook).
     """
     path = Path(file_path).resolve()
     if not path.exists():
@@ -382,13 +534,19 @@ def parse_excel_head(file_path: Union[str, Path], n_rows: int = 5) -> List[Table
         logger.warning("Pandas is not installed. Cannot parse Excel file.")
         return [TableSchema(name=path.name, source_type="xlsx", file_path=str(path))]
 
+    read_limit = max(n_rows, stats_rows) if stats_rows else n_rows
+
     try:
         with pd.ExcelFile(path) as excel_file:
             for sheet_name in excel_file.sheet_names:
                 try:
-                    df = pd.read_excel(excel_file, sheet_name=sheet_name, nrows=n_rows)
+                    df = pd.read_excel(excel_file, sheet_name=sheet_name, nrows=read_limit)
+                    df = strip_dataframe_whitespace(df)
+
                     columns = [str(c) for c in df.columns]
                     col_types = extract_columns_and_types(df)
+                    raw_col_types = {str(col): str(dtype) for col, dtype in df.dtypes.items()}
+                    col_examples = sample_unique_values(df, top_n=top_n_examples)
                     sample_rows = clean_sample_records(df, n_rows=n_rows)
 
                     schemas.append(
@@ -398,6 +556,8 @@ def parse_excel_head(file_path: Union[str, Path], n_rows: int = 5) -> List[Table
                             file_path=str(path),
                             columns=columns,
                             column_types=col_types,
+                            raw_column_types=raw_col_types,
+                            column_examples=col_examples,
                             sample_rows=sample_rows,
                             sheet_name=sheet_name,
                         )
@@ -419,15 +579,20 @@ def parse_excel_head(file_path: Union[str, Path], n_rows: int = 5) -> List[Table
     return schemas
 
 
-def parse_sqlite_head(file_path: Union[str, Path], n_rows: int = 5) -> List[TableSchema]:
-    """Read top 5 rows (head) of each table in a SQLite database file.
+def parse_sqlite_head(
+    file_path: Union[str, Path],
+    n_rows: int = 5,
+    top_n_examples: int = 5,
+) -> List[TableSchema]:
+    """Read schema, top unique string examples, and head(5) rows of each table in SQLite.
 
     Args:
         file_path: Path to .sqlite / .db / .sqlite3 file.
         n_rows: Number of top rows to read (default: 5).
+        top_n_examples: Top N frequent unique values per text column (default: 5).
 
     Returns:
-        List of TableSchema (one per user table in database).
+        List of enriched TableSchema (one per user table in database).
     """
     path = Path(file_path).resolve()
     if not path.exists():
@@ -450,15 +615,45 @@ def parse_sqlite_head(file_path: Union[str, Path], n_rows: int = 5) -> List[Tabl
                 cols_info = cursor.fetchall()
                 columns = [str(c[1]) for c in cols_info]
                 col_types = {str(c[1]): (c[2] or "TEXT").lower() for c in cols_info}
+                raw_col_types = {
+                    str(c[1]): ("object" if "char" in (c[2] or "text").lower() or "text" in (c[2] or "text").lower() or "clob" in (c[2] or "text").lower() else (c[2] or "object").lower())
+                    for c in cols_info
+                }
 
                 # Count rows
                 cursor.execute(f"SELECT COUNT(*) FROM '{t_name}'")
                 total_rows = cursor.fetchone()[0]
 
-                # Head n_rows sample
+                # Head n_rows sample (stripping string whitespace)
                 cursor.execute(f"SELECT * FROM '{t_name}' LIMIT {n_rows}")
                 raw_rows = cursor.fetchall()
-                sample_rows = [dict(zip(columns, row)) for row in raw_rows]
+                sample_rows = [
+                    {
+                        col: (val.strip() if isinstance(val, str) else val)
+                        for col, val in zip(columns, row)
+                    }
+                    for row in raw_rows
+                ]
+
+                # Sample top unique values for text/object columns
+                col_examples: Dict[str, List[str]] = {}
+                for col in columns:
+                    if raw_col_types.get(col) == "object" or "text" in col_types.get(col, ""):
+                        try:
+                            safe_col = col.replace('"', '""')
+                            safe_tbl = t_name.replace('"', '""')
+                            cursor.execute(
+                                f'SELECT TRIM("{safe_col}") AS v, COUNT(*) AS cnt '
+                                f'FROM "{safe_tbl}" '
+                                f'WHERE "{safe_col}" IS NOT NULL AND TRIM("{safe_col}") != "" '
+                                f'GROUP BY TRIM("{safe_col}") '
+                                f'ORDER BY cnt DESC LIMIT {top_n_examples}'
+                            )
+                            vals = [str(r[0]) for r in cursor.fetchall() if r[0] is not None]
+                            if vals:
+                                col_examples[col] = vals
+                        except Exception:
+                            pass
 
                 schemas.append(
                     TableSchema(
@@ -467,6 +662,8 @@ def parse_sqlite_head(file_path: Union[str, Path], n_rows: int = 5) -> List[Tabl
                         file_path=str(path),
                         columns=columns,
                         column_types=col_types,
+                        raw_column_types=raw_col_types,
+                        column_examples=col_examples,
                         sample_rows=sample_rows,
                         total_rows=total_rows,
                         extra_notes=f"SQLite Table: {t_name}",
@@ -484,12 +681,17 @@ def parse_sqlite_head(file_path: Union[str, Path], n_rows: int = 5) -> List[Tabl
     return schemas
 
 
-def parse_table_head(file_path: Union[str, Path], n_rows: int = 5) -> List[TableSchema]:
-    """Generic dispatcher: reads 5 rows head and schema of CSV, Excel, or SQLite file.
+def parse_table_head(
+    file_path: Union[str, Path],
+    n_rows: int = 5,
+    top_n_examples: int = 5,
+) -> List[TableSchema]:
+    """Generic dispatcher: reads schema, categorical examples, and head rows of CSV, Excel, or SQLite.
 
     Args:
         file_path: File path to parse.
         n_rows: Number of top rows to read (default: 5).
+        top_n_examples: Top N frequent unique values per string/object column (default: 5).
 
     Returns:
         List of TableSchema objects.
@@ -498,14 +700,85 @@ def parse_table_head(file_path: Union[str, Path], n_rows: int = 5) -> List[Table
     ext = p.suffix.lower()
 
     if ext == ".csv":
-        return [parse_csv_head(p, n_rows=n_rows)]
+        return [parse_csv_head(p, n_rows=n_rows, top_n_examples=top_n_examples)]
     elif ext in (".xlsx", ".xls"):
-        return parse_excel_head(p, n_rows=n_rows)
+        return parse_excel_head(p, n_rows=n_rows, top_n_examples=top_n_examples)
     elif ext in (".sqlite", ".db", ".sqlite3"):
-        return parse_sqlite_head(p, n_rows=n_rows)
+        return parse_sqlite_head(p, n_rows=n_rows, top_n_examples=top_n_examples)
     else:
         logger.debug(f"Unsupported file format for table parsing: {p.name}")
         return []
+
+
+def _scan_directory_context(
+    target_dir: Path,
+    business_id: Optional[str] = None,
+    readme_base_dir: Optional[Path] = None,
+    n_rows: int = 5,
+) -> DatasetContext:
+    """Scan a resolved dataset directory for README, metadata, and tabular schemas."""
+    if not target_dir.exists():
+        logger.warning(f"Target directory {target_dir} does not exist.")
+        return DatasetContext(data_dir=str(target_dir), business_id=business_id)
+
+    readme_root = readme_base_dir if readme_base_dir is not None else target_dir
+    readme_content = read_business_readme(business_id=business_id, data_dir=readme_root)
+    as_of_date = extract_as_of_date(readme_content)
+
+    for meta_name in ("metadata.json", "meta.json"):
+        meta_path = target_dir / meta_name
+        if meta_path.is_file():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                if not as_of_date and "as_of_date" in meta:
+                    as_of_date = str(meta["as_of_date"])
+            except Exception as e:
+                logger.debug(f"Error reading {meta_path}: {e}")
+
+    tables: List[TableSchema] = []
+    file_map: Dict[str, str] = {}
+
+    for file in sorted(target_dir.iterdir()):
+        if file.is_dir() or file.name.startswith("."):
+            continue
+
+        ext = file.suffix.lower()
+        if ext in (".csv", ".xlsx", ".xls", ".sqlite", ".db", ".sqlite3"):
+            file_map[file.name] = str(file.resolve())
+            tables.extend(parse_table_head(file, n_rows=n_rows))
+
+    return DatasetContext(
+        data_dir=str(target_dir),
+        business_id=business_id,
+        readme_content=readme_content if readme_content else None,
+        as_of_date=as_of_date,
+        tables=tables,
+        file_map=file_map,
+    )
+
+
+@lru_cache(maxsize=256)
+def get_business_schema(
+    business_dir: str,
+    max_readme_chars: int = 1500,
+    n_rows: int = 5,
+) -> str:
+    """Read tabular files and README inside ``business_dir`` and return a cached schema string.
+
+    Decorated with ``@lru_cache(maxsize=256)`` so repeated calls for the same
+    ``business_dir`` immediately return the cached string without hitting disk.
+
+    Args:
+        business_dir: Path to the directory containing README.md and CSV/XLSX/SQLite files.
+        max_readme_chars: Maximum characters of README to include in prompt (default: 1500).
+        n_rows: Number of sample rows to extract per table (default: 5).
+
+    Returns:
+        Formatted schema string ready to inject into ``PromptBuilder``.
+    """
+    target_dir = Path(business_dir).resolve()
+    context = _scan_directory_context(target_dir=target_dir, business_id=None, n_rows=n_rows)
+    return context.to_prompt_context(max_readme_chars=max_readme_chars)
 
 
 def build_schema_string(
@@ -527,8 +800,15 @@ def build_schema_string(
     Returns:
         Neat schema string ready to be injected into PromptBuilder.
     """
+    if not business_id:
+        return get_business_schema(
+            str(Path(data_dir).resolve()),
+            max_readme_chars=max_readme_chars,
+            n_rows=n_rows,
+        )
+
     parser = SchemaParser(data_dir=data_dir)
-    context = parser.parse(business_id=business_id)
+    context = parser.parse(business_id=business_id, n_rows=n_rows)
     return context.to_prompt_context(max_readme_chars=max_readme_chars)
 
 
@@ -591,49 +871,11 @@ class SchemaParser:
             return self._cached_contexts[cache_key]
 
         target_dir = self.get_business_dir(business_id)
-        if not target_dir.exists():
-            logger.warning(f"Target directory {target_dir} does not exist.")
-            ctx = DatasetContext(data_dir=str(target_dir), business_id=business_id)
-            self._cached_contexts[cache_key] = ctx
-            return ctx
-
-        # 1. Read README.md for business context
-        readme_content = read_business_readme(business_id=business_id, data_dir=self.data_dir)
-        as_of_date = extract_as_of_date(readme_content)
-
-        # Also check metadata.json if exists
-        for meta_name in ("metadata.json", "meta.json"):
-            meta_path = target_dir / meta_name
-            if meta_path.is_file():
-                try:
-                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                    if not as_of_date and "as_of_date" in meta:
-                        as_of_date = str(meta["as_of_date"])
-                except Exception as e:
-                    logger.debug(f"Error reading {meta_path}: {e}")
-
-        # 2. Inspect and parse all tabular files in target directory
-        tables: List[TableSchema] = []
-        file_map: Dict[str, str] = {}
-
-        # Scan files (non-recursive in target_dir to avoid indexing sub-businesses)
-        for file in sorted(target_dir.iterdir()):
-            if file.is_dir() or file.name.startswith("."):
-                continue
-
-            ext = file.suffix.lower()
-            if ext in (".csv", ".xlsx", ".xls", ".sqlite", ".db", ".sqlite3"):
-                file_map[file.name] = str(file.resolve())
-                parsed_schemas = parse_table_head(file, n_rows=n_rows)
-                tables.extend(parsed_schemas)
-
-        context = DatasetContext(
-            data_dir=str(target_dir),
+        context = _scan_directory_context(
+            target_dir=target_dir,
             business_id=business_id,
-            readme_content=readme_content if readme_content else None,
-            as_of_date=as_of_date,
-            tables=tables,
-            file_map=file_map,
+            readme_base_dir=self.data_dir,
+            n_rows=n_rows,
         )
 
         self._cached_contexts[cache_key] = context

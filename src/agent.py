@@ -86,7 +86,7 @@ def load_vllm_engine(
     return llm, sampling_params
 
 
-class VLLMAgent:
+class CodeAgent:
     """Manages local vLLM instance for high-throughput, offline Python code generation."""
 
     def __init__(
@@ -182,6 +182,46 @@ class VLLMAgent:
 
         return self.extract_python_code(raw_output)
 
+    def generate_code_batch(
+        self,
+        prompts: list[str],
+        system_prompt: Optional[str] = None,
+    ) -> list[str]:
+        """Generate Python completions for a batch of prompts simultaneously via vLLM.
+
+        Args:
+            prompts: Ordered list of prompts to feed into vLLM batch generation.
+            system_prompt: Optional system prompt to wrap prompts in ChatML format if
+                provided; when ``None``, passes ``prompts`` directly to ``self.llm.generate``.
+
+        Returns:
+            List of extracted text completions in the exact same order as ``prompts``.
+        """
+        if not prompts:
+            return []
+
+        if self.dry_run or self.llm is None:
+            return [self._mock_generate_code(prompt) for prompt in prompts]
+
+        if system_prompt is not None:
+            batch_inputs = [
+                (
+                    f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+                    f"<|im_start|>user\n{prompt}<|im_end|>\n"
+                    f"<|im_start|>assistant\n"
+                )
+                for prompt in prompts
+            ]
+        else:
+            batch_inputs = prompts
+
+        outputs = self.llm.generate(batch_inputs, self.sampling_params)
+        results: list[str] = []
+        for output in outputs:
+            text = output.outputs[0].text.strip() if getattr(output, "outputs", None) else ""
+            results.append(text)
+        return results
+
     def extract_python_code(self, text: str) -> str:
         """Extract clean executable code from LLM completion text.
 
@@ -248,6 +288,10 @@ class VLLMAgent:
         )
 
 
+# Backwards-compatible alias
+VLLMAgent = CodeAgent
+
+
 def main() -> None:
     """CLI test script to load vLLM model and verify greedy generation."""
     parser = argparse.ArgumentParser(description="Load Qwen2.5-14B-Instruct via vLLM with temperature=0.0")
@@ -257,7 +301,7 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    agent = VLLMAgent(model_path=args.model_path, temperature=args.temperature, dry_run=args.dry_run)
+    agent = CodeAgent(model_path=args.model_path, temperature=args.temperature, dry_run=args.dry_run)
 
     test_prompt = "Hãy viết code pandas tính tổng doanh thu từ sales.csv"
     code = agent.generate_code(test_prompt)

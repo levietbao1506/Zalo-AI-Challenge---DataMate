@@ -11,8 +11,10 @@ from src.evaluator import (
     is_answer_match,
 )
 from src.main import (
+    BATCH_SIZE,
     load_questions,
     main,
+    process_batch_chunk,
     process_single_question,
 )
 from src.agent import VLLMAgent
@@ -147,6 +149,59 @@ class TestPipelineE2E(unittest.TestCase):
             self.assertGreater(eval_summary["average_latency_seconds"], 0.0)
             self.assertLess(eval_summary["average_latency_seconds"], 5.0)  # fast batch latency
             self.assertGreaterEqual(eval_summary["penalized_score"], 0.0)
+
+    def test_batch_chunk_pipeline_fast_path_and_sequential_retry_fallback(self):
+        """Batch chunk runs generate_code_batch once and falls back to generate_code only for failures/empty."""
+        self.assertEqual(BATCH_SIZE, 32)
+        parser = SchemaParser(self.sample_data_dir)
+        context = parser.parse()
+        schema_str = context.to_prompt_context()
+        prompt_builder = PromptBuilder()
+        system_prompt = prompt_builder.build_system_prompt()
+
+        batch_calls = []
+        retry_calls = []
+
+        class MockBatchAndRetryAgent:
+            def generate_code_batch(self, prompts):
+                batch_calls.append(prompts)
+                return [
+                    "```python\nfinal_result = 100\n```",
+                    "```python\nimport pandas as pd\nfinal_result = pd.DataFrame()\n```",
+                    "```python\nfinal_result = missing_var\n```",
+                ]
+
+            def generate_code(self, prompt, system_prompt=None):
+                retry_calls.append(prompt)
+                if "missing_var" in prompt:
+                    return 'final_result = "Hà Nội"'
+                return "final_result = 250.5"
+
+        chunk = [
+            {"id": "q1", "type": "number", "question": "Q1?"},
+            {"id": "q2", "type": "number", "question": "Q2?"},
+            {"id": "q3", "type": "string", "question": "Q3?"},
+        ]
+
+        records = process_batch_chunk(
+            chunk=chunk,
+            dataset_context=context,
+            schema_prompt_str=schema_str,
+            agent=MockBatchAndRetryAgent(),
+            prompt_builder=prompt_builder,
+            system_prompt=system_prompt,
+            max_retries=3,
+            timeout=5.0,
+            parser=parser,
+        )
+
+        self.assertEqual(len(batch_calls), 1)
+        self.assertEqual(len(batch_calls[0]), 3)
+        # Only Q2 (empty DataFrame) and Q3 (NameError) needed sequential retries; Q1 succeeded on batch
+        self.assertEqual(len(retry_calls), 2)
+        self.assertEqual(records[0]["answer"], 100)
+        self.assertEqual(records[1]["answer"], 250.5)
+        self.assertEqual(records[2]["answer"], "Hà Nội")
 
 
 if __name__ == "__main__":

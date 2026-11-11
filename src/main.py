@@ -10,18 +10,28 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+from functools import partial
 import json
 import logging
 from pathlib import Path
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
-from src.agent import VLLMAgent
-from src.executor import SandboxedExecutor
-from src.formatter import format_output, format_scalar, format_submission_record
+from src.agent import CodeAgent, VLLMAgent
+from src.executor import (
+    EMPTY_RESULT_FEEDBACK,
+    SandboxedExecutor,
+    execute_local,
+    execute_with_retry,
+    extract_code,
+    is_empty_result,
+)
+from src.formatter import format_output, format_submission_record
 from src.prompt_builder import PromptBuilder
-from src.schema_parser import DatasetContext, SchemaParser
+from src.schema_parser import DatasetContext, SchemaParser, get_business_schema
+
+BATCH_SIZE = 32
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,7 +81,13 @@ def parse_arguments() -> argparse.Namespace:
         "--max_retries",
         type=int,
         default=3,
-        help="Maximum self-correction retries for code execution errors (default: 3)",
+        help="Maximum self-correction attempts including initial pass (default: 3)",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=BATCH_SIZE,
+        help=f"Number of questions per vLLM batch inference chunk (default: {BATCH_SIZE})",
     )
     parser.add_argument(
         "--dry_run",
@@ -116,20 +132,13 @@ def process_single_question(
     parser: Optional[SchemaParser] = None,
 ) -> Any:
     """Process a single question through agent generation, execution, and self-correction."""
-    q_id = q_data.get("id") or q_data.get("question_id") or "unknown"
     question_text = q_data.get("question") or q_data.get("text") or ""
-
-    # Dynamically resolve business_id context if present
-    biz_id = q_data.get("business_id") or q_data.get("db_id")
-    if biz_id and parser:
-        active_context = parser.parse(business_id=biz_id)
-        active_schema_str = active_context.to_prompt_context()
-    else:
-        active_context = dataset_context
-        active_schema_str = schema_prompt_str
-
-    # Extract reference as_of_date if specified at question level, otherwise use dataset default
-    q_as_of = q_data.get("as_of_date") or active_context.as_of_date
+    active_context, active_schema_str, q_as_of = _resolve_question_context(
+        q_data=q_data,
+        dataset_context=dataset_context,
+        schema_prompt_str=schema_prompt_str,
+        parser=parser,
+    )
 
     # 1. Compose user prompt
     user_prompt = prompt_builder.build_user_prompt(
@@ -171,6 +180,177 @@ def process_single_question(
     return formatted_answer
 
 
+def _format_chatml_prompt(system_prompt: str, user_prompt: str) -> str:
+    """Wrap system and user prompts into Qwen ChatML format for batch inference."""
+    return (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+
+def _resolve_question_context(
+    q_data: Dict[str, Any],
+    dataset_context: DatasetContext,
+    schema_prompt_str: str,
+    parser: Optional[SchemaParser] = None,
+) -> tuple[DatasetContext, str, Optional[str]]:
+    """Resolve active DatasetContext, cached schema string, and as_of_date for a question."""
+    biz_id = q_data.get("business_id") or q_data.get("db_id")
+    if biz_id and parser:
+        active_context = parser.parse(business_id=biz_id)
+        active_schema_str = get_business_schema(active_context.data_dir)
+    else:
+        active_context = dataset_context
+        active_schema_str = schema_prompt_str
+
+    q_as_of = q_data.get("as_of_date") or active_context.as_of_date
+    return active_context, active_schema_str, q_as_of
+
+
+def iter_process_batch_chunk(
+    chunk: List[Dict[str, Any]],
+    dataset_context: DatasetContext,
+    schema_prompt_str: str,
+    agent: CodeAgent,
+    prompt_builder: PromptBuilder,
+    system_prompt: str,
+    max_retries: int,
+    timeout: float,
+    parser: Optional[SchemaParser] = None,
+) -> Iterator[Dict[str, Any]]:
+    """Process one batch chunk of questions: build prompts, run vLLM batch, execute & retry sequentially.
+
+    Step A: Build initial prompts for every question in ``chunk`` via ``prompt_builder``.
+    Step B: Call ``agent.generate_code_batch(batch_prompts)`` in one vLLM batch pass.
+    Step C: For each generated completion, extract code and execute locally via
+        :func:`execute_local`. If execution succeeds and :func:`is_empty_result` is
+        ``False``, format and yield immediately; otherwise fall back to sequential
+        :func:`execute_with_retry` powered by ``agent.generate_code`` for subsequent retries.
+    """
+    batch_prompts: List[str] = []
+    batch_meta: List[Dict[str, Any]] = []
+
+    # Step A: Build initial prompts for the chunk
+    for idx, q_data in enumerate(chunk, 1):
+        q_id = q_data.get("id") or q_data.get("question_id") or f"unknown_{idx}"
+        question_text = q_data.get("question") or q_data.get("text") or ""
+        active_context, active_schema_str, q_as_of = _resolve_question_context(
+            q_data=q_data,
+            dataset_context=dataset_context,
+            schema_prompt_str=schema_prompt_str,
+            parser=parser,
+        )
+        user_prompt = prompt_builder.build_user_prompt(
+            question=question_text,
+            schema_context=active_schema_str,
+            as_of_date=q_as_of,
+            file_map=active_context.file_map,
+        )
+        batch_prompts.append(_format_chatml_prompt(system_prompt, user_prompt))
+        batch_meta.append({
+            "q_id": q_id,
+            "q_type": q_data.get("type"),
+            "data_dir": active_context.data_dir,
+            "file_map": active_context.file_map,
+            "as_of_date": q_as_of,
+            "user_prompt": user_prompt,
+        })
+
+    # Step B: Simultaneous vLLM batch inference for initial code generation
+    try:
+        batch_responses = agent.generate_code_batch(batch_prompts)
+    except Exception as e:
+        logger.error(f"Batch code generation failed: {e}. Falling back to empty batch responses.")
+        batch_responses = [""] * len(batch_meta)
+
+    if len(batch_responses) < len(batch_meta):
+        batch_responses = list(batch_responses) + [""] * (len(batch_meta) - len(batch_responses))
+
+    single_generate_fn = partial(agent.generate_code, system_prompt=system_prompt)
+    retry_budget = max(0, max_retries - 1)
+
+    # Step C: Execute each initial completion, falling back to sequential retry only on failure
+    for meta, raw_response in zip(batch_meta, batch_responses):
+        q_id = meta["q_id"]
+        try:
+            code_str = extract_code(raw_response)
+            success, raw_result, error_msg = execute_local(
+                code_str,
+                meta["data_dir"],
+                file_map=meta["file_map"],
+                as_of_date=meta["as_of_date"],
+                timeout_seconds=timeout,
+            )
+
+            if success and not is_empty_result(raw_result):
+                final_success, final_result = True, raw_result
+            elif retry_budget > 0:
+                failed_code = f"```python\n{code_str}\n```\n" if code_str else ""
+                feedback_line = (
+                    f"Đoạn code trên bị lỗi: {error_msg}. Hãy viết lại code sửa lỗi."
+                    if not success
+                    else EMPTY_RESULT_FEEDBACK
+                )
+                retry_initial_prompt = f"{meta['user_prompt']}\n{failed_code}{feedback_line}"
+                final_success, final_result, _ = execute_with_retry(
+                    initial_prompt=retry_initial_prompt,
+                    generate_fn=single_generate_fn,
+                    data_dir=meta["data_dir"],
+                    max_retries=retry_budget,
+                    file_map=meta["file_map"],
+                    as_of_date=meta["as_of_date"],
+                    timeout_seconds=timeout,
+                )
+            else:
+                final_success, final_result = False, None
+
+            formatted_answer = format_output(
+                val=final_result if final_success else None,
+                success=final_success,
+                round_decimals=2,
+                abstain_token="abstain",
+                clean_text=False,
+            )
+        except Exception as e:
+            logger.error(f"Unexpected exception processing {q_id}: {e}")
+            formatted_answer = "abstain"
+
+        yield format_submission_record(
+            q_id=q_id,
+            answer=formatted_answer,
+            q_type=meta["q_type"],
+            abstain_token="abstain",
+        )
+
+
+def process_batch_chunk(
+    chunk: List[Dict[str, Any]],
+    dataset_context: DatasetContext,
+    schema_prompt_str: str,
+    agent: CodeAgent,
+    prompt_builder: PromptBuilder,
+    system_prompt: str,
+    max_retries: int,
+    timeout: float,
+    parser: Optional[SchemaParser] = None,
+) -> List[Dict[str, Any]]:
+    """Process a batch chunk and return formatted submission records in order."""
+    return list(
+        iter_process_batch_chunk(
+            chunk=chunk,
+            dataset_context=dataset_context,
+            schema_prompt_str=schema_prompt_str,
+            agent=agent,
+            prompt_builder=prompt_builder,
+            system_prompt=system_prompt,
+            max_retries=max_retries,
+            timeout=timeout,
+            parser=parser,
+        )
+    )
+
+
 def main() -> None:
     """Main pipeline execution entry point."""
     start_time = time.time()
@@ -179,29 +359,31 @@ def main() -> None:
     data_dir = Path(args.data_dir).resolve()
     questions_file = Path(args.questions_file).resolve() if args.questions_file else data_dir / "questions.jsonl"
     output_file = Path(args.output_file).resolve()
+    batch_size = max(1, int(args.batch_size))
 
     logger.info("=" * 60)
-    logger.info("Starting Zalo DataMate 2026 Pipeline Orchestrator")
+    logger.info("Starting Zalo DataMate 2026 Pipeline Orchestrator (Batch Mode)")
     logger.info(f"Data Directory:    {data_dir}")
     logger.info(f"Questions File:    {questions_file}")
     logger.info(f"Output File:       {output_file}")
     logger.info(f"Model Path:        {args.model_path}")
+    logger.info(f"Batch Size:        {batch_size}")
     logger.info(f"Execution Timeout: {args.timeout}s")
-    logger.info(f"Max Retries:       {args.max_retries}")
+    logger.info(f"Max Attempts:      {args.max_retries}")
     logger.info("=" * 60)
 
     # Step 1: Parse and cache dataset schema & documentation
     parser = SchemaParser(data_dir=data_dir)
     context = parser.parse()
-    schema_prompt_str = context.to_prompt_context()
+    schema_prompt_str = get_business_schema(context.data_dir)
     logger.info(f"Discovered {len(context.tables)} table resources in dataset.")
     if context.as_of_date:
         logger.info(f"Dataset as_of_date detected: {context.as_of_date}")
 
-    # Step 2: Initialize Agent, Sandbox, and Prompt Builder
+    # Step 2: Initialize Agent and Prompt Builder
     prompt_builder = PromptBuilder()
-    executor = SandboxedExecutor(default_timeout_seconds=args.timeout)
-    agent = VLLMAgent(
+    system_prompt = prompt_builder.build_system_prompt()
+    agent = CodeAgent(
         model_path=args.model_path,
         gpu_memory_utilization=0.90,
         max_model_len=4096,
@@ -217,50 +399,45 @@ def main() -> None:
         output_file.write_text("", encoding="utf-8")
         return
 
-    # Step 4: Process questions and stream to submission.jsonl
+    # Step 4: Process questions in BATCH_SIZE chunks and stream to output JSONL
     output_file.parent.mkdir(parents=True, exist_ok=True)
     total_q = len(questions)
     answered_count = 0
     abstained_count = 0
+    processed_count = 0
 
     with open(output_file, "w", encoding="utf-8") as out_f:
-        for idx, q_data in enumerate(questions, 1):
-            q_id = q_data.get("id") or q_data.get("question_id") or f"q_{idx}"
-            logger.info(f"[{idx}/{total_q}] Processing Question ID: {q_id}")
+        for batch_start in range(0, total_q, batch_size):
+            chunk = questions[batch_start : batch_start + batch_size]
+            logger.info(
+                f"Processing batch {batch_start // batch_size + 1}: "
+                f"questions {batch_start + 1}-{min(batch_start + len(chunk), total_q)}/{total_q}"
+            )
 
-            try:
-                answer = process_single_question(
-                    q_data=q_data,
-                    dataset_context=context,
-                    schema_prompt_str=schema_prompt_str,
-                    agent=agent,
-                    executor=executor,
-                    prompt_builder=prompt_builder,
-                    max_retries=args.max_retries,
-                    timeout=args.timeout,
-                    parser=parser,
-                )
-            except Exception as e:
-                logger.error(f"Unexpected exception processing {q_id}: {e}")
-                # Safe abstain on catastrophic failure to avoid penalized accuracy penalty
-                answer = "abstain"
+            for record in iter_process_batch_chunk(
+                chunk=chunk,
+                dataset_context=context,
+                schema_prompt_str=schema_prompt_str,
+                agent=agent,
+                prompt_builder=prompt_builder,
+                system_prompt=system_prompt,
+                max_retries=args.max_retries,
+                timeout=args.timeout,
+                parser=parser,
+            ):
+                processed_count += 1
+                if record.get("answer") in (None, "abstain"):
+                    abstained_count += 1
+                else:
+                    answered_count += 1
 
-            if answer is None or answer == "abstain":
-                abstained_count += 1
-                answer = "abstain"
-            else:
-                answered_count += 1
-
-            # Format dictionary containing id, type, answer
-            q_type = q_data.get("type")
-            record = format_submission_record(q_id=q_id, answer=answer, q_type=q_type, abstain_token="abstain")
-            out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            out_f.flush()
+                out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                out_f.flush()
 
     elapsed = time.time() - start_time
     logger.info("=" * 60)
     logger.info("Inference Complete!")
-    logger.info(f"Total Questions:   {total_q}")
+    logger.info(f"Total Questions:   {total_q} (Processed: {processed_count})")
     logger.info(f"Answered:          {answered_count}")
     logger.info(f"Abstained (Safe):  {abstained_count}")
     logger.info(f"Total Time:        {elapsed:.2f}s ({elapsed/max(1, total_q):.2f}s/q)")
