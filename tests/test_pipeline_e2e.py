@@ -12,8 +12,12 @@ from src.evaluator import (
 )
 from src.main import (
     BATCH_SIZE,
+    DEFAULT_DATA_DIR,
+    DEFAULT_MODEL_PATH,
+    DEFAULT_OUTPUT_FILE,
     load_questions,
     main,
+    parse_arguments,
     process_batch_chunk,
     process_single_question,
 )
@@ -202,6 +206,23 @@ class TestPipelineE2E(unittest.TestCase):
         self.assertEqual(records[0]["answer"], 100)
         self.assertEqual(records[1]["answer"], 250.5)
         self.assertEqual(records[2]["answer"], "Hà Nội")
+
+    def test_main_defaults_match_phase3_local_config(self):
+        """Ensure CLI defaults target local Qwen2.5-Coder-0.5B-Instruct, sample_dataset, and result/submission.jsonl."""
+        import sys
+
+        old_argv = sys.argv
+        sys.argv = ["main.py"]
+        try:
+            args = parse_arguments()
+        finally:
+            sys.argv = old_argv
+
+        self.assertEqual(args.model_path, "./models/Qwen2.5-Coder-0.5B-Instruct")
+        self.assertEqual(DEFAULT_MODEL_PATH, "./models/Qwen2.5-Coder-0.5B-Instruct")
+        self.assertEqual(DEFAULT_DATA_DIR, "./data/sample_dataset")
+        self.assertEqual(DEFAULT_OUTPUT_FILE, "result/submission.jsonl")
+        self.assertEqual(args.batch_size, 32)
 
 
 if __name__ == "__main__":

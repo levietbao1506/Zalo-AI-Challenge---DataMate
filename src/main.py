@@ -18,20 +18,17 @@ import sys
 import time
 from typing import Any, Dict, Iterator, List, Optional
 
+from src import executor
 from src.agent import CodeAgent, VLLMAgent
-from src.executor import (
-    EMPTY_RESULT_FEEDBACK,
-    SandboxedExecutor,
-    execute_local,
-    execute_with_retry,
-    extract_code,
-    is_empty_result,
-)
+from src.executor import EMPTY_RESULT_FEEDBACK, SandboxedExecutor
 from src.formatter import format_output, format_submission_record
 from src.prompt_builder import PromptBuilder
 from src.schema_parser import DatasetContext, SchemaParser, get_business_schema
 
 BATCH_SIZE = 32
+DEFAULT_MODEL_PATH = "./models/Qwen2.5-Coder-0.5B-Instruct"
+DEFAULT_DATA_DIR = "./data/sample_dataset"
+DEFAULT_OUTPUT_FILE = "result/submission.jsonl"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,8 +47,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="./data",
-        help="Directory containing tabular data files and README.md (default: ./data)",
+        default=DEFAULT_DATA_DIR,
+        help=f"Directory containing tabular data files and README.md (default: {DEFAULT_DATA_DIR})",
     )
     parser.add_argument(
         "--questions_file",
@@ -62,14 +59,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--output_file",
         type=str,
-        default="./submission.jsonl",
-        help="Destination path for submission.jsonl (default: ./submission.jsonl)",
+        default=DEFAULT_OUTPUT_FILE,
+        help=f"Destination path for submission.jsonl (default: {DEFAULT_OUTPUT_FILE})",
     )
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/app/model",
-        help="Path to local model weights for vLLM (default: /app/model)",
+        default=DEFAULT_MODEL_PATH,
+        help=f"Path to local model weights for vLLM (default: {DEFAULT_MODEL_PATH})",
     )
     parser.add_argument(
         "--timeout",
@@ -274,8 +271,8 @@ def iter_process_batch_chunk(
     for meta, raw_response in zip(batch_meta, batch_responses):
         q_id = meta["q_id"]
         try:
-            code_str = extract_code(raw_response)
-            success, raw_result, error_msg = execute_local(
+            code_str = executor.extract_code(raw_response)
+            success, raw_result, error_msg = executor.execute_local(
                 code_str,
                 meta["data_dir"],
                 file_map=meta["file_map"],
@@ -283,7 +280,7 @@ def iter_process_batch_chunk(
                 timeout_seconds=timeout,
             )
 
-            if success and not is_empty_result(raw_result):
+            if success and not executor.is_empty_result(raw_result):
                 final_success, final_result = True, raw_result
             elif retry_budget > 0:
                 failed_code = f"```python\n{code_str}\n```\n" if code_str else ""
@@ -293,7 +290,7 @@ def iter_process_batch_chunk(
                     else EMPTY_RESULT_FEEDBACK
                 )
                 retry_initial_prompt = f"{meta['user_prompt']}\n{failed_code}{feedback_line}"
-                final_success, final_result, _ = execute_with_retry(
+                final_success, final_result, _ = executor.execute_with_retry(
                     initial_prompt=retry_initial_prompt,
                     generate_fn=single_generate_fn,
                     data_dir=meta["data_dir"],
@@ -353,8 +350,11 @@ def process_batch_chunk(
 
 def main() -> None:
     """Main pipeline execution entry point."""
+    model_path = "./models/Qwen2.5-Coder-0.5B-Instruct"
     start_time = time.time()
     args = parse_arguments()
+    if args.model_path:
+        model_path = args.model_path
 
     data_dir = Path(args.data_dir).resolve()
     questions_file = Path(args.questions_file).resolve() if args.questions_file else data_dir / "questions.jsonl"
@@ -366,7 +366,7 @@ def main() -> None:
     logger.info(f"Data Directory:    {data_dir}")
     logger.info(f"Questions File:    {questions_file}")
     logger.info(f"Output File:       {output_file}")
-    logger.info(f"Model Path:        {args.model_path}")
+    logger.info(f"Model Path:        {model_path}")
     logger.info(f"Batch Size:        {batch_size}")
     logger.info(f"Execution Timeout: {args.timeout}s")
     logger.info(f"Max Attempts:      {args.max_retries}")
@@ -383,13 +383,7 @@ def main() -> None:
     # Step 2: Initialize Agent and Prompt Builder
     prompt_builder = PromptBuilder()
     system_prompt = prompt_builder.build_system_prompt()
-    agent = CodeAgent(
-        model_path=args.model_path,
-        gpu_memory_utilization=0.90,
-        max_model_len=4096,
-        tensor_parallel_size=1,
-        dry_run=args.dry_run,
-    )
+    agent = CodeAgent(model_path, dry_run=args.dry_run)
 
     # Step 3: Load questions
     questions = load_questions(questions_file)

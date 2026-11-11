@@ -292,18 +292,23 @@ print("Computed output: 999")
         self.assertEqual(calls, 3)
 
     def test_is_empty_result_detection_and_valid_exceptions(self):
-        """Test is_empty_result catches empty structures while allowing abstain tokens and zeros."""
+        """Test is_empty_result catches empty structures/NA values while allowing abstain tokens and zeros."""
         self.assertTrue(is_empty_result(None))
         self.assertTrue(is_empty_result(""))
+        self.assertTrue(is_empty_result("   "))
         self.assertTrue(is_empty_result([]))
         self.assertTrue(is_empty_result({}))
         self.assertTrue(is_empty_result(pd.DataFrame()))
         self.assertTrue(is_empty_result(pd.Series(dtype=object)))
         self.assertTrue(is_empty_result(float("nan")))
+        self.assertTrue(is_empty_result(pd.NA))
+        self.assertTrue(is_empty_result(pd.NaT))
 
         # Critical exception: intentional unanswerable/abstain tokens are valid
         self.assertFalse(is_empty_result("unanswerable"))
+        self.assertFalse(is_empty_result("Unanswerable"))
         self.assertFalse(is_empty_result("abstain"))
+        self.assertFalse(is_empty_result("ABSTAIN"))
 
         # Valid non-empty scalars & collections (including numeric zero & False)
         self.assertFalse(is_empty_result(0))

@@ -122,9 +122,10 @@ def is_empty_result(result: Any) -> bool:
         return True
 
     if isinstance(result, str):
-        if result in ("unanswerable", "abstain"):
+        normalized = result.strip().lower()
+        if normalized in ("unanswerable", "abstain"):
             return False
-        return result.strip() == ""
+        return normalized == ""
 
     if isinstance(result, pd.DataFrame):
         return bool(result.empty)
@@ -138,8 +139,15 @@ def is_empty_result(result: Any) -> bool:
     if _HAS_NUMPY and isinstance(result, np.ndarray):
         return result.size == 0
 
-    if result is pd.NA or result is pd.NaT:
-        return True
+    try:
+        na_check = pd.isna(result)
+        is_bool_scalar = isinstance(na_check, bool) or (
+            _HAS_NUMPY and isinstance(na_check, np.bool_)
+        )
+        if is_bool_scalar and bool(na_check):
+            return True
+    except Exception:
+        pass
 
     if isinstance(result, float) or (_HAS_NUMPY and isinstance(result, np.floating)):
         return math.isnan(result)
