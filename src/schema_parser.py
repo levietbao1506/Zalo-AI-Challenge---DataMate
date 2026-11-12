@@ -199,7 +199,7 @@ def strip_dataframe_whitespace(df: "pd.DataFrame") -> "pd.DataFrame":
 
 def sample_unique_values(
     df: "pd.DataFrame",
-    top_n: int = 5,
+    top_n: int = 3,
     max_val_len: int = 80,
 ) -> Dict[str, List[str]]:
     """Calculate top-N most frequent unique values for every object/string column.
@@ -208,7 +208,7 @@ def sample_unique_values(
 
     Args:
         df: Cleaned Pandas DataFrame.
-        top_n: Number of top frequent unique examples to extract (default: 5).
+        top_n: Number of top frequent unique examples to extract (default: 3).
         max_val_len: Maximum character length per example value.
 
     Returns:
@@ -392,18 +392,18 @@ def parse_csv_head(
     file_path: Union[str, Path],
     n_rows: int = 5,
     stats_rows: int = 5000,
-    top_n_examples: int = 5,
+    top_n_examples: int = 3,
 ) -> TableSchema:
     """Read schema, top unique categorical examples, and head(5) rows of a CSV file.
 
     Applies whitespace stripping across all string/object columns prior to sampling
-    the top 3-5 most frequent non-null values and top sample records.
+    the top 3 most frequent non-null values and top sample records.
 
     Args:
         file_path: Path to the .csv file.
         n_rows: Number of top rows to keep in sample_rows (default: 5).
         stats_rows: Maximum rows to inspect for categorical frequency enrichment (default: 5000).
-        top_n_examples: Top N frequent unique values to capture per string/object column (default: 5).
+        top_n_examples: Top N frequent unique values to capture per string/object column (default: 3).
 
     Returns:
         Enriched TableSchema containing columns, types, categorical examples, and sample rows.
@@ -508,7 +508,7 @@ def parse_excel_head(
     file_path: Union[str, Path],
     n_rows: int = 5,
     stats_rows: int = 5000,
-    top_n_examples: int = 5,
+    top_n_examples: int = 3,
 ) -> List[TableSchema]:
     """Read schema, categorical examples, and head(5) rows of each sheet in an Excel workbook.
 
@@ -519,7 +519,7 @@ def parse_excel_head(
         file_path: Path to .xlsx or .xls file.
         n_rows: Number of top rows to keep in sample_rows (default: 5).
         stats_rows: Maximum rows to read per sheet for frequency sampling (default: 5000).
-        top_n_examples: Top N frequent unique values per string/object column (default: 5).
+        top_n_examples: Top N frequent unique values per string/object column (default: 3).
 
     Returns:
         List of enriched TableSchema (one per sheet in workbook).
@@ -582,14 +582,14 @@ def parse_excel_head(
 def parse_sqlite_head(
     file_path: Union[str, Path],
     n_rows: int = 5,
-    top_n_examples: int = 5,
+    top_n_examples: int = 3,
 ) -> List[TableSchema]:
     """Read schema, top unique string examples, and head(5) rows of each table in SQLite.
 
     Args:
         file_path: Path to .sqlite / .db / .sqlite3 file.
         n_rows: Number of top rows to read (default: 5).
-        top_n_examples: Top N frequent unique values per text column (default: 5).
+        top_n_examples: Top N frequent unique values per text column (default: 3).
 
     Returns:
         List of enriched TableSchema (one per user table in database).
@@ -684,14 +684,14 @@ def parse_sqlite_head(
 def parse_table_head(
     file_path: Union[str, Path],
     n_rows: int = 5,
-    top_n_examples: int = 5,
+    top_n_examples: int = 3,
 ) -> List[TableSchema]:
     """Generic dispatcher: reads schema, categorical examples, and head rows of CSV, Excel, or SQLite.
 
     Args:
         file_path: File path to parse.
         n_rows: Number of top rows to read (default: 5).
-        top_n_examples: Top N frequent unique values per string/object column (default: 5).
+        top_n_examples: Top N frequent unique values per string/object column (default: 3).
 
     Returns:
         List of TableSchema objects.

@@ -226,12 +226,12 @@ class TestSchemaParser(unittest.TestCase):
         ]
         pd.DataFrame(rows).to_csv(csv_file, index=False, encoding="utf-8-sig")
 
-        schema = parse_csv_head(csv_file, n_rows=5, top_n_examples=3)
+        schema = parse_csv_head(csv_file, n_rows=5)
         # Whitespace was stripped in sample_rows as well
         self.assertEqual(schema.sample_rows[0]["product_name"], "Trà sữa trân châu")
         self.assertEqual(schema.sample_rows[0]["status"], "Hoàn thành")
 
-        # Top 3 unique values ordered by frequency, NaNs dropped
+        # Defaults to top 3 unique values ordered by frequency, NaNs dropped
         self.assertEqual(schema.column_examples["product_name"], ["Trà sữa trân châu", "Cà phê sữa", "Bạc xỉu"])
         self.assertEqual(schema.column_examples["status"], ["Hoàn thành", "Đang giao", "Đã hủy"])
         self.assertNotIn("order_id", schema.column_examples)

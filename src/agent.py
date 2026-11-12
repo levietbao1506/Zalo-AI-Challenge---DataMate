@@ -1,8 +1,8 @@
 """Agent managing local vLLM inference engine for offline code generation (Bước 3).
 
-Configured with Qwen2.5-14B-Instruct and temperature=0.0 for deterministic, greedy code generation.
-Includes code extraction, regex cleaning, and seamless dry-run/mock fallback
-for running tests and developing without dedicated GPUs.
+Configured with local Qwen2.5-Coder-0.5B-Instruct (or compatible <15B Qwen models)
+and temperature=0.0 for deterministic, greedy code generation. Includes single &
+batch inference, regex code extraction, and graceful dry-run/mock fallback.
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ except ImportError:
     LLM = None
     SamplingParams = None
 
-DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-14B-Instruct"
-DEFAULT_LOCAL_MODEL_PATH = "/app/model"
+DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
+DEFAULT_LOCAL_MODEL_PATH = "./models/Qwen2.5-Coder-0.5B-Instruct"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_STOP_TOKENS = ["<|im_end|>", "</s>", "<|endoftext|>"]
 
@@ -184,9 +184,9 @@ class CodeAgent:
 
     def generate_code_batch(
         self,
-        prompts: list[str],
+        prompts: List[str],
         system_prompt: Optional[str] = None,
-    ) -> list[str]:
+    ) -> List[str]:
         """Generate Python completions for a batch of prompts simultaneously via vLLM.
 
         Args:
@@ -216,7 +216,7 @@ class CodeAgent:
             batch_inputs = prompts
 
         outputs = self.llm.generate(batch_inputs, self.sampling_params)
-        results: list[str] = []
+        results: List[str] = []
         for output in outputs:
             text = output.outputs[0].text.strip() if getattr(output, "outputs", None) else ""
             results.append(text)

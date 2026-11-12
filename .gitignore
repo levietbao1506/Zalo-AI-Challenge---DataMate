@@ -14,3 +14,6 @@ pyproject.toml
 # Submission and temporary files
 submission.jsonl
 *.log
+
+uv.lock
+models/
