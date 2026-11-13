@@ -1,8 +1,8 @@
-"""Agent managing local vLLM inference engine for offline code generation (Bước 3).
+"""Agent managing local vLLM, llama-cpp-python (GGUF), or Ollama API inference (Bước 3).
 
-Configured with local Qwen2.5-Coder-0.5B-Instruct (or compatible <15B Qwen models)
-and temperature=0.0 for deterministic, greedy code generation. Includes single &
-batch inference, regex code extraction, and graceful dry-run/mock fallback.
+Supports local vLLM models (e.g. Qwen2.5-Coder), GGUF models via ``llama-cpp-python``
+(when ``model_path`` ends with ``.gguf``), and local Ollama API models prefixed with
+``ollama:`` with temperature=0.0 for deterministic code generation.
 """
 
 from __future__ import annotations
@@ -25,8 +25,21 @@ except ImportError:
     LLM = None
     SamplingParams = None
 
-DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
-DEFAULT_LOCAL_MODEL_PATH = "./models/Qwen2.5-Coder-0.5B-Instruct"
+# Try importing llama-cpp-python for GGUF inference
+try:
+    from llama_cpp import Llama
+except ImportError:
+    Llama = None  # type: ignore[assignment]
+
+# Try importing requests for Ollama API support
+try:
+    import requests
+except ImportError:
+    requests = None  # type: ignore[assignment]
+
+DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-Coder-3B-Instruct"
+DEFAULT_LOCAL_MODEL_PATH = "./models/Qwen2.5-Coder-3B-Instruct"
+DEFAULT_OLLAMA_URL = "http://localhost:11434/api/generate"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_STOP_TOKENS = ["<|im_end|>", "</s>", "<|endoftext|>"]
 
@@ -35,7 +48,7 @@ def load_vllm_engine(
     model_path: str = DEFAULT_LOCAL_MODEL_PATH,
     temperature: float = DEFAULT_TEMPERATURE,
     max_tokens: int = 1024,
-    gpu_memory_utilization: float = 0.90,
+    gpu_memory_utilization: float = 0.85,
     max_model_len: int = 4096,
     tensor_parallel_size: int = 1,
     trust_remote_code: bool = True,
@@ -46,7 +59,7 @@ def load_vllm_engine(
         model_path: Path to model directory or HuggingFace repo ID (e.g. Qwen/Qwen2.5-14B-Instruct).
         temperature: Decoding temperature (default: 0.0 for greedy, deterministic generation).
         max_tokens: Maximum completion tokens (default: 1024).
-        gpu_memory_utilization: Fraction of GPU VRAM allocated to vLLM (default: 0.90).
+        gpu_memory_utilization: Fraction of GPU VRAM allocated to vLLM (default: 0.85).
         max_model_len: Maximum model sequence length (default: 4096).
         tensor_parallel_size: Tensor parallel degree (default: 1 for <15B models).
         trust_remote_code: Trust remote code flag (default: True).
@@ -87,43 +100,88 @@ def load_vllm_engine(
 
 
 class CodeAgent:
-    """Manages local vLLM instance for high-throughput, offline Python code generation."""
+    """Manages local vLLM, llama.cpp (GGUF), or Ollama API backend for Python code generation."""
 
     def __init__(
         self,
         model_path: str = DEFAULT_LOCAL_MODEL_PATH,
         temperature: float = DEFAULT_TEMPERATURE,
-        gpu_memory_utilization: float = 0.90,
+        gpu_memory_utilization: float = 0.85,
         max_model_len: int = 4096,
         tensor_parallel_size: int = 1,
+        trust_remote_code: bool = True,
         dry_run: bool = False,
     ):
-        """Initialize vLLM engine or mock engine for local testing.
+        """Initialize llama.cpp, vLLM engine, Ollama HTTP client, or mock engine.
 
         Args:
-            model_path: Local path to model weights directory or HuggingFace repo ID.
+            model_path: Path to ``.gguf`` file, vLLM directory/repo ID, or ``ollama:<model>``.
             temperature: Sampling temperature (default: 0.0 for deterministic greedy decoding).
-            gpu_memory_utilization: Fraction of GPU memory allocated to vLLM (default: 0.90).
+            gpu_memory_utilization: Fraction of GPU memory allocated to vLLM (default: 0.85).
             max_model_len: Context window limit (default: 4096).
             tensor_parallel_size: Tensor parallel degree (default: 1 for <15B models).
-            dry_run: If True, forces dry-run mock mode without loading weights.
+            trust_remote_code: Whether to pass ``trust_remote_code=True`` to vLLM (default: True).
+            dry_run: If True, forces dry-run mock mode without calling a model backend.
         """
         self.model_path = model_path
         self.temperature = temperature
-        self.dry_run = dry_run or not _HAS_VLLM
+        self.trust_remote_code = trust_remote_code
+        self.ollama_url = DEFAULT_OLLAMA_URL
         self.llm = None
         self.sampling_params = None
 
-        if not self.dry_run:
-            self._init_vllm(gpu_memory_utilization, max_model_len, tensor_parallel_size)
+        if isinstance(model_path, str) and model_path.startswith("ollama:"):
+            self.backend = "ollama"
+            self.model_name = model_path[len("ollama:"):].strip()
+            if not self.model_name:
+                raise ValueError("Ollama model name cannot be empty after 'ollama:' prefix.")
+            self.dry_run = dry_run
+            if self.dry_run:
+                logger.info("Initializing Agent in DRY-RUN / MOCK mode (Ollama disabled).")
+            else:
+                logger.info(
+                    f"Initializing Ollama backend with model: '{self.model_name}' "
+                    f"(endpoint={self.ollama_url}, temperature={self.temperature})."
+                )
+        elif isinstance(model_path, str) and model_path.lower().endswith(".gguf"):
+            self.backend = "llama_cpp"
+            self.model_name = model_path
+            self.dry_run = dry_run
+            if self.dry_run:
+                logger.info("Initializing Agent in DRY-RUN / MOCK mode (llama.cpp disabled).")
+            else:
+                self._init_llama_cpp(n_ctx=max_model_len)
         else:
-            logger.info("Initializing Agent in DRY-RUN / MOCK mode (vLLM not loaded).")
+            self.backend = "vllm"
+            self.model_name = model_path
+            self.dry_run = dry_run or not _HAS_VLLM
+
+            if not self.dry_run:
+                self._init_vllm(
+                    gpu_memory_utilization,
+                    max_model_len,
+                    tensor_parallel_size,
+                    trust_remote_code=trust_remote_code,
+                )
+            else:
+                logger.info("Initializing Agent in DRY-RUN / MOCK mode (vLLM not loaded).")
+
+    def _init_llama_cpp(self, n_ctx: int = 4096) -> None:
+        """Initialize local GGUF model via llama-cpp-python."""
+        llama_cls = Llama
+        if llama_cls is None:
+            from llama_cpp import Llama as llama_cls
+
+        logger.info(f"Initializing llama_cpp backend with GGUF model: '{self.model_path}' (n_ctx={n_ctx})...")
+        self.llm = llama_cls(model_path=self.model_path, n_ctx=n_ctx, verbose=False)
+        logger.info("llama_cpp GGUF model loaded successfully.")
 
     def _init_vllm(
         self,
         gpu_memory_utilization: float,
         max_model_len: int,
         tensor_parallel_size: int,
+        trust_remote_code: bool = True,
     ) -> None:
         """Initialize the real vLLM engine."""
         path_obj = Path(self.model_path)
@@ -142,10 +200,53 @@ class CodeAgent:
                 gpu_memory_utilization=gpu_memory_utilization,
                 max_model_len=max_model_len,
                 tensor_parallel_size=tensor_parallel_size,
+                trust_remote_code=trust_remote_code,
             )
         except Exception as e:
             logger.error(f"Failed to initialize vLLM engine: {e}. Falling back to dry-run mock mode.")
             self.dry_run = True
+
+    def _generate_ollama(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        """Send a single completion request to the local Ollama HTTP API."""
+        if requests is None:
+            raise RuntimeError(
+                "Thư viện 'requests' chưa được cài đặt. Hãy cài đặt 'requests' để sử dụng Ollama backend."
+            )
+
+        payload: dict[str, Any] = {
+            "model": self.model_name,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": self.temperature},
+        }
+        if system_prompt is not None:
+            payload["system"] = system_prompt
+
+        try:
+            response = requests.post(self.ollama_url, json=payload, timeout=None)
+            response.raise_for_status()
+            return response.json()["response"]
+        except requests.RequestException as e:
+            logger.error(f"Ollama API request failed for model '{self.model_name}': {e}")
+            raise
+
+    def _generate_llama_cpp(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        """Generate a completion using the local llama-cpp-python GGUF model."""
+        if system_prompt is not None:
+            full_prompt = (
+                f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+                f"<|im_start|>user\n{prompt}<|im_end|>\n"
+                f"<|im_start|>assistant\n"
+            )
+        else:
+            full_prompt = prompt
+
+        response = self.llm(
+            full_prompt,
+            max_tokens=1024,
+            temperature=self.temperature,
+        )
+        return response["choices"][0]["text"]
 
     def generate_code(self, prompt: str, system_prompt: Optional[str] = None) -> str:
         """Generate Python code to solve the tabular QA question.
@@ -155,9 +256,18 @@ class CodeAgent:
             system_prompt: System prompt containing role instructions and few-shots.
 
         Returns:
-            Extracted Python code string ready for sandboxed execution.
+            Generated response text (for Ollama/llama_cpp) or extracted Python code (for vLLM).
         """
-        if self.dry_run or self.llm is None:
+        if self.dry_run:
+            return self._mock_generate_code(prompt)
+
+        if self.backend == "ollama":
+            return self._generate_ollama(prompt, system_prompt=system_prompt)
+
+        if self.backend == "llama_cpp":
+            return self._generate_llama_cpp(prompt, system_prompt=system_prompt)
+
+        if self.llm is None:
             return self._mock_generate_code(prompt)
 
         # Format chat prompt according to ChatML / Qwen instruct template
@@ -187,20 +297,34 @@ class CodeAgent:
         prompts: List[str],
         system_prompt: Optional[str] = None,
     ) -> List[str]:
-        """Generate Python completions for a batch of prompts simultaneously via vLLM.
+        """Generate Python completions for a batch of prompts.
+
+        Uses single-pass vLLM batch inference when ``backend == "vllm"`` or loops
+        sequentially via :meth:`generate_code` when ``backend`` is ``"ollama"``
+        or ``"llama_cpp"``.
 
         Args:
-            prompts: Ordered list of prompts to feed into vLLM batch generation.
-            system_prompt: Optional system prompt to wrap prompts in ChatML format if
-                provided; when ``None``, passes ``prompts`` directly to ``self.llm.generate``.
+            prompts: Ordered list of prompts to feed into inference.
+            system_prompt: Optional system prompt to forward/wrap with prompts.
 
         Returns:
-            List of extracted text completions in the exact same order as ``prompts``.
+            List of text completions in the exact same order as ``prompts``.
         """
         if not prompts:
             return []
 
-        if self.dry_run or self.llm is None:
+        if self.dry_run:
+            return [self._mock_generate_code(prompt) for prompt in prompts]
+
+        if self.backend in ("ollama", "llama_cpp"):
+            if system_prompt is None:
+                return [self.generate_code(prompt) for prompt in prompts]
+            return [
+                self.generate_code(prompt, system_prompt=system_prompt)
+                for prompt in prompts
+            ]
+
+        if self.llm is None:
             return [self._mock_generate_code(prompt) for prompt in prompts]
 
         if system_prompt is not None:
@@ -216,11 +340,10 @@ class CodeAgent:
             batch_inputs = prompts
 
         outputs = self.llm.generate(batch_inputs, self.sampling_params)
-        results: List[str] = []
-        for output in outputs:
-            text = output.outputs[0].text.strip() if getattr(output, "outputs", None) else ""
-            results.append(text)
-        return results
+        return [
+            output.outputs[0].text if getattr(output, "outputs", None) else ""
+            for output in outputs
+        ]
 
     def extract_python_code(self, text: str) -> str:
         """Extract clean executable code from LLM completion text.

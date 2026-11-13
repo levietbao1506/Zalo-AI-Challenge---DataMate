@@ -26,7 +26,7 @@ from src.prompt_builder import PromptBuilder
 from src.schema_parser import DatasetContext, SchemaParser, get_business_schema
 
 BATCH_SIZE = 32
-DEFAULT_MODEL_PATH = "./models/Qwen2.5-Coder-0.5B-Instruct"
+DEFAULT_MODEL_PATH = "./models/Qwen-3B-GGUF/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
 DEFAULT_DATA_DIR = "./data/sample_dataset"
 DEFAULT_OUTPUT_FILE = "result/submission.jsonl"
 
@@ -66,7 +66,7 @@ def parse_arguments() -> argparse.Namespace:
         "--model_path",
         type=str,
         default=DEFAULT_MODEL_PATH,
-        help=f"Path to local model weights for vLLM (default: {DEFAULT_MODEL_PATH})",
+        help=f"Model path (.gguf for llama.cpp, directory for vLLM, or 'ollama:<model>') (default: {DEFAULT_MODEL_PATH})",
     )
     parser.add_argument(
         "--timeout",
@@ -350,7 +350,7 @@ def process_batch_chunk(
 
 def main() -> None:
     """Main pipeline execution entry point."""
-    model_path = "./models/Qwen2.5-Coder-0.5B-Instruct"
+    model_path = "./models/Qwen-3B-GGUF/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
     start_time = time.time()
     args = parse_arguments()
     if args.model_path:

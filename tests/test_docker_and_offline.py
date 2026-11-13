@@ -75,7 +75,16 @@ class TestDockerAndOffline(unittest.TestCase):
         """Ensure all required tabular and competition libraries are declared in requirements.txt."""
         self.assertTrue(self.requirements_path.exists())
         reqs = self.requirements_path.read_text(encoding="utf-8").lower()
-        required_pkgs = ["vllm", "pandas", "duckdb", "lunarcalendar", "openpyxl", "pydantic"]
+        required_pkgs = [
+            "vllm",
+            "llama-cpp-python",
+            "pandas",
+            "duckdb",
+            "lunarcalendar",
+            "openpyxl",
+            "pydantic",
+            "requests",
+        ]
         for pkg in required_pkgs:
             self.assertIn(pkg, reqs, f"Package '{pkg}' missing from requirements.txt")
 

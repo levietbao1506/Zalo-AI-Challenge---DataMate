@@ -1,7 +1,9 @@
 duckdb
+llama-cpp-python
 lunarcalendar
 openpyxl
 pandas
 pydantic
+requests
 vllm
 
