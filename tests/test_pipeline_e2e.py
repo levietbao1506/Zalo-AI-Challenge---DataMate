@@ -207,8 +207,8 @@ class TestPipelineE2E(unittest.TestCase):
         self.assertEqual(records[1]["answer"], 250.5)
         self.assertEqual(records[2]["answer"], "Hà Nội")
 
-    def test_main_defaults_match_phase3_local_config(self):
-        """Ensure CLI defaults target local Qwen2.5-Coder-0.5B-Instruct, sample_dataset, and result/submission.jsonl."""
+    def test_main_defaults_match_gguf_3b_config(self):
+        """Ensure CLI defaults target local GGUF Qwen-3B, sample_dataset, and result/submission.jsonl."""
         import sys
 
         old_argv = sys.argv
@@ -218,8 +218,9 @@ class TestPipelineE2E(unittest.TestCase):
         finally:
             sys.argv = old_argv
 
-        self.assertEqual(args.model_path, "./models/Qwen2.5-Coder-0.5B-Instruct")
-        self.assertEqual(DEFAULT_MODEL_PATH, "./models/Qwen2.5-Coder-0.5B-Instruct")
+        expected_gguf = "./models/Qwen-3B-GGUF/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
+        self.assertEqual(args.model_path, expected_gguf)
+        self.assertEqual(DEFAULT_MODEL_PATH, expected_gguf)
         self.assertEqual(DEFAULT_DATA_DIR, "./data/sample_dataset")
         self.assertEqual(DEFAULT_OUTPUT_FILE, "result/submission.jsonl")
         self.assertEqual(args.batch_size, 32)
