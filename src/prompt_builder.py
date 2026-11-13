@@ -27,6 +27,24 @@ MÔI TRƯỜNG THỰC THI (SANDBOX ENVIRONMENT):
    - `as_of_date`: Đối tượng `datetime.date` làm mốc thời gian tham chiếu (ngày hiện tại / ngày neo).
    - Tên file được biến đổi thành biến trực tiếp (vd: `orders_csv = FILE_MAP['orders.csv']`).
 
+CRITICAL RULES (ERROR-PREVENTION & SYSTEM INTEGRITY):
+* CẢNH BÁO: VI PHẠM BẤT KỲ QUY TẮC NÀO DƯỚI ĐÂY SẼ LÀM HỆ THỐNG CRASH NGAY LẬP TỨC!
+1. ĐỊNH DẠNG ĐẦU RA - CHỈ MÃ PYTHON DUY NHẤT:
+   - BẮT BUỘC chỉ trả về DUY NHẤT một khối mã Python hợp lệ được bao quanh bởi thẻ ```python ... ```.
+   - TUYỆT ĐỐI CẤM (STRICTLY FORBIDDEN): Mọi văn bản hội thoại, lời chào hỏi, giải thích bằng lời, ghi chú hay ký tự bất kỳ bên ngoài khối code.
+2. TUÂN THỦ LƯỢC ĐỒ DỮ LIỆU - CẤM BỊA ĐẶT CỘT (SCHEMA FIDELITY):
+   - CHỈ ĐƯỢC sử dụng các tên bảng và tên cột CHÍNH XÁC 100% như đã định nghĩa trong Schema String.
+   - TUYỆT ĐỐI KHÔNG tự bịa (hallucinate) tên cột, tên bảng hoặc các thuộc tính không có trong lược đồ dữ liệu.
+3. XỬ LÝ AN TOÀN CÁC TRƯỜNG HỢP BIÊN (EDGE CASES & SAFE DATA EXTRACTION):
+   - Luôn xử lý dữ liệu khuyết/NaN một cách an toàn bằng `.fillna()`, `.dropna()`, hoặc kiểm tra `pd.isna()`.
+   - Trước khi trích xuất giá trị phần tử (vd: `.iloc[0]`, `.values[0]`), BẮT BUỘC phải kiểm tra DataFrame/Series có rỗng hay không (`if df.empty:`). Nếu rỗng, gán `final_result = None` hoặc `"unanswerable"` để tránh IndexError/KeyError làm sập chương trình.
+4. ĐỊNH NGHĨA KIỂU DỮ LIỆU VÀ ĐỊNH DẠNG KẾT QUẢ (EXPECTED DATA TYPES & FORMAT):
+   - Kết quả cuối cùng BẮT BUỘC phải được gán vào biến `final_result`.
+   - Nếu kết quả là số nguyên / số lượng / đếm: gán kiểu `int` (vd: `final_result = int(...)`).
+   - Nếu kết quả là số thực / doanh thu / tỷ lệ: làm tròn đúng 2 chữ số thập phân `round(float(...), 2)`.
+   - Nếu kết quả là chuỗi / tên: chuẩn hóa Unicode NFC, loại bỏ khoảng trắng thừa bằng `.strip()`.
+   - Không được gán nguyên một DataFrame hay Series lớn vào `final_result` mà phải rút trích giá trị cụ thể.
+
 QUY TẮC CỐT LÕI (BẮT BUỘC TUÂN THỦ):
 1. SUY LUẬN TỪNG BƯỚC (CHAIN-OF-THOUGHT):
    - Trước khi viết code, bạn BẮT BUỘC phải viết 1-2 dòng comment bắt đầu bằng `# Phân tích: ` để giải thích ngắn gọn cách bạn sẽ lọc dữ liệu và tính toán.
@@ -229,7 +247,11 @@ class PromptBuilder:
         prompt_parts.append("\n" + "=" * 50)
         prompt_parts.append(f"### CÂU HỎI TIẾNG VIỆT:\n\"{question}\"\n")
         prompt_parts.append(
-            "Hãy bắt đầu bằng comment `# Phân tích: ...`, viết đoạn mã Python (dùng pandas) hợp lệ để tính toán và gán câu trả lời vào biến `final_result` (hoặc gán `final_result = \"unanswerable\"` nếu schema không có thông tin liên quan).\n"
+            "CRITICAL RULES (ERROR-PREVENTION - TUÂN THỦ TUYỆT ĐỐI ĐỂ TRÁNH CRASH HỆ THỐNG):\n"
+            "- CHỈ sử dụng ĐÚNG tên bảng và tên cột có trong Schema, TUYỆT ĐỐI KHÔNG bịa đặt cột.\n"
+            "- Xử lý an toàn edge cases: dùng `.fillna()`, kiểm tra `if df.empty:` trước khi trích xuất giá trị để tránh KeyError/IndexError.\n"
+            "- BẮT BUỘC bắt đầu code bằng comment `# Phân tích: ...`, viết đoạn mã Python (dùng pandas) hợp lệ để tính toán và gán câu trả lời vào biến `final_result` (hoặc gán `final_result = \"unanswerable\"` nếu schema không có thông tin liên quan).\n"
+            "- TUYỆT ĐỐI KHÔNG viết lời giải thích hay văn bản hội thoại nào ngoài code block.\n"
             "Chỉ in ra code trong thẻ ```python ... ```, không giải thích."
         )
 

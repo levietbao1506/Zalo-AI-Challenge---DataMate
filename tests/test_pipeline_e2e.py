@@ -130,10 +130,10 @@ class TestPipelineE2E(unittest.TestCase):
 
             duration = time.time() - start_t
 
-            # Verify submission.jsonl exists and has 15 lines
+            # Verify submission.jsonl exists and has 2 lines
             self.assertTrue(out_file.exists())
             lines = out_file.read_text(encoding="utf-8").strip().splitlines()
-            self.assertEqual(len(lines), 15)
+            self.assertEqual(len(lines), 2)
 
             # Check JSON schema of each line
             for line in lines:

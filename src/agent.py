@@ -8,11 +8,12 @@ Supports local vLLM models (e.g. Qwen2.5-Coder), GGUF models via ``llama-cpp-pyt
 from __future__ import annotations
 
 import argparse
+from datetime import date
 import logging
 from pathlib import Path
 import re
 import sys
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -146,11 +147,12 @@ class CodeAgent:
         elif isinstance(model_path, str) and model_path.lower().endswith(".gguf"):
             self.backend = "llama_cpp"
             self.model_name = model_path
-            self.dry_run = dry_run
-            if self.dry_run:
-                logger.info("Initializing Agent in DRY-RUN / MOCK mode (llama.cpp disabled).")
+            self.dry_run = False
+            if not dry_run:
+                self._init_llama_cpp(n_ctx=8192)
             else:
-                self._init_llama_cpp(n_ctx=max_model_len)
+                self.dry_run = True
+                logger.info("Initializing Agent in DRY-RUN / MOCK mode (llama.cpp disabled).")
         else:
             self.backend = "vllm"
             self.model_name = model_path
@@ -166,7 +168,7 @@ class CodeAgent:
             else:
                 logger.info("Initializing Agent in DRY-RUN / MOCK mode (vLLM not loaded).")
 
-    def _init_llama_cpp(self, n_ctx: int = 4096) -> None:
+    def _init_llama_cpp(self, n_ctx: int = 8192) -> None:
         """Initialize local GGUF model via llama-cpp-python."""
         llama_cls = Llama
         if llama_cls is None:
@@ -230,24 +232,6 @@ class CodeAgent:
             logger.error(f"Ollama API request failed for model '{self.model_name}': {e}")
             raise
 
-    def _generate_llama_cpp(self, prompt: str, system_prompt: Optional[str] = None) -> str:
-        """Generate a completion using the local llama-cpp-python GGUF model."""
-        if system_prompt is not None:
-            full_prompt = (
-                f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-                f"<|im_start|>user\n{prompt}<|im_end|>\n"
-                f"<|im_start|>assistant\n"
-            )
-        else:
-            full_prompt = prompt
-
-        response = self.llm(
-            full_prompt,
-            max_tokens=1024,
-            temperature=self.temperature,
-        )
-        return response["choices"][0]["text"]
-
     def generate_code(self, prompt: str, system_prompt: Optional[str] = None) -> str:
         """Generate Python code to solve the tabular QA question.
 
@@ -265,7 +249,25 @@ class CodeAgent:
             return self._generate_ollama(prompt, system_prompt=system_prompt)
 
         if self.backend == "llama_cpp":
-            return self._generate_llama_cpp(prompt, system_prompt=system_prompt)
+            try:
+                system_content = (
+                    system_prompt
+                    if system_prompt
+                    else "You are a Python Data Analyst. Output ONLY valid executable pandas code inside a ```python block. Do not provide any explanations."
+                )
+                messages = [
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": prompt},
+                ]
+                response = self.llm.create_chat_completion(
+                    messages=messages,
+                    max_tokens=1024,
+                    temperature=0.0,
+                )
+                return response["choices"][0]["message"]["content"]
+            except Exception as e:
+                print(f"❌ Llama CPP Generation Error: {e}")
+                return ""
 
         if self.llm is None:
             return self._mock_generate_code(prompt)
@@ -316,13 +318,20 @@ class CodeAgent:
         if self.dry_run:
             return [self._mock_generate_code(prompt) for prompt in prompts]
 
-        if self.backend in ("ollama", "llama_cpp"):
+        if self.backend == "ollama":
             if system_prompt is None:
                 return [self.generate_code(prompt) for prompt in prompts]
             return [
                 self.generate_code(prompt, system_prompt=system_prompt)
                 for prompt in prompts
             ]
+
+        if self.backend == "llama_cpp":
+            results = []
+            for i, p in enumerate(prompts):
+                print(f"  ⏳ Llama-CPP đang xử lý câu {i+1}/{len(prompts)}...")
+                results.append(self.generate_code(p))
+            return results
 
         if self.llm is None:
             return [self._mock_generate_code(prompt) for prompt in prompts]
@@ -344,6 +353,37 @@ class CodeAgent:
             output.outputs[0].text if getattr(output, "outputs", None) else ""
             for output in outputs
         ]
+
+    def generate_with_retry(
+        self,
+        initial_prompt: str,
+        data_dir: str,
+        max_retries: int = 3,
+        system_prompt: Optional[str] = None,
+        file_map: Optional[Dict[str, str]] = None,
+        as_of_date: Optional[Union[str, date]] = None,
+        timeout_seconds: Optional[float] = None,
+        base_prompt: Optional[str] = None,
+    ) -> tuple[bool, Any, str]:
+        """Generate code and execute with self-correction feedback loop up to max_retries.
+
+        If execution fails, feeds the exact error message and failed code back
+        to the model.
+        """
+        from functools import partial
+        from src import executor
+
+        single_fn = partial(self.generate_code, system_prompt=system_prompt)
+        return executor.execute_with_retry(
+            initial_prompt=initial_prompt,
+            generate_fn=single_fn,
+            data_dir=data_dir,
+            max_retries=max_retries,
+            file_map=file_map,
+            as_of_date=as_of_date,
+            timeout_seconds=timeout_seconds,
+            base_prompt=base_prompt or initial_prompt,
+        )
 
     def extract_python_code(self, text: str) -> str:
         """Extract clean executable code from LLM completion text.

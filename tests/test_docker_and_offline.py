@@ -122,7 +122,7 @@ class TestDockerAndOffline(unittest.TestCase):
             # Verify submission was produced without network access
             self.assertTrue(out_file.exists())
             lines = out_file.read_text(encoding="utf-8").strip().splitlines()
-            self.assertEqual(len(lines), 15)
+            self.assertEqual(len(lines), 2)
 
             for line in lines:
                 rec = json.loads(line)

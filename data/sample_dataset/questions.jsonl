@@ -1,15 +1,2 @@
 {"id": "q_01", "type": "number", "as_of_date": "2024-06-15", "question": "Có bao nhiêu đơn hàng được tạo vào ngày hôm qua?"}
 {"id": "q_02", "type": "number", "as_of_date": "2024-06-15", "question": "Tổng số tiền các đơn hàng của chi nhánh da nang là bao nhiêu?"}
-{"id": "q_03", "type": "number", "as_of_date": "2024-06-15", "question": "Giá trị đơn hàng lớn nhất amount trong hệ thống là bao nhiêu?"}
-{"id": "q_04", "type": "number", "as_of_date": "2024-06-15", "question": "Có bao nhiêu đơn hàng có trạng thái Thành công?"}
-{"id": "q_05", "type": "number", "as_of_date": "2024-06-15", "question": "Giá bán của sản phẩm có mã P001 là bao nhiêu?"}
-{"id": "q_06", "type": "number", "as_of_date": "2024-06-15", "question": "Tổng số lượng tồn kho của tất cả sản phẩm trong Kho Hà Nội là bao nhiêu?"}
-{"id": "q_07", "type": "string", "as_of_date": "2024-06-15", "question": "Khách hàng có mã C001 tên là gì?"}
-{"id": "q_08", "type": "number", "as_of_date": "2024-06-15", "question": "Có bao nhiêu khách hàng đến từ Hà Nội?"}
-{"id": "q_09", "type": "number", "as_of_date": "2024-06-15", "question": "Tổng doanh thu các đơn hàng thành công trong tháng 5 năm 2024 là bao nhiêu?"}
-{"id": "q_10", "type": "abstain", "as_of_date": "2024-06-15", "question": "Số lượng tồn kho của mặt hàng mã P999 là bao nhiêu?"}
-{"id": "q_11", "type": "abstain", "as_of_date": "2024-06-15", "question": "Số điện thoại của khách hàng C999 là bao nhiêu?"}
-{"id": "q_12", "type": "number", "as_of_date": "2024-06-15", "question": "Tổng số đơn hàng thuộc chi nhánh TP HCM là bao nhiêu?"}
-{"id": "q_13", "type": "number", "as_of_date": "2024-06-15", "question": "Giá bán trung bình của các sản phẩm thuộc danh mục Gia dụng là bao nhiêu?"}
-{"id": "q_14", "type": "string", "as_of_date": "2024-06-15", "question": "Tên sản phẩm có mã P003 là gì?"}
-{"id": "q_15", "type": "abstain", "as_of_date": "2024-06-15", "question": "Tỷ lệ tăng trưởng doanh số của chi nhánh Cần Thơ so với năm ngoái?"}

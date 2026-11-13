@@ -240,11 +240,19 @@ print("Computed output: 999")
         self.assertEqual(err, "")
 
     def test_execute_local_exception_catching(self):
-        """Test execute_local catches exceptions safely and returns (False, None, str(e))."""
+        """Test execute_local catches exceptions safely and returns (False, None, error_details)."""
         success, result, err = execute_local("x = 1 / 0\nfinal_result = x", "/app/data")
         self.assertFalse(success)
         self.assertIsNone(result)
+        self.assertIn("ZeroDivisionError", err)
         self.assertIn("division by zero", err)
+        self.assertIn("Traceback (most recent call last):", err)
+
+        # KeyError test
+        success_k, _, err_k = execute_local("d = {}\nfinal_result = d['col_missing']", "/app/data")
+        self.assertFalse(success_k)
+        self.assertIn("KeyError", err_k)
+        self.assertIn("Traceback (most recent call last):", err_k)
 
     def test_execute_with_retry_self_correction(self):
         """Test execute_with_retry appends exact Vietnamese error prompt and succeeds on retry."""
@@ -268,6 +276,14 @@ print("Computed output: 999")
         self.assertEqual(result, 123)
         self.assertEqual(err, "")
         self.assertEqual(len(prompts_seen), 2)
+        # 1. Original question and schema
+        self.assertIn("Tính tổng doanh thu", prompts_seen[1])
+        # 2. Failed Python code
+        self.assertIn("missing_var", prompts_seen[1])
+        # 3. Exact error message
+        self.assertIn("NameError", prompts_seen[1])
+        # 4. Strict instruction
+        self.assertIn("The previous code failed with the error above. Write a new, corrected Python code block to solve the problem and fix the error. DO NOT repeat the exact same code.", prompts_seen[1])
         self.assertIn("\nĐoạn code trên bị lỗi: ", prompts_seen[1])
         self.assertIn(". Hãy viết lại code sửa lỗi.", prompts_seen[1])
 
