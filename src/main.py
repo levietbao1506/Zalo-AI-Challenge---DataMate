@@ -283,13 +283,19 @@ def iter_process_batch_chunk(
             if success and not executor.is_empty_result(raw_result):
                 final_success, final_result = True, raw_result
             elif retry_budget > 0:
-                failed_code = f"```python\n{code_str}\n```\n" if code_str else ""
-                feedback_line = (
-                    f"Đoạn code trên bị lỗi: {error_msg}. Hãy viết lại code sửa lỗi."
-                    if not success
-                    else EMPTY_RESULT_FEEDBACK
-                )
-                retry_initial_prompt = f"{meta['user_prompt']}\n{failed_code}{feedback_line}"
+                if not success:
+                    failed_block = f"```python\n{code_str}\n```" if code_str else "```python\n# (No code extracted)\n```"
+                    retry_initial_prompt = (
+                        f"{meta['user_prompt']}\n\n"
+                        f"**FAILED CODE:**\n{failed_block}\n\n"
+                        f"**EXACT ERROR:**\n```\n{error_msg}\n```\n"
+                        f"Đoạn code trên bị lỗi: {error_msg}. Hãy viết lại code sửa lỗi.\n"
+                        f"{executor.RETRY_STRICT_INSTRUCTION}"
+                    )
+                else:
+                    failed_code = f"```python\n{code_str}\n```\n" if code_str else ""
+                    retry_initial_prompt = f"{meta['user_prompt']}\n{failed_code}{EMPTY_RESULT_FEEDBACK}"
+
                 final_success, final_result, _ = executor.execute_with_retry(
                     initial_prompt=retry_initial_prompt,
                     generate_fn=single_generate_fn,
@@ -298,6 +304,7 @@ def iter_process_batch_chunk(
                     file_map=meta["file_map"],
                     as_of_date=meta["as_of_date"],
                     timeout_seconds=timeout,
+                    base_prompt=meta["user_prompt"],
                 )
             else:
                 final_success, final_result = False, None

@@ -132,6 +132,23 @@ class TestPromptBuilder(unittest.TestCase):
         self.assertIn("Đếm đơn hàng?", retry_prompt)
         self.assertIn("result = None", retry_prompt)
 
+    def test_critical_rules_and_error_prevention_prompts(self):
+        """Ensure SYSTEM_PROMPT contains CRITICAL RULES, strict output format, and error prevention."""
+        self.assertIn("CRITICAL RULES", SYSTEM_PROMPT)
+        self.assertIn("VI PHẠM BẤT KỲ QUY TẮC NÀO DƯỚI ĐÂY SẼ LÀM HỆ THỐNG CRASH", SYSTEM_PROMPT)
+        self.assertIn("TUYỆT ĐỐI CẤM", SYSTEM_PROMPT)
+        self.assertIn("TUYỆT ĐỐI KHÔNG tự bịa", SYSTEM_PROMPT)
+        self.assertIn(".fillna()", SYSTEM_PROMPT)
+        self.assertIn("df.empty", SYSTEM_PROMPT)
+        self.assertIn("final_result", SYSTEM_PROMPT)
+
+        user_prompt = self.builder.build_user_prompt(
+            question="Doanh thu?",
+            schema_context="Table: orders.csv",
+        )
+        self.assertIn("CRITICAL RULES", user_prompt)
+        self.assertIn("TRÁNH CRASH HỆ THỐNG", user_prompt)
+
 
 class TestVLLMAgent(unittest.TestCase):
     """Test suite for VLLMAgent initialization, temperature=0.0, and code extraction."""
@@ -319,11 +336,11 @@ class TestVLLMAgent(unittest.TestCase):
         mock_sp_cls.assert_called_once()
 
     def test_llama_cpp_gguf_initialization_and_generation(self):
-        """Verify .gguf model_path initializes llama_cpp backend, generates code, and batches sequentially."""
+        """Verify .gguf model_path initializes llama_cpp backend, generates code via chat completion, and batches sequentially."""
         gguf_path = "./models/Qwen-3B-GGUF/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
         mock_llama_instance = MagicMock()
-        mock_llama_instance.return_value = {
-            "choices": [{"text": "```python\nfinal_result = 7\n```"}]
+        mock_llama_instance.create_chat_completion.return_value = {
+            "choices": [{"message": {"content": "```python\nfinal_result = 7\n```"}}]
         }
 
         with patch("src.agent.Llama", return_value=mock_llama_instance) as mock_llama_cls:
@@ -334,15 +351,21 @@ class TestVLLMAgent(unittest.TestCase):
         self.assertIs(agent.llm, mock_llama_instance)
         mock_llama_cls.assert_called_once_with(
             model_path=gguf_path,
-            n_ctx=4096,
+            n_ctx=8192,
             verbose=False,
         )
 
         # Single generation without system_prompt
         out = agent.generate_code("Tính tổng?")
         self.assertEqual(out, "```python\nfinal_result = 7\n```")
-        mock_llama_instance.assert_called_once_with(
-            "Tính tổng?",
+        mock_llama_instance.create_chat_completion.assert_called_once_with(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a Python Data Analyst. Output ONLY valid executable pandas code inside a ```python block. Do not provide any explanations.",
+                },
+                {"role": "user", "content": "Tính tổng?"},
+            ],
             max_tokens=1024,
             temperature=0.0,
         )
@@ -355,6 +378,11 @@ class TestVLLMAgent(unittest.TestCase):
         self.assertEqual(mock_gen.call_count, 2)
         mock_gen.assert_any_call("p0")
         mock_gen.assert_any_call("p1")
+
+        # Error handling returns ""
+        mock_llama_instance.create_chat_completion.side_effect = Exception("CUDA error")
+        err_out = agent.generate_code("Error test")
+        self.assertEqual(err_out, "")
 
 
 if __name__ == "__main__":

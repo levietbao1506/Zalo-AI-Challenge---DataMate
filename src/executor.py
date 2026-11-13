@@ -34,6 +34,12 @@ EMPTY_RESULT_FEEDBACK = (
     "Hãy kiểm tra lại điều kiện lọc (filter) ngày tháng hoặc định dạng chuỗi."
 )
 
+RETRY_STRICT_INSTRUCTION = (
+    "The previous code failed with the error above. "
+    "Write a new, corrected Python code block to solve the problem and fix the error. "
+    "DO NOT repeat the exact same code."
+)
+
 try:
     import numpy as np
     _HAS_NUMPY = True
@@ -220,7 +226,11 @@ def execute_local(
             extracted = namespace["final_result"] if "final_result" in namespace else namespace.get("result")
             return (True, extracted, "")
         except Exception as e:
-            return (False, None, str(e))
+            tb = traceback.format_exc()
+            err_type = type(e).__name__
+            err_msg = str(e) or "Unknown error"
+            full_error = f"{err_type}: {err_msg}\n{tb}".strip()
+            return (False, None, full_error)
 
     if timeout_seconds is None:
         return _run()
@@ -248,6 +258,7 @@ def execute_with_retry(
     file_map: Optional[Dict[str, str]] = None,
     as_of_date: Optional[Union[str, date]] = None,
     timeout_seconds: Optional[float] = None,
+    base_prompt: Optional[str] = None,
 ) -> tuple[bool, Any, str]:
     """Run LLM code generation and local sandbox execution with a self-correction retry loop.
 
@@ -264,12 +275,14 @@ def execute_with_retry(
         file_map: Optional mapping from filenames to absolute file paths.
         as_of_date: Optional reference date for relative-date resolution.
         timeout_seconds: Optional worker-thread timeout in seconds.
+        base_prompt: Optional original prompt containing question and schema.
 
     Returns:
         Tuple of ``(success, final_result, error_message)`` from the first valid
         non-empty execution, or ``(False, None, error_message)`` if retries are exhausted.
     """
     current_prompt = initial_prompt
+    base_schema_question = base_prompt or initial_prompt
     error_msg = ""
 
     for _ in range(max_retries):
@@ -290,7 +303,16 @@ def execute_with_retry(
             error_msg = EMPTY_RESULT_FEEDBACK
             current_prompt += f"\n{EMPTY_RESULT_FEEDBACK}"
         else:
-            current_prompt += f"\nĐoạn code trên bị lỗi: {error_msg}. Hãy viết lại code sửa lỗi."
+            failed_block = f"```python\n{code_str}\n```" if code_str else "```python\n# (No code extracted)\n```"
+            feedback_line = f"\nĐoạn code trên bị lỗi: {error_msg}. Hãy viết lại code sửa lỗi."
+            strict_line = f"\n{RETRY_STRICT_INSTRUCTION}"
+            current_prompt = (
+                f"{base_schema_question}\n\n"
+                f"**FAILED CODE:**\n{failed_block}\n\n"
+                f"**EXACT ERROR:**\n```\n{error_msg}\n```"
+                f"{feedback_line}"
+                f"{strict_line}"
+            )
 
     return (False, None, error_msg)
 

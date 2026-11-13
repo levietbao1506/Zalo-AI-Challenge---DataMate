@@ -1,9 +1,10 @@
 duckdb
-llama-cpp-python
+llama-cpp-pythonƯ
 lunarcalendar
 openpyxl
 pandas
 pydantic
 requests
 vllm
-
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+llama-cpp-python
