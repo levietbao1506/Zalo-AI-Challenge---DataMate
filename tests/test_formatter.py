@@ -12,12 +12,18 @@ from src.formatter import (
     DEFAULT_ABSTAIN_VALUE,
     append_submission_line,
     clean_string,
+    format_boolean,
+    format_date,
+    format_list,
     format_number,
     format_output,
+    format_percent,
     format_scalar,
     format_submission_json,
     format_submission_record,
+    format_table,
     is_abstain_signal,
+    normalize_for_comparison,
     normalize_unicode_nfc,
 )
 
@@ -208,6 +214,51 @@ class TestFormatter(unittest.TestCase):
             self.assertEqual(parsed_1["answer"], 100)
             self.assertEqual(parsed_2["id"], "q_2")
             self.assertEqual(parsed_2["answer"], "abstain")
+
+    def test_exact_string_normalization_and_comparison(self):
+        """Test competition string normalization: NFC, lowercase, punctuation removal, whitespace collapse."""
+        raw = "  Đại Học Bách Khoa - Hà Nội (Cơ sở 1)!  "
+        normalized = normalize_for_comparison(raw)
+        self.assertEqual(normalized, "đại học bách khoa hà nội cơ sở 1")
+
+        # Must be NFC
+        self.assertEqual(normalized, unicodedata.normalize("NFC", normalized))
+
+    def test_number_and_currency_stripping(self):
+        """Ensure number formatting strips VND/currency signs and commas, rounding to 2 decimals."""
+        self.assertEqual(format_number("15,000,000 VNĐ"), 15000000)
+        self.assertEqual(format_number("1,234.567 đồng"), 1234.57)
+        self.assertEqual(format_number("$ 999.99"), 999.99)
+        self.assertEqual(format_number("350.000"), 350)
+
+    def test_percent_formatting_rules(self):
+        """Percent must be a numeric float without percent signs, converting ratios when needed."""
+        # Negative ratio converted to percentage number
+        self.assertEqual(format_percent(-0.1245), -12.45)
+        self.assertIsInstance(format_percent(-0.1245), float)
+
+        # Percent string parsed to clean numeric float
+        self.assertEqual(format_percent("-12.45%"), -12.45)
+        self.assertEqual(format_percent("25%"), 25)
+
+    def test_date_iso_formatting_comprehensive(self):
+        """Ensure dates are formatted strictly as YYYY-MM-DD or YYYY-MM."""
+        self.assertEqual(format_date("2024/05/01"), "2024-05-01")
+        self.assertEqual(format_date("01/05/2024"), "2024-05-01")
+        self.assertEqual(format_date("tháng 05 năm 2024"), "2024-05")
+        self.assertEqual(format_date("2024/05", as_month=True), "2024-05")
+
+    def test_table_and_ranking_list_formatting(self):
+        """Test formatting of table dictionaries and ranking lists."""
+        table_in = {"columns": ["Ten", "Diem"], "rows": [["An", 9.556], ["Binh", 8.0]]}
+        formatted_tbl = format_table(table_in)
+        self.assertEqual(formatted_tbl["columns"], ["Ten", "Diem"])
+        self.assertEqual(formatted_tbl["rows"], [["An", 9.56], ["Binh", 8]])
+
+        # Ranking tie breaking
+        ranked_items = ["Cửa hàng C", "Cửa hàng A", "Cửa hàng B"]
+        formatted_list = format_list(ranked_items)
+        self.assertEqual(formatted_list, ["Cửa hàng C", "Cửa hàng A", "Cửa hàng B"])
 
 
 if __name__ == "__main__":

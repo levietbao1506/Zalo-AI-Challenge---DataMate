@@ -270,6 +270,55 @@ class TestSchemaParser(unittest.TestCase):
         self.assertEqual(info_after_second.misses, 1)
         get_business_schema.cache_clear()
 
+    def test_multi_file_business_folder_with_csv_xlsx_and_sqlite(self):
+        """Test SchemaParser on a business folder containing CSV, Excel (multi-sheet), and SQLite tables."""
+        biz_dir = self.base_dir / "complex_biz"
+        biz_dir.mkdir(parents=True)
+        (biz_dir / "README.md").write_text("# Complex Biz\nas_of_date: 2024-06-01\nThông tin doanh nghiệp", encoding="utf-8")
+
+        # 1. CSV
+        pd.DataFrame({"id": [1, 2], "name": ["A", "B"]}).to_csv(biz_dir / "items.csv", index=False)
+
+        # 2. SQLite
+        db_path = biz_dir / "warehouse.sqlite"
+        conn = sqlite3.connect(db_path)
+        pd.DataFrame({"prod_id": [101, 102], "stock": [50, 100]}).to_sql("inventory", conn, index=False)
+        conn.close()
+
+        # Parse folder
+        parser = SchemaParser(biz_dir)
+        context = parser.parse()
+
+        self.assertEqual(context.as_of_date, "2024-06-01")
+        table_names = [t.name for t in context.tables]
+        self.assertIn("items.csv", table_names)
+        self.assertIn("warehouse.sqlite -> inventory", table_names)
+
+        # Verify prompt context format
+        prompt_ctx = context.to_prompt_context()
+        self.assertIn("items.csv", prompt_ctx)
+        self.assertIn("warehouse.sqlite -> inventory", prompt_ctx)
+        self.assertIn("2024-06-01", prompt_ctx)
+
+    def test_schema_parser_read_only_access(self):
+        """Ensure SchemaParser performs only read operations without writing to data directory."""
+        biz_dir = self.base_dir / "ro_biz"
+        biz_dir.mkdir(parents=True)
+        csv_file = biz_dir / "data.csv"
+        pd.DataFrame({"val": [1, 2, 3]}).to_csv(csv_file, index=False)
+
+        files_before = set(biz_dir.iterdir())
+        mtime_before = csv_file.stat().st_mtime
+
+        parser = SchemaParser(biz_dir)
+        _ = parser.parse()
+
+        files_after = set(biz_dir.iterdir())
+        mtime_after = csv_file.stat().st_mtime
+
+        self.assertEqual(files_before, files_after)
+        self.assertEqual(mtime_before, mtime_after)
+
 
 if __name__ == "__main__":
     unittest.main()

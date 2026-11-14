@@ -1,0 +1,32 @@
+# In-Context Learning and Offline Evaluation Configuration
+# Zalo AI Challenge 2026 - DataMate Track
+
+pipeline:
+  task: "Tabular Question Answering"
+  language: "vi"
+  evaluation_metric: "Penalized Accuracy (PA)"
+  penalized_weights:
+    correct: 1.0
+    abstain: 0.0
+    wrong: -1.0
+
+model:
+  name: "Qwen/Qwen3-14B"
+  local_path: "./models/Qwen3-14B"
+  backend: "vllm"
+  temperature: 0.0
+  max_model_len: 32768
+  tensor_parallel_size: 1
+  abstain_threshold: 0.6
+
+inference:
+  batch_size: 32
+  max_retries: 3
+  timeout_seconds: 25.0
+  isolated_subprocess: true
+
+data:
+  questions_file: "questions.jsonl"
+  rulebook_file: "rulebook.md"
+  calendar_file: "calendar.csv"
+  businesses_dir: "data"

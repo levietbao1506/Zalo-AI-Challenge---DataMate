@@ -10,12 +10,35 @@ from __future__ import annotations
 import argparse
 from datetime import date
 import logging
+import math
 from pathlib import Path
 import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_ABSTAIN_THRESHOLD: float = 0.6
+ABSTAIN_THRESHOLD: float = DEFAULT_ABSTAIN_THRESHOLD
+
+
+def extract_thinking(text: str) -> Optional[str]:
+    """Extract raw reasoning content from model output (<think>...</think>).
+
+    Captures content between <think> and </think> (or from <think> onwards if unclosed),
+    preserving the exact raw reasoning without summarization or truncation.
+    """
+    if not text or not isinstance(text, str):
+        return None
+    if "<think>" in text:
+        after_think = text.split("<think>", 1)[1]
+        if "</think>" in after_think:
+            thinking_body = after_think.split("</think>", 1)[0]
+        else:
+            thinking_body = after_think
+        stripped = thinking_body.strip()
+        return stripped if stripped else None
+    return None
 
 # Try importing vLLM
 try:
@@ -38,8 +61,8 @@ try:
 except ImportError:
     requests = None  # type: ignore[assignment]
 
-DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-Coder-3B-Instruct"
-DEFAULT_LOCAL_MODEL_PATH = "./models/Qwen2.5-Coder-3B-Instruct"
+DEFAULT_MODEL_NAME = "Qwen/Qwen3-14B"
+DEFAULT_LOCAL_MODEL_PATH = "./models/Qwen3-14B"
 DEFAULT_OLLAMA_URL = "http://localhost:11434/api/generate"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_STOP_TOKENS = ["<|im_end|>", "</s>", "<|endoftext|>"]
@@ -54,10 +77,10 @@ def load_vllm_engine(
     tensor_parallel_size: int = 1,
     trust_remote_code: bool = True,
 ) -> Tuple[Any, Any]:
-    """Load Qwen2.5-14B-Instruct (or local weights) using vLLM with temperature=0.0.
+    """Load Qwen3-14B (or local weights) using vLLM with temperature=0.0.
 
     Args:
-        model_path: Path to model directory or HuggingFace repo ID (e.g. Qwen/Qwen2.5-14B-Instruct).
+        model_path: Path to model directory or HuggingFace repo ID (e.g. Qwen/Qwen3-14B).
         temperature: Decoding temperature (default: 0.0 for greedy, deterministic generation).
         max_tokens: Maximum completion tokens (default: 1024).
         gpu_memory_utilization: Fraction of GPU VRAM allocated to vLLM (default: 0.85).
@@ -112,6 +135,7 @@ class CodeAgent:
         tensor_parallel_size: int = 1,
         trust_remote_code: bool = True,
         dry_run: bool = False,
+        abstain_threshold: float = DEFAULT_ABSTAIN_THRESHOLD,
     ):
         """Initialize llama.cpp, vLLM engine, Ollama HTTP client, or mock engine.
 
@@ -123,13 +147,17 @@ class CodeAgent:
             tensor_parallel_size: Tensor parallel degree (default: 1 for <15B models).
             trust_remote_code: Whether to pass ``trust_remote_code=True`` to vLLM (default: True).
             dry_run: If True, forces dry-run mock mode without calling a model backend.
+            abstain_threshold: Confidence threshold below which answers are downgraded to abstain (default: 0.6).
         """
         self.model_path = model_path
         self.temperature = temperature
         self.trust_remote_code = trust_remote_code
+        self.abstain_threshold = abstain_threshold
         self.ollama_url = DEFAULT_OLLAMA_URL
         self.llm = None
         self.sampling_params = None
+        self.last_thinking: Optional[str] = None
+        self.last_batch_thinking: List[Optional[str]] = []
 
         if isinstance(model_path, str) and model_path.startswith("ollama:"):
             self.backend = "ollama"
@@ -227,7 +255,10 @@ class CodeAgent:
         try:
             response = requests.post(self.ollama_url, json=payload, timeout=None)
             response.raise_for_status()
-            return response.json()["response"]
+            resp_data = response.json()
+            raw_output = resp_data.get("response", "")
+            self.last_thinking = resp_data.get("thinking") or extract_thinking(raw_output)
+            return raw_output
         except requests.RequestException as e:
             logger.error(f"Ollama API request failed for model '{self.model_name}': {e}")
             raise
@@ -243,7 +274,9 @@ class CodeAgent:
             Generated response text (for Ollama/llama_cpp) or extracted Python code (for vLLM).
         """
         if self.dry_run:
-            return self._mock_generate_code(prompt)
+            mock_res = self._mock_generate_code(prompt)
+            self.last_thinking = extract_thinking(mock_res)
+            return mock_res
 
         if self.backend == "ollama":
             return self._generate_ollama(prompt, system_prompt=system_prompt)
@@ -264,13 +297,19 @@ class CodeAgent:
                     max_tokens=1024,
                     temperature=0.0,
                 )
-                return response["choices"][0]["message"]["content"]
+                msg = response["choices"][0]["message"]
+                content = msg.get("content", "")
+                self.last_thinking = msg.get("reasoning_content") or extract_thinking(content)
+                return content
             except Exception as e:
                 print(f"❌ Llama CPP Generation Error: {e}")
+                self.last_thinking = None
                 return ""
 
         if self.llm is None:
-            return self._mock_generate_code(prompt)
+            mock_res = self._mock_generate_code(prompt)
+            self.last_thinking = extract_thinking(mock_res)
+            return mock_res
 
         # Format chat prompt according to ChatML / Qwen instruct template
         if system_prompt:
@@ -286,7 +325,9 @@ class CodeAgent:
             )
 
         outputs = self.llm.generate([full_text], self.sampling_params)
-        raw_output = outputs[0].outputs[0].text
+        out_obj = outputs[0].outputs[0]
+        raw_output = out_obj.text
+        self.last_thinking = getattr(out_obj, "reasoning_content", None) or extract_thinking(raw_output)
 
         # Prepend ```python\n if omitted because we guided the prefix
         if not raw_output.startswith("```"):
@@ -313,28 +354,45 @@ class CodeAgent:
             List of text completions in the exact same order as ``prompts``.
         """
         if not prompts:
+            self.last_batch_thinking = []
             return []
 
         if self.dry_run:
-            return [self._mock_generate_code(prompt) for prompt in prompts]
+            results = [self._mock_generate_code(prompt) for prompt in prompts]
+            self.last_batch_thinking = [extract_thinking(r) for r in results]
+            return results
 
         if self.backend == "ollama":
-            if system_prompt is None:
-                return [self.generate_code(prompt) for prompt in prompts]
-            return [
-                self.generate_code(prompt, system_prompt=system_prompt)
-                for prompt in prompts
-            ]
+            results = []
+            thinkings = []
+            for prompt in prompts:
+                if system_prompt is not None:
+                    code = self.generate_code(prompt, system_prompt=system_prompt)
+                else:
+                    code = self.generate_code(prompt)
+                results.append(code)
+                thinkings.append(self.last_thinking)
+            self.last_batch_thinking = thinkings
+            return results
 
         if self.backend == "llama_cpp":
             results = []
+            thinkings = []
             for i, p in enumerate(prompts):
                 print(f"  ⏳ Llama-CPP đang xử lý câu {i+1}/{len(prompts)}...")
-                results.append(self.generate_code(p))
+                if system_prompt is not None:
+                    code = self.generate_code(p, system_prompt=system_prompt)
+                else:
+                    code = self.generate_code(p)
+                results.append(code)
+                thinkings.append(self.last_thinking)
+            self.last_batch_thinking = thinkings
             return results
 
         if self.llm is None:
-            return [self._mock_generate_code(prompt) for prompt in prompts]
+            results = [self._mock_generate_code(prompt) for prompt in prompts]
+            self.last_batch_thinking = [extract_thinking(r) for r in results]
+            return results
 
         if system_prompt is not None:
             batch_inputs = [
@@ -349,10 +407,34 @@ class CodeAgent:
             batch_inputs = prompts
 
         outputs = self.llm.generate(batch_inputs, self.sampling_params)
-        return [
-            output.outputs[0].text if getattr(output, "outputs", None) else ""
-            for output in outputs
-        ]
+        results = []
+        thinkings = []
+        for output in outputs:
+            if getattr(output, "outputs", None):
+                out_obj = output.outputs[0]
+                text = out_obj.text
+                reasoning = getattr(out_obj, "reasoning_content", None) or extract_thinking(text)
+                results.append(text)
+                thinkings.append(reasoning)
+            else:
+                results.append("")
+                thinkings.append(None)
+        self.last_batch_thinking = thinkings
+        return results
+
+    def generate_code_with_thinking(
+        self, prompt: str, system_prompt: Optional[str] = None
+    ) -> tuple[str, Optional[str]]:
+        """Generate code and return tuple of (code, thinking)."""
+        code = self.generate_code(prompt, system_prompt=system_prompt)
+        return code, self.last_thinking
+
+    def generate_code_batch_with_thinking(
+        self, prompts: List[str], system_prompt: Optional[str] = None
+    ) -> tuple[List[str], List[Optional[str]]]:
+        """Generate batch completions and return tuple of (codes, thinkings)."""
+        codes = self.generate_code_batch(prompts, system_prompt=system_prompt)
+        return codes, list(self.last_batch_thinking)
 
     def generate_with_retry(
         self,
@@ -364,6 +446,7 @@ class CodeAgent:
         as_of_date: Optional[Union[str, date]] = None,
         timeout_seconds: Optional[float] = None,
         base_prompt: Optional[str] = None,
+        use_subprocess: bool = False,
     ) -> tuple[bool, Any, str]:
         """Generate code and execute with self-correction feedback loop up to max_retries.
 
@@ -383,6 +466,7 @@ class CodeAgent:
             as_of_date=as_of_date,
             timeout_seconds=timeout_seconds,
             base_prompt=base_prompt or initial_prompt,
+            use_subprocess=use_subprocess,
         )
 
     def extract_python_code(self, text: str) -> str:
@@ -449,6 +533,314 @@ class CodeAgent:
             "except Exception:\n"
             "    result = None\n"
         )
+
+    def verify_prediction(
+        self,
+        execution_success: bool,
+        raw_result: Any = None,
+        result: Any = None,
+        q_type: Optional[str] = None,
+        code_str: Optional[str] = None,
+        retry_results: Optional[List[Any]] = None,
+        error_msg: Optional[str] = None,
+        threshold: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Apply verification gate using configured abstain threshold.
+
+        Guards against negative PA score (-1 vs 0) by downgrading to {"type": "abstain"}
+        when execution fails, result is empty/NaN, schema constraints are violated,
+        or retries yielded conflicting outputs.
+        """
+        eff_threshold = threshold if threshold is not None else self.abstain_threshold
+        val = raw_result if raw_result is not None else result
+        return verification_gate(
+            execution_success=execution_success,
+            result=val,
+            q_type=q_type,
+            code_str=code_str,
+            retry_results=retry_results,
+            error_msg=error_msg,
+            threshold=eff_threshold,
+        )
+
+    # Alias
+    verification_gate = verify_prediction
+
+
+def verification_gate(
+    execution_success: bool,
+    result: Any = None,
+    raw_result: Any = None,
+    q_type: Optional[str] = None,
+    code_str: Optional[str] = None,
+    retry_results: Optional[List[Any]] = None,
+    error_msg: Optional[str] = None,
+    threshold: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Verification gate to guard against negative Penalized Accuracy scores (-1 vs 0).
+
+    a) If code execution still raises an exception after retries, or returns
+       NaN/None/empty results on an aggregation query, emits {"type": "abstain", "answer": "abstain"}.
+    b) Runs lightweight verification on output schema/type constraints and
+       filtered row counts; if uncertain or conflicting across retries, downgrades
+       to {"type": "abstain", "answer": "abstain"} based on ABSTAIN_THRESHOLD.
+
+    Args:
+        execution_success: Whether sandbox execution succeeded.
+        result: Raw or intermediate result from code execution.
+        q_type: Expected question type (e.g., 'number', 'percent', 'string', 'date', 'boolean', 'list', 'table').
+        code_str: Executed Python code string.
+        retry_results: List of result values obtained across attempts.
+        error_msg: Traceback or error message on failure.
+        threshold: Confidence cutoff threshold (default: ABSTAIN_THRESHOLD).
+
+    Returns:
+        Dict with "type", "answer", "confidence", "passed", and "reason".
+    """
+    from src import executor, formatter, evaluator
+
+    eff_threshold = float(threshold) if isinstance(threshold, (int, float)) else ABSTAIN_THRESHOLD
+    result = result if result is not None else raw_result
+
+    # a.1 Hard execution failure check
+    if not execution_success:
+        return {
+            "type": "abstain",
+            "answer": "abstain",
+            "confidence": 0.0,
+            "passed": False,
+            "reason": f"Execution failed after retries: {error_msg or 'runtime exception'}",
+        }
+
+    # a.2 None check
+    if result is None:
+        return {
+            "type": "abstain",
+            "answer": "abstain",
+            "confidence": 0.0,
+            "passed": False,
+            "reason": "Execution returned None",
+        }
+
+    # a.3 Float NaN or Inf check
+    if isinstance(result, float) and (math.isnan(result) or math.isinf(result)):
+        return {
+            "type": "abstain",
+            "answer": "abstain",
+            "confidence": 0.0,
+            "passed": False,
+            "reason": "Execution returned NaN or infinite float",
+        }
+
+    # a.4 Logical empty check (DataFrame, Series, list, dict, empty string)
+    if executor.is_empty_result(result):
+        return {
+            "type": "abstain",
+            "answer": "abstain",
+            "confidence": 0.0,
+            "passed": False,
+            "reason": "Execution returned logically empty container or string",
+        }
+
+    # a.5 Explicit abstain / unanswerable strings
+    if isinstance(result, str):
+        s_norm = result.strip().lower()
+        if s_norm in ("abstain", "null", "none", "nan", "không có", "không xác định", "n/a", "na", ""):
+            return {
+                "type": "abstain",
+                "answer": "abstain",
+                "confidence": 0.0,
+                "passed": False,
+                "reason": f"Result explicitly indicates abstain: {result}",
+            }
+        if s_norm == "unanswerable" or q_type == "unanswerable":
+            return {
+                "type": "unanswerable",
+                "answer": "unanswerable",
+                "confidence": 1.0,
+                "passed": True,
+                "reason": "Question is unanswerable",
+            }
+
+    confidence = 1.0
+    reason_notes: List[str] = []
+
+    # b.1 Output schema & type constraints check
+    formatted_answer: Any = result
+    if q_type == "number":
+        try:
+            formatted_answer = formatter.format_number(result)
+        except Exception as e:
+            return {
+                "type": "abstain",
+                "answer": "abstain",
+                "confidence": 0.0,
+                "passed": False,
+                "reason": f"Schema constraint violated for number: {e}",
+            }
+    elif q_type == "percent":
+        try:
+            formatted_answer = formatter.format_percent(result)
+        except Exception as e:
+            return {
+                "type": "abstain",
+                "answer": "abstain",
+                "confidence": 0.0,
+                "passed": False,
+                "reason": f"Schema constraint violated for percent: {e}",
+            }
+    elif q_type == "date":
+        try:
+            formatted_answer = formatter.format_date(result)
+            if not (re.match(r"^\d{4}-\d{2}-\d{2}$", str(formatted_answer)) or re.match(r"^\d{4}-\d{2}$", str(formatted_answer))):
+                confidence -= 0.5
+                reason_notes.append("Date string does not match standard ISO format")
+        except Exception as e:
+            return {
+                "type": "abstain",
+                "answer": "abstain",
+                "confidence": 0.0,
+                "passed": False,
+                "reason": f"Schema constraint violated for date: {e}",
+            }
+    elif q_type == "boolean":
+        try:
+            formatted_answer = formatter.format_boolean(result)
+        except Exception as e:
+            return {
+                "type": "abstain",
+                "answer": "abstain",
+                "confidence": 0.0,
+                "passed": False,
+                "reason": f"Schema constraint violated for boolean: {e}",
+            }
+    elif q_type == "list":
+        try:
+            formatted_answer = formatter.format_list(result)
+            if not formatted_answer:
+                return {
+                    "type": "abstain",
+                    "answer": "abstain",
+                    "confidence": 0.0,
+                    "passed": False,
+                    "reason": "List is empty",
+                }
+        except Exception as e:
+            return {
+                "type": "abstain",
+                "answer": "abstain",
+                "confidence": 0.0,
+                "passed": False,
+                "reason": f"Schema constraint violated for list: {e}",
+            }
+    elif q_type == "table":
+        try:
+            formatted_answer = formatter.format_table(result)
+            if not formatted_answer.get("columns") or not formatted_answer.get("rows"):
+                return {
+                    "type": "abstain",
+                    "answer": "abstain",
+                    "confidence": 0.0,
+                    "passed": False,
+                    "reason": "Table columns or rows are empty",
+                }
+        except Exception as e:
+            return {
+                "type": "abstain",
+                "answer": "abstain",
+                "confidence": 0.0,
+                "passed": False,
+                "reason": f"Schema constraint violated for table: {e}",
+            }
+    elif q_type == "string":
+        try:
+            formatted_answer = formatter.format_string(result)
+            if not formatted_answer:
+                return {
+                    "type": "abstain",
+                    "answer": "abstain",
+                    "confidence": 0.0,
+                    "passed": False,
+                    "reason": "String answer is empty",
+                }
+        except Exception as e:
+            return {
+                "type": "abstain",
+                "answer": "abstain",
+                "confidence": 0.0,
+                "passed": False,
+                "reason": f"Schema constraint violated for string: {e}",
+            }
+    else:
+        # q_type is None or unspecified: infer using format_scalar
+        try:
+            formatted_answer = formatter.format_scalar(result, q_type=None)
+            if formatted_answer in ("abstain", None):
+                return {
+                    "type": "abstain",
+                    "answer": "abstain",
+                    "confidence": 0.0,
+                    "passed": False,
+                    "reason": "Scalar formatting yielded abstain",
+                }
+        except Exception as e:
+            return {
+                "type": "abstain",
+                "answer": "abstain",
+                "confidence": 0.0,
+                "passed": False,
+                "reason": f"Formatting error on un-typed value: {e}",
+            }
+
+    # b.2 Filtered row counts and zero aggregation check
+    if code_str:
+        has_filter = any(pat in code_str for pat in (".query(", "[df[", ".loc[", "== ", "isin("))
+        has_agg = any(pat in code_str for pat in (".sum()", ".mean()", ".count()", ".agg(", "len("))
+        if has_filter and has_agg:
+            if formatted_answer == 0 and ("empty" in code_str or "len(" in code_str):
+                confidence -= 0.1
+                reason_notes.append("Filtered aggregation returned 0")
+
+    # b.3 Retry consistency / conflict check
+    if retry_results and len(retry_results) > 1:
+        valid_retries = []
+        for r in retry_results:
+            if r is not None and not executor.is_empty_result(r):
+                r_str = str(r).strip().lower()
+                if r_str not in ("abstain", "unanswerable", "none", "null"):
+                    valid_retries.append(r)
+
+        if len(valid_retries) > 1:
+            first_val = valid_retries[0]
+            conflicts = False
+            for other_val in valid_retries[1:]:
+                if not evaluator.is_answer_match(first_val, other_val, float_tol=0.01, q_type=q_type):
+                    conflicts = True
+                    break
+
+            if conflicts:
+                confidence -= 0.5
+                reason_notes.append(f"Conflicting results across retries: {valid_retries}")
+
+    # Final gate decision against threshold
+    if confidence < eff_threshold:
+        reason_msg = "; ".join(reason_notes) if reason_notes else "Confidence below threshold"
+        return {
+            "type": "abstain",
+            "answer": "abstain",
+            "confidence": round(confidence, 2),
+            "passed": False,
+            "reason": f"{reason_msg} (confidence={confidence:.2f} < threshold={eff_threshold:.2f})",
+        }
+
+    resolved_type = q_type or evaluator._infer_type_from_value(formatted_answer)
+    return {
+        "type": resolved_type,
+        "answer": formatted_answer,
+        "confidence": round(confidence, 2),
+        "passed": True,
+        "reason": "Passed verification gate",
+    }
 
 
 # Backwards-compatible alias

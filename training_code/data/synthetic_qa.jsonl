@@ -1,0 +1,4 @@
+{"id": "syn_q_001", "type": "number", "question": "Tổng doanh thu của tất cả các đơn hàng thành công là bao nhiêu?", "reference_code": "final_result = df[df['status'] == 'completed']['revenue'].sum()"}
+{"id": "syn_q_002", "type": "number", "question": "Có bao nhiêu đơn hàng bị hủy trong tháng vừa qua?", "reference_code": "final_result = len(df[df['status'] == 'cancelled'])"}
+{"id": "syn_q_003", "type": "string", "question": "Tên chi nhánh có doanh số cao nhất là gì?", "reference_code": "final_result = df.groupby('branch')['revenue'].sum().idxmax()"}
+{"id": "syn_q_004", "type": "unanswerable", "question": "Nhiệt độ trung bình trong kho bảo quản là bao nhiêu?", "reference_code": "final_result = 'unanswerable'"}

@@ -14,6 +14,11 @@ pyproject.toml
 # Submission and temporary files
 submission.jsonl
 *.log
+download_model.log
+
+# Local test datasets and output directories
+local_data/
+local_out/
 
 uv.lock
 models/

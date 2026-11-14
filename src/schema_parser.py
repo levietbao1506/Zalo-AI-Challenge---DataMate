@@ -41,6 +41,8 @@ class TableSchema:
     column_types: Dict[str, str] = field(default_factory=dict)
     raw_column_types: Dict[str, str] = field(default_factory=dict)
     column_examples: Dict[str, List[str]] = field(default_factory=dict)
+    date_ranges: Dict[str, str] = field(default_factory=dict)
+    low_cardinality_values: Dict[str, List[Any]] = field(default_factory=dict)
     sample_rows: List[Dict[str, Any]] = field(default_factory=list)
     total_rows: Optional[int] = None
     sheet_name: Optional[str] = None
@@ -52,6 +54,7 @@ class TableSchema:
         Format:
             Table: orders.csv
             - order_id (int64)
+            - order_date (datetime) [Date range: 2024-01-01 to 2024-12-31]
             - product_name (object) [Examples: 'Trà sữa trân châu', 'Cà phê sữa', 'Bạc xỉu']
             - status (object) [Examples: 'Hoàn thành', 'Đang giao', 'Đã hủy']
             - revenue (float64)
@@ -59,12 +62,17 @@ class TableSchema:
         lines = [f"Table: {self.name}"]
         for col in self.columns:
             dtype_str = self.raw_column_types.get(col) or self.column_types.get(col, "object")
+            parts = [f"- {col} ({dtype_str})"]
+            if col in self.date_ranges:
+                parts.append(f"[Date range: {self.date_ranges[col]}]")
             examples = self.column_examples.get(col)
             if examples:
                 formatted_vals = ", ".join(repr(str(v)) for v in examples)
-                lines.append(f"- {col} ({dtype_str}) [Examples: {formatted_vals}]")
-            else:
-                lines.append(f"- {col} ({dtype_str})")
+                parts.append(f"[Examples: {formatted_vals}]")
+            elif col in self.low_cardinality_values and self.low_cardinality_values[col]:
+                formatted_vals = ", ".join(repr(str(v)) for v in self.low_cardinality_values[col])
+                parts.append(f"[Examples: {formatted_vals}]")
+            lines.append(" ".join(parts))
         return "\n".join(lines)
 
     def to_markdown(self) -> str:
@@ -75,6 +83,9 @@ class TableSchema:
             lines.append(f"- **Sheet Name**: `{self.sheet_name}`")
         if self.total_rows is not None:
             lines.append(f"- **Approx Rows**: {self.total_rows}")
+        if self.date_ranges:
+            date_range_str = ", ".join(f"`{col}`: {rng}" for col, rng in self.date_ranges.items())
+            lines.append(f"- **Date Ranges**: {date_range_str}")
 
         # Columns & Types inline summary
         col_type_str = ", ".join(f"`{col}` ({self.column_types.get(col, 'string')})" for col in self.columns)
@@ -85,15 +96,16 @@ class TableSchema:
             lines.append("\n**Enriched Schema & Unique Value Examples:**")
             lines.append(self.format_enriched_schema())
 
-        # Sample rows table (head 5)
+        # Sample rows table (head 3-5)
         if self.sample_rows and self.columns:
-            lines.append(f"\n**Sample Records (head {len(self.sample_rows)}):**")
+            preview_count = min(len(self.sample_rows), 5)
+            lines.append(f"\n**Sample Records (head {preview_count}):**")
             header = "| " + " | ".join(self.columns) + " |"
             sep = "| " + " | ".join("---" for _ in self.columns) + " |"
             lines.append(header)
             lines.append(sep)
 
-            for row in self.sample_rows[:5]:
+            for row in self.sample_rows[:preview_count]:
                 row_vals = []
                 for col in self.columns:
                     val = row.get(col, "")
@@ -244,6 +256,105 @@ def sample_unique_values(
     return examples
 
 
+def extract_date_ranges(df: "pd.DataFrame") -> Dict[str, str]:
+    """Detect date/datetime columns and extract min/max date ranges.
+
+    Args:
+        df: Pandas DataFrame.
+
+    Returns:
+        Dictionary mapping date column name to 'YYYY-MM-DD to YYYY-MM-DD'.
+    """
+    ranges: Dict[str, str] = {}
+    for col in df.columns:
+        series = df[col].dropna()
+        if series.empty:
+            continue
+        col_str = str(col)
+        col_lower = col_str.lower()
+        is_date = False
+        parsed_dates = None
+
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            is_date = True
+            parsed_dates = series
+        elif re.search(r"(date|time|ngay|created|updated|thoi_gian)", col_lower):
+            try:
+                sample_s = series.head(100)
+                converted = pd.to_datetime(sample_s, errors="coerce")
+                if converted.notna().sum() >= max(1, int(len(sample_s) * 0.5)):
+                    is_date = True
+                    parsed_dates = pd.to_datetime(series, errors="coerce").dropna()
+            except Exception:
+                pass
+
+        if is_date and parsed_dates is not None and not parsed_dates.empty:
+            try:
+                min_val = parsed_dates.min()
+                max_val = parsed_dates.max()
+                min_str = min_val.strftime("%Y-%m-%d") if hasattr(min_val, "strftime") else str(min_val)[:10]
+                max_str = max_val.strftime("%Y-%m-%d") if hasattr(max_val, "strftime") else str(max_val)[:10]
+                ranges[col_str] = f"{min_str} to {max_str}"
+            except Exception:
+                pass
+    return ranges
+
+
+def extract_low_cardinality_values(
+    df: "pd.DataFrame",
+    max_unique: int = 12,
+    max_val_len: int = 60,
+) -> Dict[str, List[str]]:
+    """Extract all distinct values for status, category, or low-cardinality string/category columns.
+
+    Args:
+        df: Pandas DataFrame.
+        max_unique: Maximum distinct values to include (default: 12).
+        max_val_len: Maximum length per value.
+
+    Returns:
+        Dictionary mapping column names to sorted list of distinct values.
+    """
+    distinct_vals: Dict[str, List[str]] = {}
+    for col in df.columns:
+        series = df[col].dropna()
+        if series.empty:
+            continue
+        col_str = str(col)
+        col_lower = col_str.lower()
+        is_cat_keyword = bool(
+            re.search(r"(status|trang_thai|state|type|loai|category|danh_muc|flag|return|tra_hang|payment|gender|gioi_tinh)", col_lower)
+        )
+        # Skip purely numeric columns unless explicitly a status/flag/category keyword
+        is_str_or_cat = (
+            pd.api.types.is_object_dtype(series)
+            or pd.api.types.is_string_dtype(series)
+            or pd.api.types.is_bool_dtype(series)
+            or isinstance(series.dtype, pd.CategoricalDtype)
+        )
+        if not is_str_or_cat and not is_cat_keyword:
+            continue
+        if pd.api.types.is_numeric_dtype(series) and not is_cat_keyword:
+            continue
+
+        str_series = series.astype(str).str.strip()
+        str_series = str_series[str_series != ""]
+        if str_series.empty:
+            continue
+        unique_vals = str_series.unique()
+        if len(unique_vals) <= max_unique or is_cat_keyword:
+            if len(unique_vals) <= max_unique:
+                formatted: List[str] = []
+                for v in sorted(unique_vals, key=lambda x: str(x)):
+                    v_str = str(v).replace("\n", " ").strip()
+                    if len(v_str) > max_val_len:
+                        v_str = v_str[: max_val_len - 3] + "..."
+                    formatted.append(v_str)
+                if formatted:
+                    distinct_vals[col_str] = formatted
+    return distinct_vals
+
+
 def format_table_schema(table: TableSchema) -> str:
     """Format a TableSchema object into a clean enriched schema text block."""
     return table.format_enriched_schema()
@@ -334,6 +445,8 @@ def read_business_readme(
     # Candidate search paths
     search_dirs: List[Path] = []
     if business_id:
+        # Check subfolder <data_dir>/data/<business_id> (per DataMate Docker spec)
+        search_dirs.append(base_dir / "data" / business_id)
         # Check subfolder <data_dir>/<business_id>
         search_dirs.append(base_dir / business_id)
         # Check if business_id itself is a valid path
@@ -444,7 +557,12 @@ def parse_csv_head(
                 columns = [str(c) for c in df.columns]
                 col_types = extract_columns_and_types(df)
                 raw_col_types = {str(col): str(dtype) for col, dtype in df.dtypes.items()}
+                date_ranges = extract_date_ranges(df)
+                low_card = extract_low_cardinality_values(df)
                 col_examples = sample_unique_values(df, top_n=top_n_examples)
+                for col, vals in low_card.items():
+                    if col not in col_examples:
+                        col_examples[col] = vals
                 sample_rows = clean_sample_records(df, n_rows=n_rows)
 
                 return TableSchema(
@@ -455,6 +573,8 @@ def parse_csv_head(
                     column_types=col_types,
                     raw_column_types=raw_col_types,
                     column_examples=col_examples,
+                    date_ranges=date_ranges,
+                    low_cardinality_values=low_card,
                     sample_rows=sample_rows,
                     total_rows=total_rows,
                 )
@@ -546,7 +666,12 @@ def parse_excel_head(
                     columns = [str(c) for c in df.columns]
                     col_types = extract_columns_and_types(df)
                     raw_col_types = {str(col): str(dtype) for col, dtype in df.dtypes.items()}
+                    date_ranges = extract_date_ranges(df)
+                    low_card = extract_low_cardinality_values(df)
                     col_examples = sample_unique_values(df, top_n=top_n_examples)
+                    for col, vals in low_card.items():
+                        if col not in col_examples:
+                            col_examples[col] = vals
                     sample_rows = clean_sample_records(df, n_rows=n_rows)
 
                     schemas.append(
@@ -558,8 +683,11 @@ def parse_excel_head(
                             column_types=col_types,
                             raw_column_types=raw_col_types,
                             column_examples=col_examples,
+                            date_ranges=date_ranges,
+                            low_cardinality_values=low_card,
                             sample_rows=sample_rows,
                             sheet_name=sheet_name,
+                            total_rows=len(df),
                         )
                     )
                 except Exception as sheet_err:
@@ -635,9 +763,26 @@ def parse_sqlite_head(
                     for row in raw_rows
                 ]
 
-                # Sample top unique values for text/object columns
+                # Sample top unique values for text/object columns and date ranges
                 col_examples: Dict[str, List[str]] = {}
+                date_ranges: Dict[str, str] = {}
                 for col in columns:
+                    c_lower = col.lower()
+                    if "date" in c_lower or "time" in c_lower or "ngay" in c_lower:
+                        try:
+                            safe_col = col.replace('"', '""')
+                            safe_tbl = t_name.replace('"', '""')
+                            cursor.execute(
+                                f'SELECT MIN("{safe_col}"), MAX("{safe_col}") '
+                                f'FROM "{safe_tbl}" '
+                                f'WHERE "{safe_col}" IS NOT NULL AND TRIM("{safe_col}") != ""'
+                            )
+                            min_val, max_val = cursor.fetchone()
+                            if min_val is not None and max_val is not None:
+                                date_ranges[col] = f"{str(min_val)[:10]} to {str(max_val)[:10]}"
+                        except Exception:
+                            pass
+
                     if raw_col_types.get(col) == "object" or "text" in col_types.get(col, ""):
                         try:
                             safe_col = col.replace('"', '""')
@@ -664,6 +809,7 @@ def parse_sqlite_head(
                         column_types=col_types,
                         raw_column_types=raw_col_types,
                         column_examples=col_examples,
+                        date_ranges=date_ranges,
                         sample_rows=sample_rows,
                         total_rows=total_rows,
                         extra_notes=f"SQLite Table: {t_name}",
@@ -723,6 +869,25 @@ def _scan_directory_context(
 
     readme_root = readme_base_dir if readme_base_dir is not None else target_dir
     readme_content = read_business_readme(business_id=business_id, data_dir=readme_root)
+    # Also check directly inside target_dir for README if not found
+    if not readme_content and target_dir.is_dir():
+        for name in ("README.md", "readme.md", "README.txt", "readme.txt"):
+            r_p = target_dir / name
+            if r_p.is_file():
+                try:
+                    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+                        try:
+                            txt = r_p.read_text(encoding=enc).strip()
+                            if txt:
+                                readme_content = txt
+                                break
+                        except UnicodeDecodeError:
+                            continue
+                    if readme_content:
+                        break
+                except Exception:
+                    pass
+
     as_of_date = extract_as_of_date(readme_content)
 
     for meta_name in ("metadata.json", "meta.json"):
@@ -738,14 +903,24 @@ def _scan_directory_context(
     tables: List[TableSchema] = []
     file_map: Dict[str, str] = {}
 
-    for file in sorted(target_dir.iterdir()):
-        if file.is_dir() or file.name.startswith("."):
-            continue
+    candidate_files: List[Path] = []
+    for item in sorted(target_dir.iterdir()):
+        if item.is_file() and not item.name.startswith("."):
+            ext = item.suffix.lower()
+            if ext in (".csv", ".xlsx", ".xls", ".sqlite", ".db", ".sqlite3"):
+                candidate_files.append(item)
+        elif item.is_dir() and not item.name.startswith(".") and item.name not in ("__pycache__", ".venv", ".git", ".cache", "sqlite_copies"):
+            for sub in sorted(item.iterdir()):
+                if sub.is_file() and not sub.name.startswith("."):
+                    ext = sub.suffix.lower()
+                    if ext in (".csv", ".xlsx", ".xls", ".sqlite", ".db", ".sqlite3"):
+                        candidate_files.append(sub)
 
-        ext = file.suffix.lower()
-        if ext in (".csv", ".xlsx", ".xls", ".sqlite", ".db", ".sqlite3"):
-            file_map[file.name] = str(file.resolve())
-            tables.extend(parse_table_head(file, n_rows=n_rows))
+    for file in candidate_files:
+        file_map[file.name] = str(file.resolve())
+        if file.parent != target_dir:
+            file_map[f"{file.parent.name}/{file.name}"] = str(file.resolve())
+        tables.extend(parse_table_head(file, n_rows=n_rows))
 
     return DatasetContext(
         data_dir=str(target_dir),
@@ -830,14 +1005,27 @@ class SchemaParser:
     def get_business_dir(self, business_id: Optional[str] = None) -> Path:
         """Resolve directory path for a specific business_id."""
         if not business_id:
+            data_sub = self.data_dir / "data"
+            if data_sub.is_dir():
+                tabular_in_data = any(
+                    f.is_file() and f.suffix.lower() in (".csv", ".xlsx", ".xls", ".sqlite", ".db", ".sqlite3")
+                    for f in data_sub.iterdir()
+                )
+                if tabular_in_data:
+                    return data_sub
             return self.data_dir
 
-        # Check <data_dir>/<business_id>
+        # 1. Check <data_dir>/data/<business_id> (per DataMate Docker spec)
+        data_sub_dir = self.data_dir / "data" / business_id
+        if data_sub_dir.is_dir():
+            return data_sub_dir
+
+        # 2. Check <data_dir>/<business_id>
         sub_dir = self.data_dir / business_id
         if sub_dir.is_dir():
             return sub_dir
 
-        # Check direct path
+        # 3. Check direct path
         direct_p = Path(business_id)
         if direct_p.is_dir():
             return direct_p.resolve()

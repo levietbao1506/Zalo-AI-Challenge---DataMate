@@ -207,8 +207,8 @@ class TestPipelineE2E(unittest.TestCase):
         self.assertEqual(records[1]["answer"], 250.5)
         self.assertEqual(records[2]["answer"], "Hà Nội")
 
-    def test_main_defaults_match_gguf_3b_config(self):
-        """Ensure CLI defaults target local GGUF Qwen-3B, sample_dataset, and result/submission.jsonl."""
+    def test_main_defaults_match_qwen3_14b_config(self):
+        """Ensure CLI defaults target local Qwen3-14B, sample_dataset, and result/submission.jsonl."""
         import sys
 
         old_argv = sys.argv
@@ -218,12 +218,80 @@ class TestPipelineE2E(unittest.TestCase):
         finally:
             sys.argv = old_argv
 
-        expected_gguf = "./models/Qwen-3B-GGUF/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
-        self.assertEqual(args.model_path, expected_gguf)
-        self.assertEqual(DEFAULT_MODEL_PATH, expected_gguf)
+        expected_model = "./models/Qwen3-14B"
+        self.assertEqual(args.model_path, expected_model)
+        self.assertEqual(DEFAULT_MODEL_PATH, expected_model)
         self.assertEqual(DEFAULT_DATA_DIR, "./data/sample_dataset")
         self.assertEqual(DEFAULT_OUTPUT_FILE, "result/submission.jsonl")
         self.assertEqual(args.batch_size, 32)
+
+    def test_read_only_data_directory_enforcement(self):
+        """Ensure pipeline treats data_dir as strictly read-only and writes only to output_dir and scratch."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_dir = Path(tmp_dir) / "test_out"
+            data_files_before = set(self.sample_data_dir.rglob("*"))
+
+            import sys
+            test_args = [
+                "main.py",
+                "--data_dir", str(self.sample_data_dir),
+                "--questions_file", str(self.questions_file),
+                "--output_dir", str(out_dir),
+                "--dry_run",
+            ]
+            old_argv = sys.argv
+            sys.argv = test_args
+            try:
+                main()
+            finally:
+                sys.argv = old_argv
+
+            # Verify no new files were created in data_dir
+            data_files_after = set(self.sample_data_dir.rglob("*"))
+            self.assertEqual(data_files_before, data_files_after, "data_dir must not have any new or modified files")
+
+            # Verify outputs are written strictly in output_dir
+            self.assertTrue((out_dir / "submission.jsonl").exists())
+            self.assertTrue((out_dir / "logs" / "predictions.jsonl").exists())
+
+    def test_end_to_end_predictions_log_generation_and_pa_report(self):
+        """Verify pipeline writes competition-compliant predictions.jsonl with 6 fields and computes PA."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_dir = Path(tmp_dir) / "eval_out"
+            out_file = out_dir / "submission.jsonl"
+            log_file = out_dir / "logs" / "predictions.jsonl"
+
+            import sys
+            test_args = [
+                "main.py",
+                "--data_dir", str(self.sample_data_dir),
+                "--questions_file", str(self.questions_file),
+                "--output_dir", str(out_dir),
+                "--dry_run",
+            ]
+            old_argv = sys.argv
+            sys.argv = test_args
+            try:
+                main()
+            finally:
+                sys.argv = old_argv
+
+            self.assertTrue(log_file.exists())
+            log_lines = log_file.read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(log_lines), 2)
+
+            required_fields = {"id", "answer", "elapsed_ms", "thinking", "code", "output"}
+            for line in log_lines:
+                rec = json.loads(line)
+                self.assertEqual(set(rec.keys()), required_fields)
+                self.assertIsInstance(rec["elapsed_ms"], int)
+                self.assertGreaterEqual(rec["elapsed_ms"], 0)
+
+            # Check Penalized Accuracy report
+            summary = evaluate_submission(out_file, self.ground_truth_file)
+            self.assertIn("penalized_accuracy", summary)
+            self.assertIn("type_breakdown", summary)
+            self.assertIsInstance(summary["type_breakdown"], dict)
 
 
 if __name__ == "__main__":

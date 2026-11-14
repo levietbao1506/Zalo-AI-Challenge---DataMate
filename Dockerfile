@@ -1,53 +1,45 @@
 # ==============================================================================
 # Zalo AI Challenge 2026 - DataMate Track
-# Official Production-Grade Dockerfile for Offline Evaluation (<15B Model, vLLM)
-# Base: NVIDIA CUDA 12.8 on Ubuntu 22.04 per Competition Rules
+# Production Dockerfile for Offline Evaluation (<15B Model, vLLM)
+# Base: vllm/vllm-openai:v0.10.1.1
 # ==============================================================================
 
-FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
+FROM vllm/vllm-openai:v0.10.1.1
 
 LABEL maintainer="Zalo AI Challenge - DataMate 2026"
 LABEL description="Offline tabular QA inference container running vLLM, Pandas, DuckDB"
 
-# 1. System environment configuration
-ENV DEBIAN_FRONTEND=noninteractive \
+# Override default vLLM entrypoint to allow custom script execution
+ENTRYPOINT []
+
+# Strict offline and runtime environment flags
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    NCCL_P2P_DISABLE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    HF_HUB_OFFLINE=1 \
-    TRANSFORMERS_OFFLINE=1 \
     TOKENIZERS_PARALLELISM=false \
     VLLM_WORKER_MULTIPROC_METHOD=spawn \
-    OMP_NUM_THREADS=4 \
-    PATH="/usr/local/bin:$PATH"
+    OMP_NUM_THREADS=4
 
-# 2. Install Python 3.10 and necessary runtime libraries
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
-    python3-dev \
-    git \
-    curl \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+WORKDIR /code
 
-# Set python3 as default python
-RUN ln -sf /usr/bin/python3 /usr/bin/python
+# Install competition Python dependencies and pin nvidia-nccl-cu12
+COPY requirements.txt /code/requirements.txt
+RUN pip install --no-cache-dir -r /code/requirements.txt && \
+    pip install --no-cache-dir --no-deps nvidia-nccl-cu12==2.27.7
 
-# 3. Create competition directories
-WORKDIR /app
-RUN mkdir -p /app/data /app/model /app/result
+# Copy models, training code, predict runner, documentation, and source code
+COPY models/ /code/models/
+COPY training_code/ /code/training_code/
+COPY predict.sh /code/predict.sh
+COPY README.md /code/README.md
+COPY src/ /code/src/
 
-# 4. Install Python dependencies
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r /app/requirements.txt
+# Ensure predict script is executable and has Unix LF line endings
+RUN sed -i 's/\r$//' /code/predict.sh && \
+    chmod +x /code/predict.sh
 
-# 5. Copy source code and scripts
-COPY . /app
-
-# 6. Ensure shell script has executable permissions and Unix LF line endings
-RUN sed -i 's/\r$//' /app/run_inference.sh && \
-    chmod +x /app/run_inference.sh
-
-# 7. Default Entrypoint for BTC Evaluation Harness
-ENTRYPOINT ["/app/run_inference.sh"]
+# Default execution command
+CMD ["bash", "/code/predict.sh"]

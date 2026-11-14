@@ -12,6 +12,7 @@ from src.executor import (
     SandboxedExecutor,
     execute_local,
     execute_sandboxed_code,
+    execute_subprocess,
     execute_with_retry,
     extract_code,
     extract_python_code,
@@ -423,6 +424,28 @@ print("Computed output: 999")
         self.assertEqual(exec_res.attempts_used, 2)
         self.assertEqual(len(mock_agent.captured_prompts), 1)
         self.assertIn(EMPTY_RESULT_FEEDBACK, mock_agent.captured_prompts[0])
+
+    def test_isolated_subprocess_execution_with_preimported_helpers(self):
+        """Test isolated subprocess execution with pre-imported tabular modules."""
+        code = "final_result = int(np.sum([10, 20, 30]))"
+        success, val, stdout, stderr = execute_subprocess(code, data_dir="./data", timeout_seconds=5.0)
+        self.assertTrue(success)
+        self.assertEqual(val, 60)
+
+    def test_subprocess_timeout_and_traceback_capture(self):
+        """Test traceback capture and timeout handling in isolated subprocess."""
+        # 1. Traceback capture
+        err_code = "raise KeyError('missing_column')"
+        succ, val, stdout, stderr = execute_subprocess(err_code, data_dir="./data", timeout_seconds=5.0)
+        self.assertFalse(succ)
+        self.assertIn("KeyError", stderr)
+        self.assertIn("missing_column", stderr)
+
+        # 2. Timeout trapping
+        infinite_code = "import time\ntime.sleep(2.0)"
+        succ_to, val_to, stdout_to, stderr_to = execute_subprocess(infinite_code, data_dir="./data", timeout_seconds=0.5)
+        self.assertFalse(succ_to)
+        self.assertIn("TimeoutError", stderr_to)
 
 
 if __name__ == "__main__":
