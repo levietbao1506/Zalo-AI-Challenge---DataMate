@@ -1,14 +1,15 @@
 """System Prompt & Few-Shot Instruction Builder for Tabular QA (Bước 3).
 
 Crafts highly optimized prompts tailored for offline code-generation LLMs
-(Qwen2.5-Coder-0.5B-Instruct / Qwen2.5-14B-Instruct) answering Vietnamese
-tabular questions over CSV, XLSX, and SQLite files with Chain-of-Thought
-analysis and unanswerable schema fallback.
+(Qwen/Qwen3-14B) answering Vietnamese tabular questions over CSV, XLSX,
+and SQLite files with Chain-of-Thought analysis and unanswerable schema fallback.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+import os
+from pathlib import Path
+from typing import Dict, Optional, Union
 
 
 SYSTEM_PROMPT = """Bạn là một Data Analyst chuyên nghiệp. Hãy viết mã Python (dùng thư viện pandas) để trả lời câu hỏi sau. Chỉ in ra code, không giải thích.
@@ -20,7 +21,7 @@ MÔI TRƯỜNG THỰC THI (SANDBOX ENVIRONMENT):
    - `duckdb` (dùng để truy vấn SQL tốc độ cao trực tiếp trên file CSV, Parquet, hoặc SQLite)
    - `sqlite3`
    - `datetime`, `date`, `timedelta`, `re`, `np`, `math`, `unicodedata`
-   - `calendar_utils` (chứa các hàm: `resolve_as_of_date`, `resolve_vietnamese_relative_date`, `get_quarter_date_range`, `get_month_date_range`, `get_tet_date`)
+   - `calendar_utils` (chứa các hàm: `resolve_as_of_date`, `resolve_vietnamese_relative_date`, `get_quarter_date_range`, `get_month_date_range`, `get_week_date_range`, `get_same_period_last_year`, `get_tet_window`, `get_tet_date`, `get_holiday_range`, `solar_to_lunar`, `lunar_to_solar`)
 3. Các biến đã có sẵn trong môi trường:
    - `FILE_MAP`: Từ điển ánh xạ tên file sang đường dẫn tuyệt đối (vd: `FILE_MAP['orders.csv']`)
    - `data_dir` / `DATA_DIR`: Đường dẫn tới thư mục chứa dữ liệu
@@ -52,18 +53,22 @@ QUY TẮC CỐT LÕI (BẮT BUỘC TUÂN THỦ):
    - Ví dụ: `final_result = 15000000.5` hoặc `final_result = 42` hoặc `final_result = "Hà Nội"`.
 3. XỬ LÝ TRƯỜNG HỢP KHÔNG THỂ TRẢ LỜI (UNANSWERABLE & PENALIZED ACCURACY):
    - Cuộc thi áp dụng Penalized Accuracy: Trả lời sai bị TRỪ ĐIỂM, không trả lời (Abstain/Unanswerable) được 0 điểm.
+   - BẮT BUỘC kiểm tra xem các bảng và cột cần thiết có tồn tại trong dữ liệu thực tế hay không trước khi tính toán.
    - Nếu lược đồ dữ liệu (schema) hoàn toàn không có bảng hoặc cột thông tin nào liên quan để trả lời câu hỏi, không được đoán mò. Hãy viết comment phân tích và gán `final_result = "unanswerable"`.
+   - Nếu dữ liệu kinh doanh thiếu thông tin cốt lõi để tính toán (ví dụ: câu hỏi yêu cầu tính lợi nhuận `profit` nhưng trong dữ liệu chỉ có giá bán `selling_price` mà không có giá vốn/chi phí mua hàng `cost`/`purchase_price`), TUYỆT ĐỐI KHÔNG đoán mò hay tự giả định chi phí = 0. Hãy viết comment `# Phân tích: [Nêu rõ lý do bằng tiếng Việt vì sao thiếu thông tin]...` và gán `final_result = "unanswerable"`.
    - Nếu schema có cột liên quan nhưng bản ghi thực tế không tồn tại sau khi lọc (hoặc rỗng), hãy gán `final_result = None` (hoặc `"unanswerable"`).
 4. XỬ LÝ NGÀY THÁNG TIẾNG VIỆT & as_of_date:
-   - Các từ chỉ thời gian tương đối như 'hôm nay', 'hôm qua', 'tuần trước', 'tháng này', 'quý 2 năm ngoái', 'năm nay':
+   - Các từ chỉ thời gian tương đối như 'hôm nay', 'hôm qua', 'tuần trước', 'tuần rồi', 'tháng này', 'cùng kỳ năm ngoái', 'Tết', 'quý 2 năm ngoái', 'năm nay':
      LUÔN DỰA VÀO `as_of_date`. Dùng `calendar_utils.resolve_vietnamese_relative_date("cụm từ", as_of=as_of_date)` để lấy khoảng thời gian `(start_date, end_date)`.
-5. TRUY VẤN TỪ KHÓA TIẾNG VIỆT KHÔNG DẤU / KHÔNG PHÂN BIỆT HOA THƯỜNG:
+5. TUÂN THỦ QUY TẮC TỪ RULEBOOK ĐỘNG (RULEBOOK.MD):
+   - Mọi định nghĩa kinh doanh (doanh thu `revenue`, sản phẩm `bán chạy`, ranh giới tuần `week boundaries` thứ Hai hay Chủ Nhật, phương pháp chi phí/giá vốn `cost methods`) BẮT BUỘC phải tuân theo file `rulebook.md` của tập dữ liệu hiện tại nếu có. TUYỆT ĐỐI KHÔNG áp dụng quy tắc cứng hay giả định chủ quan khi rulebook đã định nghĩa khác.
+6. TRUY VẤN TỪ KHÓA TIẾNG VIỆT KHÔNG DẤU / KHÔNG PHÂN BIỆT HOA THƯỜNG:
    - Khi tìm kiếm tên riêng, chi nhánh, sản phẩm bằng tiếng Việt: chuẩn hóa về chữ thường và loại bỏ dấu (hoặc dùng regex) để so khớp linh hoạt, tránh bị lệch do cách gõ dấu (ví dụ: "ha noi" khớp "Hà Nội").
-6. ĐỊNH DẠNG SỐ VÀ CHUỖI:
+7. ĐỊNH DẠNG SỐ VÀ CHUỖI:
    - Nếu là số thực, làm tròn 2 chữ số thập phân (`round(val, 2)`).
    - Nếu là số đếm / số nguyên, giữ nguyên kiểu số nguyên.
    - Chuỗi ký tự tiếng Việt phải chuẩn Unicode NFC.
-7. ĐỊNH DẠNG PHẢN HỒI:
+8. ĐỊNH DẠNG PHẢN HỒI:
    - CHỈ trả về duy nhất một khối mã Python trong thẻ ```python ... ```.
    - Tuyệt đối không viết thêm lời giải thích bằng lời ở ngoài khối code."""
 
@@ -195,19 +200,68 @@ if 'SKU-9999' not in df['product_id'].astype(str).values:
     final_result = None
 else:
     final_result = None
+```
+
+---
+### VÍ DỤ 6 (Unanswerable - Thiếu thông tin hoặc cột dữ liệu để tính toán chỉ số yêu cầu):
+Câu hỏi: "Tính tổng lợi nhuận của sản phẩm sữa tươi trong tháng 5/2024?"
+Ngày tham chiếu: 2024-06-01
+Lược đồ dữ liệu (Schema): `sales.csv` có `product_name`, `quantity`, `selling_price`. Không có cột giá vốn hay chi phí nhập hàng.
+
+```python
+# Phân tích: Câu hỏi yêu cầu tính lợi nhuận (profit = revenue - cost). Trong các bảng dữ liệu chỉ có cột selling_price và quantity, hoàn toàn không có cột giá vốn/chi phí mua hàng (cost/purchase_price). Vì thiếu thông tin cần thiết để tính toán, trả về unanswerable kèm lý do cụ thể.
+final_result = "unanswerable"
 ```"""
+
+
+def read_rulebook(data_dir: Union[str, Path] = "./data") -> str:
+    """Read live rulebook.md from data directory if present.
+
+    Never hardcodes rules; always reads split's actual rulebook.md dynamically.
+    """
+    base = Path(data_dir).resolve()
+    candidates = [
+        base / "rulebook.md",
+        base / "RULEBOOK.md",
+        base / "data" / "rulebook.md",
+        Path("/data/rulebook.md"),
+        Path("./rulebook.md"),
+    ]
+    for c in candidates:
+        if c.is_file():
+            try:
+                for enc in ("utf-8-sig", "utf-8", "latin-1"):
+                    try:
+                        content = c.read_text(encoding=enc).strip()
+                        if content:
+                            return content
+                    except UnicodeDecodeError:
+                        continue
+            except Exception:
+                pass
+    return ""
 
 
 class PromptBuilder:
     """Builds system and question prompts for the code generation LLM."""
 
-    def __init__(self, system_prompt: str = SYSTEM_PROMPT, few_shot_examples: str = FEW_SHOT_EXAMPLES):
+    def __init__(
+        self,
+        system_prompt: str = SYSTEM_PROMPT,
+        few_shot_examples: str = FEW_SHOT_EXAMPLES,
+        rulebook_content: Optional[str] = None,
+    ):
         self.system_prompt = system_prompt
         self.few_shot_examples = few_shot_examples
+        self.rulebook_content = rulebook_content
 
-    def build_system_prompt(self) -> str:
-        """Return complete system prompt with role declaration and few-shot instructions."""
-        return f"{self.system_prompt}\n\n{self.few_shot_examples}"
+    def build_system_prompt(self, rulebook_content: Optional[str] = None) -> str:
+        """Return complete system prompt with role declaration, few-shot instructions, and rulebook."""
+        full_prompt = f"{self.system_prompt}\n\n{self.few_shot_examples}"
+        rb = rulebook_content if rulebook_content is not None else self.rulebook_content
+        if rb and rb.strip():
+            full_prompt += f"\n\n=== QUY TẮC BỔ SUNG TỪ RULEBOOK (RULEBOOK.MD) ===\n{rb.strip()}"
+        return full_prompt
 
     def build_user_prompt(
         self,
@@ -215,6 +269,7 @@ class PromptBuilder:
         schema_context: str,
         as_of_date: Optional[str] = None,
         file_map: Optional[Dict[str, str]] = None,
+        rulebook_content: Optional[str] = None,
     ) -> str:
         """Compose user prompt including schema context and specific question.
 
@@ -225,6 +280,7 @@ class PromptBuilder:
             schema_context: Markdown summary of datasets and head(5) previews.
             as_of_date: Date anchor string (e.g., '2024-06-15').
             file_map: Dictionary of available filenames to absolute paths.
+            rulebook_content: Optional text of live rulebook.md.
 
         Returns:
             Formatted prompt string.
@@ -244,11 +300,18 @@ class PromptBuilder:
             file_list = ", ".join(f"`{k}`" for k in file_map.keys())
             prompt_parts.append(f"- Các file dữ liệu có sẵn trong FILE_MAP: {file_list}")
 
+        rb = rulebook_content if rulebook_content is not None else self.rulebook_content
+        if rb and rb.strip():
+            prompt_parts.append("\n" + "=" * 50)
+            prompt_parts.append("### QUY TẮC TẬP DỮ LIỆU HIỆN TẠI (RULEBOOK.MD):")
+            prompt_parts.append(rb.strip())
+
         prompt_parts.append("\n" + "=" * 50)
         prompt_parts.append(f"### CÂU HỎI TIẾNG VIỆT:\n\"{question}\"\n")
         prompt_parts.append(
             "CRITICAL RULES (ERROR-PREVENTION - TUÂN THỦ TUYỆT ĐỐI ĐỂ TRÁNH CRASH HỆ THỐNG):\n"
             "- CHỈ sử dụng ĐÚNG tên bảng và tên cột có trong Schema, TUYỆT ĐỐI KHÔNG bịa đặt cột.\n"
+            "- KIỂM TRA sự tồn tại của cột/bảng trước khi tính toán. Nếu dữ liệu kinh doanh thiếu thông tin cốt lõi (ví dụ: tính lợi nhuận nhưng không có cột giá vốn/chi phí), gán `final_result = \"unanswerable\"` kèm comment giải thích lý do bằng tiếng Việt.\n"
             "- Xử lý an toàn edge cases: dùng `.fillna()`, kiểm tra `if df.empty:` trước khi trích xuất giá trị để tránh KeyError/IndexError.\n"
             "- BẮT BUỘC bắt đầu code bằng comment `# Phân tích: ...`, viết đoạn mã Python (dùng pandas) hợp lệ để tính toán và gán câu trả lời vào biến `final_result` (hoặc gán `final_result = \"unanswerable\"` nếu schema không có thông tin liên quan).\n"
             "- TUYỆT ĐỐI KHÔNG viết lời giải thích hay văn bản hội thoại nào ngoài code block.\n"

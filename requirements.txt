@@ -1,10 +1,24 @@
-duckdb
-llama-cpp-pythonƯ
-lunarcalendar
-openpyxl
+# ==============================================================================
+# Zalo AI Challenge 2026 - DataMate Track Dependencies
+# Compatible with vllm/vllm-openai:v0.10.1.1 (PyTorch 2.7.1+cu128, CUDA 12.8)
+# ==============================================================================
+
+# Core vLLM & LLM inference engine
+vllm
+llama-cpp-python
+
+# GPU inter-process communication (pinned to prevent two-GPU initialization hangs on Blackwell)
+nvidia-nccl-cu12==2.27.7
+
+# Tabular data manipulation and execution engines
 pandas
+numpy
+scipy
+duckdb
+openpyxl
+xlrd
+
+# Utilities & calendar handling
+lunarcalendar
 pydantic
 requests
-vllm
---extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
-llama-cpp-python

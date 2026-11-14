@@ -5,10 +5,11 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from src.agent import (
-    DEFAULT_OLLAMA_URL,
     DEFAULT_TEMPERATURE,
     CodeAgent,
     VLLMAgent,
+    extract_thinking,
+    verification_gate,
 )
 from src.executor import SandboxedExecutor
 from src.prompt_builder import (
@@ -238,78 +239,6 @@ class TestVLLMAgent(unittest.TestCase):
             ],
         )
 
-    def test_ollama_backend_initialization(self):
-        """Verify CodeAgent detects 'ollama:' prefix, extracts model name, and disables vLLM fallback."""
-        agent = CodeAgent("ollama:llama3.2:1b")
-        self.assertEqual(agent.backend, "ollama")
-        self.assertEqual(agent.model_name, "llama3.2:1b")
-        self.assertFalse(agent.dry_run)
-        self.assertIsNone(agent.llm)
-
-        vllm_agent = CodeAgent("./models/Qwen2.5-Coder-0.5B-Instruct", dry_run=True)
-        self.assertEqual(vllm_agent.backend, "vllm")
-
-        with self.assertRaises(ValueError):
-            CodeAgent("ollama:")
-
-    def test_ollama_generate_code_posts_expected_payload(self):
-        """Verify Ollama backend sends expected POST JSON payload and returns response['response']."""
-        agent = CodeAgent("ollama:llama3.2:1b")
-        mock_response = MagicMock()
-        mock_response.json.return_value = {"response": "```python\nfinal_result = 42\n```"}
-
-        with patch("src.agent.requests.post", return_value=mock_response) as mock_post:
-            output = agent.generate_code("Tính tổng doanh thu")
-
-        self.assertEqual(output, "```python\nfinal_result = 42\n```")
-        mock_post.assert_called_once_with(
-            DEFAULT_OLLAMA_URL,
-            json={
-                "model": "llama3.2:1b",
-                "prompt": "Tính tổng doanh thu",
-                "stream": False,
-                "options": {"temperature": 0.0},
-            },
-            timeout=None,
-        )
-        mock_response.raise_for_status.assert_called_once()
-
-    def test_ollama_generate_code_with_system_prompt(self):
-        """Verify Ollama backend forwards optional system_prompt in payload."""
-        agent = CodeAgent("ollama:llama3.2:1b")
-        mock_response = MagicMock()
-        mock_response.json.return_value = {"response": "final_result = 1"}
-
-        with patch("src.agent.requests.post", return_value=mock_response) as mock_post:
-            output = agent.generate_code("Q?", system_prompt="SYS")
-
-        self.assertEqual(output, "final_result = 1")
-        mock_post.assert_called_once_with(
-            DEFAULT_OLLAMA_URL,
-            json={
-                "model": "llama3.2:1b",
-                "prompt": "Q?",
-                "stream": False,
-                "options": {"temperature": 0.0},
-                "system": "SYS",
-            },
-            timeout=None,
-        )
-
-    def test_ollama_generate_code_batch_sequential(self):
-        """Verify generate_code_batch calls generate_code sequentially for Ollama backend."""
-        agent = CodeAgent("ollama:llama3.2:1b")
-        self.assertEqual(agent.generate_code_batch([]), [])
-
-        with patch.object(agent, "generate_code", side_effect=["resp_0", "resp_1", "resp_2"]) as mock_gen:
-            results = agent.generate_code_batch(["prompt_0", "prompt_1", "prompt_2"])
-
-        self.assertEqual(results, ["resp_0", "resp_1", "resp_2"])
-        self.assertEqual(mock_gen.call_count, 3)
-        mock_gen.assert_any_call("prompt_0")
-        mock_gen.assert_any_call("prompt_1")
-        mock_gen.assert_any_call("prompt_2")
-
     def test_vllm_directory_initialization_flags(self):
         """Verify standard local directory defaults to vLLM with trust_remote_code=True and tensor_parallel_size=1."""
         fake_llm_instance = MagicMock()
@@ -320,7 +249,7 @@ class TestVLLMAgent(unittest.TestCase):
             patch("src.agent.LLM", return_value=fake_llm_instance) as mock_llm_cls,
             patch("src.agent.SamplingParams", return_value=fake_sampling) as mock_sp_cls,
         ):
-            agent = CodeAgent("./models/Qwen2.5-Coder-3B-Instruct")
+            agent = CodeAgent("./models/Qwen3-14B")
 
         self.assertEqual(agent.backend, "vllm")
         self.assertFalse(agent.dry_run)
@@ -328,7 +257,7 @@ class TestVLLMAgent(unittest.TestCase):
         self.assertIs(agent.sampling_params, fake_sampling)
         mock_llm_cls.assert_called_once()
         call_kwargs = mock_llm_cls.call_args.kwargs
-        self.assertEqual(call_kwargs["model"], "./models/Qwen2.5-Coder-3B-Instruct")
+        self.assertEqual(call_kwargs["model"], "./models/Qwen3-14B")
         self.assertTrue(call_kwargs["trust_remote_code"])
         self.assertEqual(call_kwargs["tensor_parallel_size"], 1)
         self.assertEqual(call_kwargs["max_model_len"], 4096)
@@ -337,7 +266,7 @@ class TestVLLMAgent(unittest.TestCase):
 
     def test_llama_cpp_gguf_initialization_and_generation(self):
         """Verify .gguf model_path initializes llama_cpp backend, generates code via chat completion, and batches sequentially."""
-        gguf_path = "./models/Qwen-3B-GGUF/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
+        gguf_path = "./models/mock-model.gguf"
         mock_llama_instance = MagicMock()
         mock_llama_instance.create_chat_completion.return_value = {
             "choices": [{"message": {"content": "```python\nfinal_result = 7\n```"}}]
@@ -383,6 +312,46 @@ class TestVLLMAgent(unittest.TestCase):
         mock_llama_instance.create_chat_completion.side_effect = Exception("CUDA error")
         err_out = agent.generate_code("Error test")
         self.assertEqual(err_out, "")
+
+    def test_extract_thinking_helper(self):
+        """Test extraction of chain-of-thought reasoning inside <think>...</think> tags."""
+        raw_output = "<think>Phân tích câu hỏi: cần tính doanh thu tháng 5.</think>```python\nresult = 100\n```"
+        thinking = extract_thinking(raw_output)
+        self.assertEqual(thinking, "Phân tích câu hỏi: cần tính doanh thu tháng 5.")
+
+        # No thinking tags
+        self.assertIsNone(extract_thinking("```python\nresult = 100\n```"))
+
+    def test_agent_verification_gate_pa_guard(self):
+        """Verify agent's verification_gate guards against negative PA scores."""
+        agent = CodeAgent(dry_run=True, abstain_threshold=0.6)
+
+        # 1. Successful execution with valid answer
+        res_ok = agent.verify_prediction(execution_success=True, raw_result=150.0, q_type="number")
+        self.assertTrue(res_ok["passed"])
+        self.assertEqual(res_ok["type"], "number")
+        self.assertEqual(res_ok["answer"], 150.0)
+
+        # 2. Conflicting retries drop confidence below threshold -> abstain
+        res_conflict = agent.verify_prediction(
+            execution_success=True,
+            raw_result=200,
+            q_type="number",
+            retry_results=[100, 200],
+        )
+        self.assertEqual(res_conflict["type"], "abstain")
+        self.assertEqual(res_conflict["answer"], "abstain")
+        self.assertFalse(res_conflict["passed"])
+
+        # 3. Execution failure after retries -> abstain
+        res_err = agent.verify_prediction(
+            execution_success=False,
+            raw_result=None,
+            q_type="number",
+            error_msg="KeyError: 'revenue'",
+        )
+        self.assertEqual(res_err["type"], "abstain")
+        self.assertEqual(res_err["answer"], "abstain")
 
 
 if __name__ == "__main__":
