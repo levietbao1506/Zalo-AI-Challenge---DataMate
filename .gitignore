@@ -30,3 +30,11 @@ local_out/
 *.zip
 *.log
 __pycache__/
+models/
+.venv/
+local_data/
+local_out/
+*.safetensors
+*.zip
+*.log
+__pycache__/
