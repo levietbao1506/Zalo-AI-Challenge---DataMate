@@ -22,4 +22,11 @@ local_out/
 
 uv.lock
 models/
-public_test.zip
+public_test.zipmodels/
+.venv/
+local_data/
+local_out/
+*.safetensors
+*.zip
+*.log
+__pycache__/
