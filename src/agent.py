@@ -1,13 +1,12 @@
-"""Agent managing local vLLM, llama-cpp-python (GGUF), or Ollama API inference (Bước 3).
+"""Agent managing local offline vLLM inference for Qwen/Qwen3-14B (Bước 3).
 
-Supports local vLLM models (e.g. Qwen2.5-Coder), GGUF models via ``llama-cpp-python``
-(when ``model_path`` ends with ``.gguf``), and local Ollama API models prefixed with
-``ollama:`` with temperature=0.0 for deterministic code generation.
+Supports local offline vLLM inference with temperature=0.0 for deterministic, reproducible code generation.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 from datetime import date
 import logging
 import math
@@ -49,21 +48,15 @@ except ImportError:
     LLM = None
     SamplingParams = None
 
-# Try importing llama-cpp-python for GGUF inference
+# Try importing llama-cpp-python for GGUF inference (optional fallback)
 try:
     from llama_cpp import Llama
 except ImportError:
     Llama = None  # type: ignore[assignment]
 
-# Try importing requests for Ollama API support
-try:
-    import requests
-except ImportError:
-    requests = None  # type: ignore[assignment]
 
 DEFAULT_MODEL_NAME = "Qwen/Qwen3-14B"
-DEFAULT_LOCAL_MODEL_PATH = "./models/Qwen3-14B"
-DEFAULT_OLLAMA_URL = "http://localhost:11434/api/generate"
+DEFAULT_LOCAL_MODEL_PATH = "/code/models/Qwen3-14B" if Path("/code/models/Qwen3-14B").exists() else "./models/Qwen3-14B"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_STOP_TOKENS = ["<|im_end|>", "</s>", "<|endoftext|>"]
 
@@ -74,7 +67,7 @@ def load_vllm_engine(
     max_tokens: int = 1024,
     gpu_memory_utilization: float = 0.85,
     max_model_len: int = 4096,
-    tensor_parallel_size: int = 1,
+    tensor_parallel_size: Optional[int] = None,
     trust_remote_code: bool = True,
 ) -> Tuple[Any, Any]:
     """Load Qwen3-14B (or local weights) using vLLM with temperature=0.0.
@@ -100,6 +93,30 @@ def load_vllm_engine(
             "hoặc chạy trong môi trường Docker GPU của BTC."
         )
 
+    # Resolve tensor parallel degree
+    if tensor_parallel_size is None:
+        tp_env = os.environ.get("TENSOR_PARALLEL_SIZE")
+        if tp_env:
+            tensor_parallel_size = int(tp_env)
+        elif Path("/code").exists() or (isinstance(model_path, str) and model_path.startswith("/code")):
+            tensor_parallel_size = 2
+        else:
+            tensor_parallel_size = 1
+
+    # Auto-adjust tensor_parallel_size based on available CUDA devices
+    try:
+        import torch
+        if torch.cuda.is_available():
+            available_gpus = torch.cuda.device_count()
+            if available_gpus < tensor_parallel_size:
+                logger.warning(
+                    f"Requested tensor_parallel_size={tensor_parallel_size} but only {available_gpus} GPU(s) available. "
+                    f"Adjusting tensor_parallel_size to {available_gpus}."
+                )
+                tensor_parallel_size = max(1, available_gpus)
+    except Exception:
+        pass
+
     logger.info(f"Initializing vLLM engine with model: '{model_path}'...")
     logger.info(f"Parameters: temperature={temperature}, max_model_len={max_model_len}, gpu_mem={gpu_memory_utilization}")
 
@@ -124,7 +141,7 @@ def load_vllm_engine(
 
 
 class CodeAgent:
-    """Manages local vLLM, llama.cpp (GGUF), or Ollama API backend for Python code generation."""
+    """Manages local offline vLLM (or optional llama.cpp GGUF) backend for Python code generation."""
 
     def __init__(
         self,
@@ -132,19 +149,19 @@ class CodeAgent:
         temperature: float = DEFAULT_TEMPERATURE,
         gpu_memory_utilization: float = 0.85,
         max_model_len: int = 4096,
-        tensor_parallel_size: int = 1,
+        tensor_parallel_size: Optional[int] = None,
         trust_remote_code: bool = True,
         dry_run: bool = False,
         abstain_threshold: float = DEFAULT_ABSTAIN_THRESHOLD,
     ):
-        """Initialize llama.cpp, vLLM engine, Ollama HTTP client, or mock engine.
+        """Initialize vLLM engine, llama.cpp GGUF engine, or mock engine.
 
         Args:
-            model_path: Path to ``.gguf`` file, vLLM directory/repo ID, or ``ollama:<model>``.
+            model_path: Path to vLLM directory or .gguf file (default: Qwen/Qwen3-14B).
             temperature: Sampling temperature (default: 0.0 for deterministic greedy decoding).
             gpu_memory_utilization: Fraction of GPU memory allocated to vLLM (default: 0.85).
             max_model_len: Context window limit (default: 4096).
-            tensor_parallel_size: Tensor parallel degree (default: 1 for <15B models).
+            tensor_parallel_size: Tensor parallel degree (default: 2 or from TENSOR_PARALLEL_SIZE).
             trust_remote_code: Whether to pass ``trust_remote_code=True`` to vLLM (default: True).
             dry_run: If True, forces dry-run mock mode without calling a model backend.
             abstain_threshold: Confidence threshold below which answers are downgraded to abstain (default: 0.6).
@@ -153,26 +170,22 @@ class CodeAgent:
         self.temperature = temperature
         self.trust_remote_code = trust_remote_code
         self.abstain_threshold = abstain_threshold
-        self.ollama_url = DEFAULT_OLLAMA_URL
         self.llm = None
         self.sampling_params = None
         self.last_thinking: Optional[str] = None
         self.last_batch_thinking: List[Optional[str]] = []
 
-        if isinstance(model_path, str) and model_path.startswith("ollama:"):
-            self.backend = "ollama"
-            self.model_name = model_path[len("ollama:"):].strip()
-            if not self.model_name:
-                raise ValueError("Ollama model name cannot be empty after 'ollama:' prefix.")
-            self.dry_run = dry_run
-            if self.dry_run:
-                logger.info("Initializing Agent in DRY-RUN / MOCK mode (Ollama disabled).")
+        # Resolve tensor parallel degree (default: 2 in Docker / TENSOR_PARALLEL_SIZE, 1 otherwise)
+        if tensor_parallel_size is None:
+            tp_env = os.environ.get("TENSOR_PARALLEL_SIZE")
+            if tp_env:
+                tensor_parallel_size = int(tp_env)
+            elif Path("/code").exists() or (isinstance(model_path, str) and model_path.startswith("/code")):
+                tensor_parallel_size = 2
             else:
-                logger.info(
-                    f"Initializing Ollama backend with model: '{self.model_name}' "
-                    f"(endpoint={self.ollama_url}, temperature={self.temperature})."
-                )
-        elif isinstance(model_path, str) and model_path.lower().endswith(".gguf"):
+                tensor_parallel_size = 1
+
+        if isinstance(model_path, str) and model_path.lower().endswith(".gguf"):
             self.backend = "llama_cpp"
             self.model_name = model_path
             self.dry_run = False
@@ -236,33 +249,6 @@ class CodeAgent:
             logger.error(f"Failed to initialize vLLM engine: {e}. Falling back to dry-run mock mode.")
             self.dry_run = True
 
-    def _generate_ollama(self, prompt: str, system_prompt: Optional[str] = None) -> str:
-        """Send a single completion request to the local Ollama HTTP API."""
-        if requests is None:
-            raise RuntimeError(
-                "Thư viện 'requests' chưa được cài đặt. Hãy cài đặt 'requests' để sử dụng Ollama backend."
-            )
-
-        payload: dict[str, Any] = {
-            "model": self.model_name,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": self.temperature},
-        }
-        if system_prompt is not None:
-            payload["system"] = system_prompt
-
-        try:
-            response = requests.post(self.ollama_url, json=payload, timeout=None)
-            response.raise_for_status()
-            resp_data = response.json()
-            raw_output = resp_data.get("response", "")
-            self.last_thinking = resp_data.get("thinking") or extract_thinking(raw_output)
-            return raw_output
-        except requests.RequestException as e:
-            logger.error(f"Ollama API request failed for model '{self.model_name}': {e}")
-            raise
-
     def generate_code(self, prompt: str, system_prompt: Optional[str] = None) -> str:
         """Generate Python code to solve the tabular QA question.
 
@@ -271,15 +257,12 @@ class CodeAgent:
             system_prompt: System prompt containing role instructions and few-shots.
 
         Returns:
-            Generated response text (for Ollama/llama_cpp) or extracted Python code (for vLLM).
+            Extracted Python code.
         """
         if self.dry_run:
             mock_res = self._mock_generate_code(prompt)
             self.last_thinking = extract_thinking(mock_res)
             return mock_res
-
-        if self.backend == "ollama":
-            return self._generate_ollama(prompt, system_prompt=system_prompt)
 
         if self.backend == "llama_cpp":
             try:
@@ -343,8 +326,7 @@ class CodeAgent:
         """Generate Python completions for a batch of prompts.
 
         Uses single-pass vLLM batch inference when ``backend == "vllm"`` or loops
-        sequentially via :meth:`generate_code` when ``backend`` is ``"ollama"``
-        or ``"llama_cpp"``.
+        sequentially via :meth:`generate_code` when ``backend == "llama_cpp"``.
 
         Args:
             prompts: Ordered list of prompts to feed into inference.
@@ -360,19 +342,6 @@ class CodeAgent:
         if self.dry_run:
             results = [self._mock_generate_code(prompt) for prompt in prompts]
             self.last_batch_thinking = [extract_thinking(r) for r in results]
-            return results
-
-        if self.backend == "ollama":
-            results = []
-            thinkings = []
-            for prompt in prompts:
-                if system_prompt is not None:
-                    code = self.generate_code(prompt, system_prompt=system_prompt)
-                else:
-                    code = self.generate_code(prompt)
-                results.append(code)
-                thinkings.append(self.last_thinking)
-            self.last_batch_thinking = thinkings
             return results
 
         if self.backend == "llama_cpp":
@@ -849,7 +818,7 @@ VLLMAgent = CodeAgent
 
 def main() -> None:
     """CLI test script to load vLLM model and verify greedy generation."""
-    parser = argparse.ArgumentParser(description="Load Qwen2.5-14B-Instruct via vLLM with temperature=0.0")
+    parser = argparse.ArgumentParser(description="Load Qwen/Qwen3-14B via vLLM with temperature=0.0")
     parser.add_argument("--model_path", type=str, default=DEFAULT_LOCAL_MODEL_PATH, help="Model weights path")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
     parser.add_argument("--dry_run", action="store_true", help="Force dry-run mock mode")

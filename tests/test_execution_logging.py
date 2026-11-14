@@ -118,7 +118,7 @@ class TestExecutionLogging(unittest.TestCase):
                 self.assertGreaterEqual(log_rec["elapsed_ms"], 0)
 
                 # answer handling
-                if sub_rec["answer"] in ("abstain", None):
+                if sub_rec.get("type") == "abstain" or sub_rec.get("answer") in ("abstain", None):
                     self.assertIsNone(log_rec["answer"])
                 else:
                     self.assertEqual(log_rec["answer"], sub_rec["answer"])

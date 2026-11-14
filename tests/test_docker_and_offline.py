@@ -139,7 +139,10 @@ class TestDockerAndOffline(unittest.TestCase):
                 rec = json.loads(line)
                 self.assertIn("id", rec)
                 self.assertIn("type", rec)
-                self.assertIn("answer", rec)
+                if rec["type"] == "abstain":
+                    self.assertNotIn("answer", rec)
+                else:
+                    self.assertIn("answer", rec)
 
     def test_predict_script_specification(self):
         """Ensure predict.sh exists with Unix LF line endings and supports DataMate container arguments."""
@@ -207,7 +210,10 @@ class TestDockerAndOffline(unittest.TestCase):
             self.assertEqual(record["id"], "q_test")
             self.assertNotIn("alias", record, "Output record must omit 'alias' field per BTC rules")
             self.assertIn("type", record)
-            self.assertIn("answer", record)
+            if record["type"] == "abstain":
+                self.assertNotIn("answer", record)
+            else:
+                self.assertIn("answer", record)
 
     def test_training_code_package_structure(self):
         """Ensure /code/training_code/ has all required directories, scripts, and zero-shot documentation."""

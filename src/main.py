@@ -29,7 +29,7 @@ from src.prompt_builder import PromptBuilder, read_rulebook
 from src.schema_parser import DatasetContext, SchemaParser, get_business_schema
 
 BATCH_SIZE = 32
-DEFAULT_MODEL_PATH = "./models/Qwen3-14B"
+DEFAULT_MODEL_PATH = "/code/models/Qwen3-14B" if Path("/code/models/Qwen3-14B").exists() else "./models/Qwen3-14B"
 DEFAULT_DATA_DIR = "./data/sample_dataset"
 DEFAULT_OUTPUT_FILE = "result/submission.jsonl"
 
@@ -137,7 +137,7 @@ def parse_arguments() -> argparse.Namespace:
         "--model-path",
         type=str,
         default=DEFAULT_MODEL_PATH,
-        help=f"Model path (.gguf for llama.cpp, directory for vLLM, or 'ollama:<model>') (default: {DEFAULT_MODEL_PATH})",
+        help=f"Model directory path for offline vLLM (default: {DEFAULT_MODEL_PATH})",
     )
     parser.add_argument(
         "--timeout",
@@ -153,6 +153,7 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--batch_size",
+        "--batch-size",
         type=int,
         default=BATCH_SIZE,
         help=f"Number of questions per vLLM batch inference chunk (default: {BATCH_SIZE})",
@@ -161,6 +162,13 @@ def parse_arguments() -> argparse.Namespace:
         "--dry_run",
         action="store_true",
         help="Run in mock/dry-run mode without loading full vLLM weights",
+    )
+    parser.add_argument(
+        "--tensor_parallel_size",
+        "--tensor-parallel-size",
+        type=int,
+        default=None,
+        help="Tensor parallel degree for vLLM (default: from TENSOR_PARALLEL_SIZE or 2 in Docker, 1 otherwise)",
     )
 
     return parser.parse_args()
@@ -656,7 +664,7 @@ def main() -> None:
     prompt_builder = PromptBuilder(rulebook_content=rulebook_content)
     system_prompt = prompt_builder.build_system_prompt()
 
-    agent = CodeAgent(model_path, dry_run=args.dry_run)
+    agent = CodeAgent(model_path, dry_run=args.dry_run, tensor_parallel_size=args.tensor_parallel_size)
 
     # Step 3: Load questions
     questions = load_questions(questions_file)

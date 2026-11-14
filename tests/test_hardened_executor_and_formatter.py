@@ -346,9 +346,10 @@ class TestHardenedFormatter(unittest.TestCase):
         self.assertEqual(rec_unans["reason"], "Thiếu thông tin chi nhánh trong câu hỏi")
         self.assertNotIn("alias", rec_unans)
 
-        # Abstain
+        # Abstain (Section 3.2: strictly id and type, no answer key)
         rec_abs = format_submission_record("q_101", answer=None)
-        self.assertEqual(rec_abs, {"id": "q_101", "type": "abstain", "answer": "abstain"})
+        self.assertEqual(rec_abs, {"id": "q_101", "type": "abstain"})
+        self.assertNotIn("answer", rec_abs)
         self.assertNotIn("alias", rec_abs)
 
         # Table

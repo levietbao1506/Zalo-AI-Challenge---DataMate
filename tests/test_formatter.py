@@ -185,9 +185,10 @@ class TestFormatter(unittest.TestCase):
         rec_str = format_submission_record("q_002", "hà nội")
         self.assertEqual(rec_str, {"id": "q_002", "type": "string", "answer": "hà nội"})
 
-        # Abstain record
+        # Abstain record (Section 3.2: strictly id and type, no answer key)
         rec_abs = format_submission_record("q_003", "abstain")
-        self.assertEqual(rec_abs, {"id": "q_003", "type": "abstain", "answer": "abstain"})
+        self.assertEqual(rec_abs, {"id": "q_003", "type": "abstain"})
+        self.assertNotIn("answer", rec_abs)
 
         # JSON line formatting
         json_line = format_submission_json("q_004", "đà nẵng", q_type="string")
@@ -213,7 +214,8 @@ class TestFormatter(unittest.TestCase):
             self.assertEqual(parsed_1["id"], "q_1")
             self.assertEqual(parsed_1["answer"], 100)
             self.assertEqual(parsed_2["id"], "q_2")
-            self.assertEqual(parsed_2["answer"], "abstain")
+            self.assertEqual(parsed_2["type"], "abstain")
+            self.assertNotIn("answer", parsed_2)
 
     def test_exact_string_normalization_and_comparison(self):
         """Test competition string normalization: NFC, lowercase, punctuation removal, whitespace collapse."""

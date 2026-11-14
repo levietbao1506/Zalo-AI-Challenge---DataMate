@@ -94,6 +94,7 @@ export OMP_NUM_THREADS=4
 export PYTHONDONTWRITEBYTECODE=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
+export TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-2}"
 export TMPDIR="${TMPDIR:-/tmp}"
 mkdir -p "${TMPDIR}" 2>/dev/null || true
 

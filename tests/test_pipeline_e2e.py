@@ -135,12 +135,15 @@ class TestPipelineE2E(unittest.TestCase):
             lines = out_file.read_text(encoding="utf-8").strip().splitlines()
             self.assertEqual(len(lines), 2)
 
-            # Check JSON schema of each line
+            # Check JSON schema of each line (Section 3.2: omit answer when type == abstain)
             for line in lines:
                 rec = json.loads(line)
                 self.assertIn("id", rec)
                 self.assertIn("type", rec)
-                self.assertIn("answer", rec)
+                if rec["type"] == "abstain":
+                    self.assertNotIn("answer", rec)
+                else:
+                    self.assertIn("answer", rec)
 
             # Evaluate submission against ground truth
             eval_summary = evaluate_submission(

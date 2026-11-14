@@ -1,12 +1,9 @@
 """System Prompt & Few-Shot Instruction Builder for Tabular QA (Bước 3).
 
 Crafts highly optimized prompts tailored for offline code-generation LLMs
-(Qwen2.5-Coder-0.5B-Instruct / Qwen2.5-14B-Instruct) answering Vietnamese
-tabular questions over CSV, XLSX, and SQLite files with Chain-of-Thought
-analysis and unanswerable schema fallback.
+(Qwen/Qwen3-14B) answering Vietnamese tabular questions over CSV, XLSX,
+and SQLite files with Chain-of-Thought analysis and unanswerable schema fallback.
 """
-
-from __future__ import annotations
 
 from __future__ import annotations
 

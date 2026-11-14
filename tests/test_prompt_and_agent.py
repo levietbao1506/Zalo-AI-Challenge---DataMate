@@ -5,7 +5,6 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from src.agent import (
-    DEFAULT_OLLAMA_URL,
     DEFAULT_TEMPERATURE,
     CodeAgent,
     VLLMAgent,
@@ -239,78 +238,6 @@ class TestVLLMAgent(unittest.TestCase):
                 "```python\nfinal_result = 3\n```",
             ],
         )
-
-    def test_ollama_backend_initialization(self):
-        """Verify CodeAgent detects 'ollama:' prefix, extracts model name, and disables vLLM fallback."""
-        agent = CodeAgent("ollama:llama3.2:1b")
-        self.assertEqual(agent.backend, "ollama")
-        self.assertEqual(agent.model_name, "llama3.2:1b")
-        self.assertFalse(agent.dry_run)
-        self.assertIsNone(agent.llm)
-
-        vllm_agent = CodeAgent("./models/Qwen2.5-Coder-0.5B-Instruct", dry_run=True)
-        self.assertEqual(vllm_agent.backend, "vllm")
-
-        with self.assertRaises(ValueError):
-            CodeAgent("ollama:")
-
-    def test_ollama_generate_code_posts_expected_payload(self):
-        """Verify Ollama backend sends expected POST JSON payload and returns response['response']."""
-        agent = CodeAgent("ollama:llama3.2:1b")
-        mock_response = MagicMock()
-        mock_response.json.return_value = {"response": "```python\nfinal_result = 42\n```"}
-
-        with patch("src.agent.requests.post", return_value=mock_response) as mock_post:
-            output = agent.generate_code("Tính tổng doanh thu")
-
-        self.assertEqual(output, "```python\nfinal_result = 42\n```")
-        mock_post.assert_called_once_with(
-            DEFAULT_OLLAMA_URL,
-            json={
-                "model": "llama3.2:1b",
-                "prompt": "Tính tổng doanh thu",
-                "stream": False,
-                "options": {"temperature": 0.0},
-            },
-            timeout=None,
-        )
-        mock_response.raise_for_status.assert_called_once()
-
-    def test_ollama_generate_code_with_system_prompt(self):
-        """Verify Ollama backend forwards optional system_prompt in payload."""
-        agent = CodeAgent("ollama:llama3.2:1b")
-        mock_response = MagicMock()
-        mock_response.json.return_value = {"response": "final_result = 1"}
-
-        with patch("src.agent.requests.post", return_value=mock_response) as mock_post:
-            output = agent.generate_code("Q?", system_prompt="SYS")
-
-        self.assertEqual(output, "final_result = 1")
-        mock_post.assert_called_once_with(
-            DEFAULT_OLLAMA_URL,
-            json={
-                "model": "llama3.2:1b",
-                "prompt": "Q?",
-                "stream": False,
-                "options": {"temperature": 0.0},
-                "system": "SYS",
-            },
-            timeout=None,
-        )
-
-    def test_ollama_generate_code_batch_sequential(self):
-        """Verify generate_code_batch calls generate_code sequentially for Ollama backend."""
-        agent = CodeAgent("ollama:llama3.2:1b")
-        self.assertEqual(agent.generate_code_batch([]), [])
-
-        with patch.object(agent, "generate_code", side_effect=["resp_0", "resp_1", "resp_2"]) as mock_gen:
-            results = agent.generate_code_batch(["prompt_0", "prompt_1", "prompt_2"])
-
-        self.assertEqual(results, ["resp_0", "resp_1", "resp_2"])
-        self.assertEqual(mock_gen.call_count, 3)
-        mock_gen.assert_any_call("prompt_0")
-        mock_gen.assert_any_call("prompt_1")
-        mock_gen.assert_any_call("prompt_2")
 
     def test_vllm_directory_initialization_flags(self):
         """Verify standard local directory defaults to vLLM with trust_remote_code=True and tensor_parallel_size=1."""

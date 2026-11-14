@@ -704,7 +704,9 @@ def format_submission_record(
     is_abstain = False
     if answer is None:
         is_abstain = True
-    elif isinstance(answer, str) and answer in (abstain_token, "abstain"):
+    elif isinstance(answer, str) and answer.strip().lower() in (abstain_token.lower(), "abstain"):
+        is_abstain = True
+    elif q_type == "abstain":
         is_abstain = True
 
     is_unans = False
@@ -714,8 +716,10 @@ def format_submission_record(
         is_unans = True
 
     if is_abstain:
-        q_type = "abstain"
-        answer = "abstain"
+        return {
+            "id": str(q_id),
+            "type": "abstain",
+        }
     elif is_unans:
         q_type = "unanswerable"
         answer = "unanswerable"
