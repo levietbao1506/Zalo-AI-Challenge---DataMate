@@ -27,8 +27,8 @@ WORKDIR /code
 
 # Install competition Python dependencies and pin nvidia-nccl-cu12
 COPY requirements.txt /code/requirements.txt
-RUN pip install --no-cache-dir -r /code/requirements.txt && \
-    pip install --no-cache-dir --no-deps nvidia-nccl-cu12==2.27.7
+RUN pip install --no-cache-dir --break-system-packages -r /code/requirements.txt && \
+    pip install --no-cache-dir --break-system-packages --no-deps nvidia-nccl-cu12==2.27.7
 
 # Copy models, training code, predict runner, documentation, and source code
 COPY models/ /code/models/
