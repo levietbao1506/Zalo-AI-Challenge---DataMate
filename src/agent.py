@@ -134,6 +134,7 @@ def load_vllm_engine(
         temperature=temperature,
         max_tokens=max_tokens,
         stop=DEFAULT_STOP_TOKENS,
+        seed=42,
     )
 
     logger.info("vLLM engine successfully loaded with temperature=0.0.")
