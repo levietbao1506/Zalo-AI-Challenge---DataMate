@@ -7,6 +7,7 @@ wheels/
 *.egg-info
 
 # Virtual environments
+.env
 .venv
 .python-version
 pyproject.toml
@@ -38,3 +39,4 @@ local_out/
 *.zip
 *.log
 __pycache__/
+result/
