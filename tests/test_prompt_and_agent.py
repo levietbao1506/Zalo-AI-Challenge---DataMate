@@ -1,5 +1,6 @@
 """Unit tests for Step 3: LLM Engine (vLLM Agent) and PromptBuilder."""
 
+import os
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
@@ -352,6 +353,32 @@ class TestVLLMAgent(unittest.TestCase):
         )
         self.assertEqual(res_err["type"], "abstain")
         self.assertEqual(res_err["answer"], "abstain")
+
+    def test_api_backend_initialization_and_generation(self):
+        """Verify API backend initializes properly when API_KEY is set and calls endpoint."""
+        with (
+            patch.dict(os.environ, {"API_KEY": "fake_key_123", "API_MODEL": "qwen/qwen3-14b", "BASE_URL": "https://api.example.com/v1"}),
+            patch("requests.post") as mock_post,
+        ):
+            mock_post.return_value.status_code = 200
+            mock_post.return_value.json.return_value = {
+                "choices": [{
+                    "message": {
+                        "content": "```python\nfinal_result = 42\n```",
+                        "reasoning_content": "Calculated 42",
+                    }
+                }]
+            }
+            agent = CodeAgent(backend="api")
+            self.assertEqual(agent.backend, "api")
+            self.assertFalse(agent.dry_run)
+            self.assertEqual(agent.model_name, "qwen/qwen3-14b")
+            self.assertEqual(agent.base_url, "https://api.example.com/v1")
+
+            code = agent.generate_code("Tính cái gì đó")
+            self.assertIn("final_result = 42", code)
+            self.assertEqual(agent.last_thinking, "Calculated 42")
+            mock_post.assert_called_once()
 
 
 if __name__ == "__main__":

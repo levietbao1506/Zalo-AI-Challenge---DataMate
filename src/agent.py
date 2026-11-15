@@ -6,14 +6,29 @@ Supports local offline vLLM inference with temperature=0.0 for deterministic, re
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import os
 from datetime import date
+import json
 import logging
 import math
 from pathlib import Path
 import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+try:
+    import requests
+    _HAS_REQUESTS = True
+except ImportError:
+    requests = None  # type: ignore[assignment]
+    _HAS_REQUESTS = False
 
 logger = logging.getLogger(__name__)
 
@@ -153,8 +168,9 @@ class CodeAgent:
         trust_remote_code: bool = True,
         dry_run: bool = False,
         abstain_threshold: float = DEFAULT_ABSTAIN_THRESHOLD,
+        backend: Optional[str] = None,
     ):
-        """Initialize vLLM engine, llama.cpp GGUF engine, or mock engine.
+        """Initialize vLLM engine, llama.cpp GGUF engine, API engine, or mock engine.
 
         Args:
             model_path: Path to vLLM directory or .gguf file (default: Qwen/Qwen3-14B).
@@ -165,6 +181,7 @@ class CodeAgent:
             trust_remote_code: Whether to pass ``trust_remote_code=True`` to vLLM (default: True).
             dry_run: If True, forces dry-run mock mode without calling a model backend.
             abstain_threshold: Confidence threshold below which answers are downgraded to abstain (default: 0.6).
+            backend: Optional backend override ('api', 'vllm', 'llama_cpp'). If None, automatically detected.
         """
         self.model_path = model_path
         self.temperature = temperature
@@ -180,12 +197,24 @@ class CodeAgent:
             tp_env = os.environ.get("TENSOR_PARALLEL_SIZE")
             if tp_env:
                 tensor_parallel_size = int(tp_env)
-            elif Path("/code").exists() or (isinstance(model_path, str) and model_path.startswith("/code")):
+            elif (isinstance(model_path, str) and model_path.startswith("/code")) or (sys.platform != "win32" and Path("/code").exists()):
                 tensor_parallel_size = 2
             else:
                 tensor_parallel_size = 1
 
-        if isinstance(model_path, str) and model_path.lower().endswith(".gguf"):
+        # Check for API key in environment / .env
+        env_api_key = os.getenv("API_KEY") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
+        explicit_local_path = isinstance(model_path, str) and (model_path.startswith(".") or model_path.startswith("/") or model_path.startswith("\\") or "\\" in model_path)
+        is_gguf = isinstance(model_path, str) and model_path.lower().endswith(".gguf")
+
+        if backend == "api" or (backend is None and env_api_key and not dry_run and not is_gguf and not explicit_local_path):
+            self.backend = "api"
+            self.api_key = env_api_key
+            self.model_name = os.getenv("API_MODEL") or (model_path if model_path and "/" in model_path and not model_path.startswith(".") else "qwen/qwen3-14b")
+            self.base_url = (os.getenv("BASE_URL") or "https://openrouter.ai/api/v1").rstrip("/")
+            self.dry_run = False
+            logger.info(f"Initializing CodeAgent with API backend (model: {self.model_name}, endpoint: {self.base_url})")
+        elif backend == "llama_cpp" or is_gguf:
             self.backend = "llama_cpp"
             self.model_name = model_path
             self.dry_run = False
@@ -263,6 +292,9 @@ class CodeAgent:
             mock_res = self._mock_generate_code(prompt)
             self.last_thinking = extract_thinking(mock_res)
             return mock_res
+
+        if self.backend == "api":
+            return self._call_api_chat(prompt, system_prompt=system_prompt)
 
         if self.backend == "llama_cpp":
             try:
@@ -344,6 +376,9 @@ class CodeAgent:
             self.last_batch_thinking = [extract_thinking(r) for r in results]
             return results
 
+        if self.backend == "api":
+            return self._call_api_batch(prompts, system_prompt=system_prompt)
+
         if self.backend == "llama_cpp":
             results = []
             thinkings = []
@@ -388,6 +423,82 @@ class CodeAgent:
             else:
                 results.append("")
                 thinkings.append(None)
+        self.last_batch_thinking = thinkings
+        return results
+
+    def _call_api_chat(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        """Call external LLM API (OpenRouter/OpenAI compatible) to generate code."""
+        if not _HAS_REQUESTS or requests is None:
+            raise RuntimeError("The 'requests' package is required for API backend.")
+
+        system_content = (
+            system_prompt
+            if system_prompt
+            else "You are a Python Data Analyst. Output ONLY valid executable pandas code inside a ```python block. Do not provide any explanations."
+        )
+
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": prompt},
+        ]
+
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        current_model = self.model_name
+        payload = {
+            "model": current_model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": 1024,
+        }
+
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=60)
+            if resp.status_code == 404 and ":free" in current_model:
+                fallback_model = current_model.replace(":free", "")
+                logger.warning(f"Model '{current_model}' returned 404 on API. Retrying with fallback: '{fallback_model}'")
+                payload["model"] = fallback_model
+                self.model_name = fallback_model
+                resp = requests.post(url, headers=headers, json=payload, timeout=60)
+
+            resp.raise_for_status()
+            data = resp.json()
+            choice = data["choices"][0]
+            msg = choice.get("message", {})
+            content = msg.get("content", "")
+            self.last_thinking = msg.get("reasoning_content") or extract_thinking(content)
+            return self.extract_python_code(content)
+        except Exception as e:
+            logger.error(f"API Generation Error ({current_model}): {e}")
+            self.last_thinking = None
+            return ""
+
+    def _call_api_batch(self, prompts: List[str], system_prompt: Optional[str] = None) -> List[str]:
+        """Call external LLM API concurrently for a batch of prompts."""
+        if not prompts:
+            self.last_batch_thinking = []
+            return []
+
+        results = ["" for _ in prompts]
+        thinkings: List[Optional[str]] = [None for _ in prompts]
+
+        def _worker(idx: int, p: str) -> Tuple[int, str, Optional[str]]:
+            code = self._call_api_chat(p, system_prompt=system_prompt)
+            th = self.last_thinking
+            return idx, code, th
+
+        max_workers = min(len(prompts), 4)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_worker, i, p) for i, p in enumerate(prompts)]
+            for fut in futures:
+                i, code, th = fut.result()
+                results[i] = code
+                thinkings[i] = th
+
         self.last_batch_thinking = thinkings
         return results
 

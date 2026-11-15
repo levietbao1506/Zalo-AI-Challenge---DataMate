@@ -21,6 +21,11 @@ import tempfile
 import time
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
+# Ensure project root is on sys.path for direct python script invocation
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 from src import calendar_utils, executor
 from src.agent import CodeAgent, VLLMAgent, extract_thinking, verification_gate
 from src.executor import EMPTY_RESULT_FEEDBACK, SandboxedExecutor

@@ -411,7 +411,7 @@ try:
     exec(compiled, exec_globals, exec_locals)
 
     extracted_result = None
-    for var_name in ("final_result", "result"):
+    for var_name in ("final_result", "result", "ans", "answer"):
         if var_name in exec_locals and exec_locals[var_name] is not None:
             extracted_result = exec_locals[var_name]
             break
@@ -537,7 +537,11 @@ def execute_local(
     def _run() -> tuple[bool, Any, str]:
         try:
             exec(code_str, namespace)
-            extracted = namespace["final_result"] if "final_result" in namespace else namespace.get("result")
+            extracted = None
+            for var_name in ("final_result", "result", "ans", "answer"):
+                if var_name in namespace and namespace[var_name] is not None:
+                    extracted = namespace[var_name]
+                    break
             return (True, extracted, "")
         except Exception as e:
             tb = traceback.format_exc()
