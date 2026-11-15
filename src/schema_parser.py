@@ -136,7 +136,7 @@ class DatasetContext:
     tables: List[TableSchema] = field(default_factory=list)
     file_map: Dict[str, str] = field(default_factory=dict)
 
-    def to_prompt_context(self, max_readme_chars: int = 1500) -> str:
+    def to_prompt_context(self, max_readme_chars: Optional[int] = None) -> str:
         """Render complete dataset context for inclusion in LLM prompt.
 
         Formats business context from README.md and head(5) sample rows with
@@ -155,7 +155,7 @@ class DatasetContext:
         # 2. Business Documentation (README.md)
         if self.readme_content:
             readme_snippet = self.readme_content.strip()
-            if len(readme_snippet) > max_readme_chars:
+            if max_readme_chars is not None and len(readme_snippet) > max_readme_chars:
                 readme_snippet = readme_snippet[:max_readme_chars] + "\n... [Cắt bớt để tránh tràn ngữ cảnh]"
             sections.append(f"**Nội dung tài liệu kinh doanh (README.md):**\n```markdown\n{readme_snippet}\n```")
         else:
@@ -172,7 +172,7 @@ class DatasetContext:
 
         return "\n\n".join(sections)
 
-    def to_schema_string(self, max_readme_chars: int = 1500) -> str:
+    def to_schema_string(self, max_readme_chars: Optional[int] = None) -> str:
         """Alias for to_prompt_context()."""
         return self.to_prompt_context(max_readme_chars=max_readme_chars)
 
@@ -220,7 +220,7 @@ def sample_unique_values(
 
     Args:
         df: Cleaned Pandas DataFrame.
-        top_n: Number of top frequent unique examples to extract (default: 3).
+        top_n: Number of top frequent unique examples to extract (default: 3, up to 5).
         max_val_len: Maximum character length per example value.
 
     Returns:
@@ -510,7 +510,7 @@ def parse_csv_head(
     """Read schema, top unique categorical examples, and head(5) rows of a CSV file.
 
     Applies whitespace stripping across all string/object columns prior to sampling
-    the top 3 most frequent non-null values and top sample records.
+    the top frequent non-null values (default: 3, up to 5) and top sample records.
 
     Args:
         file_path: Path to the .csv file.
@@ -639,7 +639,7 @@ def parse_excel_head(
         file_path: Path to .xlsx or .xls file.
         n_rows: Number of top rows to keep in sample_rows (default: 5).
         stats_rows: Maximum rows to read per sheet for frequency sampling (default: 5000).
-        top_n_examples: Top N frequent unique values per string/object column (default: 3).
+        top_n_examples: Top N frequent unique values per string/object column (default: 5).
 
     Returns:
         List of enriched TableSchema (one per sheet in workbook).
@@ -717,7 +717,7 @@ def parse_sqlite_head(
     Args:
         file_path: Path to .sqlite / .db / .sqlite3 file.
         n_rows: Number of top rows to read (default: 5).
-        top_n_examples: Top N frequent unique values per text column (default: 3).
+        top_n_examples: Top N frequent unique values per text column (default: 5).
 
     Returns:
         List of enriched TableSchema (one per user table in database).
@@ -837,7 +837,7 @@ def parse_table_head(
     Args:
         file_path: File path to parse.
         n_rows: Number of top rows to read (default: 5).
-        top_n_examples: Top N frequent unique values per string/object column (default: 3).
+        top_n_examples: Top N frequent unique values per string/object column (default: 5).
 
     Returns:
         List of TableSchema objects.
@@ -935,7 +935,7 @@ def _scan_directory_context(
 @lru_cache(maxsize=256)
 def get_business_schema(
     business_dir: str,
-    max_readme_chars: int = 1500,
+    max_readme_chars: Optional[int] = None,
     n_rows: int = 5,
 ) -> str:
     """Read tabular files and README inside ``business_dir`` and return a cached schema string.
@@ -945,7 +945,7 @@ def get_business_schema(
 
     Args:
         business_dir: Path to the directory containing README.md and CSV/XLSX/SQLite files.
-        max_readme_chars: Maximum characters of README to include in prompt (default: 1500).
+        max_readme_chars: Optional maximum characters of README to include (default: None for full README).
         n_rows: Number of sample rows to extract per table (default: 5).
 
     Returns:
@@ -959,7 +959,7 @@ def get_business_schema(
 def build_schema_string(
     business_id: Optional[str] = None,
     data_dir: Union[str, Path] = "./data",
-    max_readme_chars: int = 1500,
+    max_readme_chars: Optional[int] = None,
     n_rows: int = 5,
 ) -> str:
     """Extract README context and head(5) schema of all tables, returning clean prompt string.
@@ -969,7 +969,7 @@ def build_schema_string(
     Args:
         business_id: ID of the business (e.g. 'retail_01') or None.
         data_dir: Directory containing the business datasets.
-        max_readme_chars: Maximum characters of README to include in prompt.
+        max_readme_chars: Optional maximum characters of README to include (default: None for full README).
         n_rows: Number of sample rows to preview (default: 5).
 
     Returns:
@@ -1081,7 +1081,7 @@ class SchemaParser:
     def get_schema_string(
         self,
         business_id: Optional[str] = None,
-        max_readme_chars: int = 1500,
+        max_readme_chars: Optional[int] = None,
     ) -> str:
         """Extract and format schema string for prompt injection."""
         ctx = self.parse(business_id=business_id)

@@ -10,6 +10,9 @@
   "architecture": "Qwen3ForCausalLM",
   "context_length_native": 32768,
   "context_length_max": 131072,
+  "fine_tuning": false,
+  "external_api_calls": false,
+  "inference_mode": "Offline inference runs on the official open-weight checkpoint Qwen/Qwen3-14B without extra fine-tuning or external API calls",
   "safetensors_files": {
     "model-00001-of-00008.safetensors": {
       "size_bytes": 3841788544,

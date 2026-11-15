@@ -19,7 +19,7 @@ MÔI TRƯỜNG THỰC THI (SANDBOX ENVIRONMENT):
 2. Các thư viện đã được import sẵn trong global scope:
    - `pd` (pandas: công cụ phân tích và xử lý bảng tính chính)
    - `duckdb` (dùng để truy vấn SQL tốc độ cao trực tiếp trên file CSV, Parquet, hoặc SQLite)
-   - `sqlite3`
+   - `sqlite3`, `openpyxl` (xử lý cơ sở dữ liệu SQLite và bảng tính Excel nhiều sheet)
    - `datetime`, `date`, `timedelta`, `re`, `np`, `math`, `unicodedata`
    - `calendar_utils` (chứa các hàm: `resolve_as_of_date`, `resolve_vietnamese_relative_date`, `get_quarter_date_range`, `get_month_date_range`, `get_week_date_range`, `get_same_period_last_year`, `get_tet_window`, `get_tet_date`, `get_holiday_range`, `solar_to_lunar`, `lunar_to_solar`)
 3. Các biến đã có sẵn trong môi trường:
@@ -40,7 +40,7 @@ CRITICAL RULES (ERROR-PREVENTION & SYSTEM INTEGRITY):
    - Luôn xử lý dữ liệu khuyết/NaN một cách an toàn bằng `.fillna()`, `.dropna()`, hoặc kiểm tra `pd.isna()`.
    - Trước khi trích xuất giá trị phần tử (vd: `.iloc[0]`, `.values[0]`), BẮT BUỘC phải kiểm tra DataFrame/Series có rỗng hay không (`if df.empty:`). Nếu rỗng, gán `final_result = None` hoặc `"unanswerable"` để tránh IndexError/KeyError làm sập chương trình.
 4. ĐỊNH NGHĨA KIỂU DỮ LIỆU VÀ ĐỊNH DẠNG KẾT QUẢ (EXPECTED DATA TYPES & FORMAT):
-   - Kết quả cuối cùng BẮT BUỘC phải được gán vào biến `final_result`.
+   - Kết quả cuối cùng BẮT BUỘC phải được gán vào biến `final_result` (hoặc `FINAL_RESULT`).
    - Nếu kết quả là số nguyên / số lượng / đếm: gán kiểu `int` (vd: `final_result = int(...)`).
    - Nếu kết quả là số thực / doanh thu / tỷ lệ: làm tròn đúng 2 chữ số thập phân `round(float(...), 2)`.
    - Nếu kết quả là chuỗi / tên: chuẩn hóa Unicode NFC, loại bỏ khoảng trắng thừa bằng `.strip()`.
@@ -49,7 +49,7 @@ CRITICAL RULES (ERROR-PREVENTION & SYSTEM INTEGRITY):
 QUY TẮC CỐT LÕI (BẮT BUỘC TUÂN THỦ):
 1. SUY LUẬN TỪNG BƯỚC (CHAIN-OF-THOUGHT):
    - Trước khi viết code, bạn BẮT BUỘC phải viết 1-2 dòng comment bắt đầu bằng `# Phân tích: ` để giải thích ngắn gọn cách bạn sẽ lọc dữ liệu và tính toán.
-2. GÁN KẾT QUẢ CUỐI CÙNG VÀO BIẾN `final_result`:
+2. GÁN KẾT QUẢ CUỐI CÙNG VÀO BIẾN `final_result` HOẶC `FINAL_RESULT`:
    - Ví dụ: `final_result = 15000000.5` hoặc `final_result = 42` hoặc `final_result = "Hà Nội"`.
 3. XỬ LÝ TRƯỜNG HỢP KHÔNG THỂ TRẢ LỜI (UNANSWERABLE & PENALIZED ACCURACY):
    - Cuộc thi áp dụng Penalized Accuracy: Trả lời sai bị TRỪ ĐIỂM, không trả lời (Abstain/Unanswerable) được 0 điểm.
@@ -59,9 +59,12 @@ QUY TẮC CỐT LÕI (BẮT BUỘC TUÂN THỦ):
    - Nếu schema có cột liên quan nhưng bản ghi thực tế không tồn tại sau khi lọc (hoặc rỗng), hãy gán `final_result = None` (hoặc `"unanswerable"`).
 4. XỬ LÝ NGÀY THÁNG TIẾNG VIỆT & as_of_date:
    - Các từ chỉ thời gian tương đối như 'hôm nay', 'hôm qua', 'tuần trước', 'tuần rồi', 'tháng này', 'cùng kỳ năm ngoái', 'Tết', 'quý 2 năm ngoái', 'năm nay':
-     LUÔN DỰA VÀO `as_of_date`. Dùng `calendar_utils.resolve_vietnamese_relative_date("cụm từ", as_of=as_of_date)` để lấy khoảng thời gian `(start_date, end_date)`.
+     Ưu tiên sử dụng các mốc ngày đã được tính toán sẵn trong mục PRE-COMPUTED TIME INTERVALS bên dưới hoặc dùng `calendar_utils.resolve_vietnamese_relative_date("cụm từ", as_of=as_of_date)`.
 5. TUÂN THỦ QUY TẮC TỪ RULEBOOK ĐỘNG (RULEBOOK.MD):
-   - Mọi định nghĩa kinh doanh (doanh thu `revenue`, sản phẩm `bán chạy`, ranh giới tuần `week boundaries` thứ Hai hay Chủ Nhật, phương pháp chi phí/giá vốn `cost methods`) BẮT BUỘC phải tuân theo file `rulebook.md` của tập dữ liệu hiện tại nếu có. TUYỆT ĐỐI KHÔNG áp dụng quy tắc cứng hay giả định chủ quan khi rulebook đã định nghĩa khác.
+   - Mọi định nghĩa kinh doanh BẮT BUỘC phải tuân theo file `rulebook.md` của tập dữ liệu hiện tại:
+     * Doanh thu (`revenue` / `doanh số`): loại trừ các đơn hủy, hoàn trả, hoặc thất bại (`cancelled`, `returned`, `failed`, `đã hủy`, `hoàn trả`) trừ khi rulebook quy định khác.
+     * Chiết khấu và voucher: áp dụng đúng công thức giảm giá dòng sản phẩm và mã voucher nếu có trong dữ liệu và rulebook.
+     * Xếp hạng và hòa điểm (Ranking & Tie-breaking): sắp xếp giảm dần theo tiêu chí chính; nếu giá trị bằng nhau thì tie-break theo mã sản phẩm / đối tượng tăng dần (`ascending=True`).
 6. TRUY VẤN TỪ KHÓA TIẾNG VIỆT KHÔNG DẤU / KHÔNG PHÂN BIỆT HOA THƯỜNG:
    - Khi tìm kiếm tên riêng, chi nhánh, sản phẩm bằng tiếng Việt: chuẩn hóa về chữ thường và loại bỏ dấu (hoặc dùng regex) để so khớp linh hoạt, tránh bị lệch do cách gõ dấu (ví dụ: "ha noi" khớp "Hà Nội").
 7. ĐỊNH DẠNG SỐ VÀ CHUỖI:
@@ -293,6 +296,27 @@ class PromptBuilder:
         prompt_parts.append("### THÔNG TIN THAM CHIẾU (REFERENCE):")
         if as_of_date:
             prompt_parts.append(f"- Ngày tham chiếu (as_of_date): `{as_of_date}`")
+            try:
+                from src.calendar_utils import get_precomputed_intervals_summary
+            except ImportError:
+                try:
+                    from calendar_utils import get_precomputed_intervals_summary
+                except ImportError:
+                    get_precomputed_intervals_summary = None
+
+            if get_precomputed_intervals_summary is not None:
+                cal_path = None
+                if file_map:
+                    cal_path = file_map.get("calendar.csv") or file_map.get("calendar")
+                    if not cal_path:
+                        for k, v in file_map.items():
+                            if "calendar.csv" in k.lower():
+                                cal_path = v
+                                break
+                intervals_summary = get_precomputed_intervals_summary(as_of_date, calendar_path=cal_path)
+                if intervals_summary:
+                    prompt_parts.append("\n" + "=" * 50)
+                    prompt_parts.append(intervals_summary)
         else:
             prompt_parts.append("- Ngày tham chiếu (as_of_date): Chưa chỉ định (mặc định hôm nay)")
 
@@ -312,8 +336,9 @@ class PromptBuilder:
             "CRITICAL RULES (ERROR-PREVENTION - TUÂN THỦ TUYỆT ĐỐI ĐỂ TRÁNH CRASH HỆ THỐNG):\n"
             "- CHỈ sử dụng ĐÚNG tên bảng và tên cột có trong Schema, TUYỆT ĐỐI KHÔNG bịa đặt cột.\n"
             "- KIỂM TRA sự tồn tại của cột/bảng trước khi tính toán. Nếu dữ liệu kinh doanh thiếu thông tin cốt lõi (ví dụ: tính lợi nhuận nhưng không có cột giá vốn/chi phí), gán `final_result = \"unanswerable\"` kèm comment giải thích lý do bằng tiếng Việt.\n"
+            "- Tuân thủ rulebook: Doanh thu loại trừ các đơn hủy/trả (cancelled/returned). Xếp hạng nếu bằng nhau thì ưu tiên theo mã đối tượng/sản phẩm tăng dần (tie-break ascending).\n"
             "- Xử lý an toàn edge cases: dùng `.fillna()`, kiểm tra `if df.empty:` trước khi trích xuất giá trị để tránh KeyError/IndexError.\n"
-            "- BẮT BUỘC bắt đầu code bằng comment `# Phân tích: ...`, viết đoạn mã Python (dùng pandas) hợp lệ để tính toán và gán câu trả lời vào biến `final_result` (hoặc gán `final_result = \"unanswerable\"` nếu schema không có thông tin liên quan).\n"
+            "- BẮT BUỘC bắt đầu code bằng comment `# Phân tích: ...`, viết đoạn mã Python (dùng pandas, sqlite3, openpyxl) hợp lệ để tính toán và gán câu trả lời vào biến `final_result` hoặc `FINAL_RESULT` (hoặc gán `final_result = \"unanswerable\"` nếu schema không có thông tin liên quan).\n"
             "- TUYỆT ĐỐI KHÔNG viết lời giải thích hay văn bản hội thoại nào ngoài code block.\n"
             "Chỉ in ra code trong thẻ ```python ... ```, không giải thích."
         )
