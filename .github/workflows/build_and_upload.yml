@@ -19,16 +19,29 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Free runner disk space
-        uses: jlumbroso/free-disk-space@main
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
         with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
+          root-reserve-mb: 512
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          build-mount-path: '/home/runner/workspace/build'
+
+      - name: Safely relocate Docker (Preserve structures)
+        run: |
+          sudo systemctl stop docker docker.socket containerd || true
+          sudo mv /var/lib/docker /home/runner/workspace/build/docker
+          sudo mv /var/lib/containerd /home/runner/workspace/build/containerd
+          sudo ln -s /home/runner/workspace/build/docker /var/lib/docker
+          sudo ln -s /home/runner/workspace/build/containerd /var/lib/containerd
+          sudo mkdir -p /var/lib/docker/tmp
+          sudo chmod 1777 /var/lib/docker/tmp
+          sudo systemctl start containerd docker
+          df -h
 
       - name: Normalize team name
         id: norm_team
@@ -44,29 +57,20 @@ jobs:
 
       - name: Generate Dockerfile.ci
         run: |
-          python3 - << 'PY_EOF'
-          with open("Dockerfile", "r", encoding="utf-8") as f:
-              content = f.read()
-
-          download_snippet = (
-              "# Download model directly in layer to prevent host duplicate disk usage\n"
-              "RUN HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 python3 -c "
-              "\"from huggingface_hub import snapshot_download; "
-              "snapshot_download('Qwen/Qwen3-14B', local_dir='/code/models/Qwen3-14B', "
-              "local_dir_use_symlinks=False, max_workers=4)\" && \\\n"
-              "    rm -rf /code/models/Qwen3-14B/.cache /root/.cache /tmp/*"
-          )
-
-          old_target = "COPY models/ /code/models/"
-          if old_target in content:
-              content = content.replace(old_target, download_snippet)
-          else:
-              print(f"Warning: '{old_target}' not found in Dockerfile, using existing content.")
-
-          with open("Dockerfile.ci", "w", encoding="utf-8") as f:
-              f.write(content)
-          PY_EOF
-          echo "Generated Dockerfile.ci based on Dockerfile:"
+          cat << 'EOF' > Dockerfile.ci
+          FROM vllm/vllm-openai:v0.10.1.1
+          ENV PYTHONUNBUFFERED=1
+          RUN pip uninstall -y xformers || true
+          RUN pip install --root-user-action=ignore --no-cache-dir pandas sqlite3 openpyxl lunarcalendar hf_transfer || \
+              pip install --root-user-action=ignore --no-cache-dir pandas openpyxl lunarcalendar hf_transfer
+          RUN HF_HUB_ENABLE_HF_TRANSFER=1 HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-14B', local_dir='/code/models/Qwen3-14B', local_dir_use_symlinks=False)" \
+              && rm -rf /code/models/Qwen3-14B/.cache /root/.cache /tmp/*
+          COPY . /code
+          WORKDIR /code
+          RUN chmod +x /code/predict.sh || true
+          CMD ["bash", "/code/predict.sh"]
+          EOF
+          echo "Generated Dockerfile.ci based on template:"
           cat Dockerfile.ci
 
       - name: Build and inspect Docker submission image
