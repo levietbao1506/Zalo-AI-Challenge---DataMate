@@ -29,19 +29,14 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
           remove-docker-images: 'true'
-          build-mount-path: '/home/runner/workspace/build'
+          build-mount-path: '/var/lib/docker/'
 
-      - name: Safely relocate Docker (Preserve structures)
+      - name: Ensure Docker directories exist
         run: |
-          sudo systemctl stop docker docker.socket containerd || true
-          sudo mv /var/lib/docker /home/runner/workspace/build/docker
-          sudo mv /var/lib/containerd /home/runner/workspace/build/containerd
-          sudo ln -s /home/runner/workspace/build/docker /var/lib/docker
-          sudo ln -s /home/runner/workspace/build/containerd /var/lib/containerd
           sudo mkdir -p /var/lib/docker/tmp
           sudo chmod 1777 /var/lib/docker/tmp
-          sudo systemctl start containerd docker
-          df -h
+          sudo systemctl restart docker || true
+          df -h / /var/lib/docker || true
 
       - name: Normalize team name
         id: norm_team
@@ -58,11 +53,10 @@ jobs:
       - name: Generate Dockerfile.ci
         run: |
           cat << 'EOF' > Dockerfile.ci
-          FROM vllm/vllm-openai:v0.10.1.1
+          FROM python:3.12-slim
           ENV PYTHONUNBUFFERED=1
-          RUN pip uninstall -y xformers || true
-          RUN pip install --root-user-action=ignore --no-cache-dir pandas sqlite3 openpyxl lunarcalendar hf_transfer || \
-              pip install --root-user-action=ignore --no-cache-dir pandas openpyxl lunarcalendar hf_transfer
+          RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake && rm -rf /var/lib/apt/lists/*
+          RUN pip install --no-cache-dir pandas openpyxl lunarcalendar hf_transfer huggingface_hub llama-cpp-python
           RUN HF_HUB_ENABLE_HF_TRANSFER=1 HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-14B', local_dir='/code/models/Qwen3-14B', local_dir_use_symlinks=False)" \
               && rm -rf /code/models/Qwen3-14B/.cache /root/.cache /tmp/*
           COPY . /code
