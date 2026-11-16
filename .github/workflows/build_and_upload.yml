@@ -30,18 +30,6 @@ jobs:
           docker-images: true
           swap-storage: true
 
-      - name: Relocate Docker to /mnt safely
-        run: |
-          sudo systemctl stop docker docker.socket containerd || true
-          sudo mkdir -p /mnt/docker /mnt/containerd
-          sudo rm -rf /var/lib/docker /var/lib/containerd
-          sudo ln -s /mnt/docker /var/lib/docker
-          sudo ln -s /mnt/containerd /var/lib/containerd
-          sudo mkdir -p /var/lib/docker/tmp
-          sudo chmod 1777 /var/lib/docker/tmp
-          sudo systemctl start containerd docker
-          df -h / /mnt
-
       - name: Normalize team name
         id: norm_team
         run: |
@@ -64,7 +52,8 @@ jobs:
               "# Download model directly in layer to prevent host duplicate disk usage\n"
               "RUN HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 python3 -c "
               "\"from huggingface_hub import snapshot_download; "
-              "snapshot_download('Qwen/Qwen3-14B', local_dir='/code/models/Qwen3-14B')\" && \\\n"
+              "snapshot_download('Qwen/Qwen3-14B', local_dir='/code/models/Qwen3-14B', "
+              "local_dir_use_symlinks=False, max_workers=4)\" && \\\n"
               "    rm -rf /code/models/Qwen3-14B/.cache /root/.cache /tmp/*"
           )
 
