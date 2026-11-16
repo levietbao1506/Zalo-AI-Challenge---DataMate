@@ -20,18 +20,31 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Free runner disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Relocate Docker data-root to /mnt
         run: |
-          echo "=========================================================================="
-          echo " 🧹 INITIAL RUNNER DISK SPACE"
-          echo "=========================================================================="
-          df -h
-          echo "Cleaning up large unused pre-installed packages..."
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
-          docker system prune -af || true
-          echo "=========================================================================="
-          echo " 🚀 AVAILABLE DISK SPACE AFTER CLEANUP"
-          echo "=========================================================================="
-          df -h
+          if mountpoint -q /mnt; then
+            echo "Relocating Docker data-root to /mnt/docker..."
+            sudo systemctl stop docker docker.socket containerd || true
+            sudo mkdir -p /mnt/docker
+            sudo tee /etc/docker/daemon.json > /dev/null <<'EOF'
+          {
+            "data-root": "/mnt/docker"
+          }
+          EOF
+            sudo systemctl start docker
+          fi
+          df -h / /mnt || true
+          docker info | grep "Docker Root Dir"
 
       - name: Normalize team name
         id: norm_team
@@ -74,8 +87,8 @@ jobs:
       - name: Build and inspect Docker submission image
         run: |
           IMAGE_TAG="zaic2026_datamate_${TEAM_LOWER}:final"
-          echo "Building platform linux/amd64 Docker image: ${IMAGE_TAG}..."
-          docker build --platform linux/amd64 -f Dockerfile.ci -t "${IMAGE_TAG}" .
+          echo "Building Docker image with DOCKER_BUILDKIT=0: ${IMAGE_TAG}..."
+          DOCKER_BUILDKIT=0 docker build -f Dockerfile.ci -t "${IMAGE_TAG}" .
           echo "=========================================================================="
           echo " 📦 DOCKER IMAGE INSPECTION"
           echo "=========================================================================="
