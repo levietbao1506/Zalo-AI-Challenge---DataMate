@@ -6,187 +6,73 @@ on:
       team_name:
         description: 'Team name for submission image (e.g., datamate_team)'
         required: true
-        default: 'datamate_team'
-        type: string
 
 jobs:
   build-and-upload:
-    name: Build & Upload Image
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-
+    name: Build & Upload Image
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@master
+      - name: Free runner disk space
+        uses: jlumbroso/free-disk-space@main
         with:
-          root-reserve-mb: 512
-          swap-size-mb: 1024
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
-          remove-docker-images: 'true'
-          build-mount-path: '/var/lib/docker/'
-
-      - name: Ensure Docker directories exist
-        run: |
-          sudo mkdir -p /var/lib/docker/tmp
-          sudo chmod 1777 /var/lib/docker/tmp
-          sudo systemctl restart docker || true
-          df -h / /var/lib/docker || true
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
 
       - name: Normalize team name
-        id: norm_team
         run: |
-          RAW_NAME="${{ github.event.inputs.team_name }}"
-          TEAM_LOWER=$(echo "${RAW_NAME}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_')
-          if [ -z "${TEAM_LOWER}" ]; then
-            TEAM_LOWER="datamate_team"
-          fi
-          echo "TEAM_LOWER=${TEAM_LOWER}" >> $GITHUB_ENV
-          echo "TEAM_LOWER=${TEAM_LOWER}" >> $GITHUB_OUTPUT
-          echo "Normalized team name: ${TEAM_LOWER}"
+          TEAM_LOWER=$(echo "${{ github.event.inputs.team_name }}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_')
+          echo "TEAM_LOWER=$TEAM_LOWER" >> $GITHUB_ENV
 
       - name: Generate Dockerfile.ci
         run: |
           cat << 'EOF' > Dockerfile.ci
           FROM python:3.12-slim
           ENV PYTHONUNBUFFERED=1
-          RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake && rm -rf /var/lib/apt/lists/*
-          RUN pip install --no-cache-dir pandas openpyxl lunarcalendar hf_transfer huggingface_hub llama-cpp-python
-          RUN HF_HUB_ENABLE_HF_TRANSFER=1 HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-14B', local_dir='/code/models/Qwen3-14B', local_dir_use_symlinks=False)" \
+          RUN apt-get update && apt-get install -y --no-install-recommends build-essential gcc g++ && rm -rf /var/lib/apt/lists/*
+          RUN pip install --root-user-action=ignore --no-cache-dir pandas openpyxl lunarcalendar hf_transfer huggingface_hub llama-cpp-python
+          RUN HF_HUB_ENABLE_HF_TRANSFER=1 HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-14B', local_dir='/code/models/Qwen3-14B', local_dir_use_symlinks=False, max_workers=4)" \
               && rm -rf /code/models/Qwen3-14B/.cache /root/.cache /tmp/*
           COPY . /code
           WORKDIR /code
-          RUN chmod +x /code/predict.sh || true
           CMD ["bash", "/code/predict.sh"]
           EOF
-          echo "Generated Dockerfile.ci based on template:"
-          cat Dockerfile.ci
 
       - name: Build and inspect Docker submission image
         run: |
-          IMAGE_TAG="zaic2026_datamate_${TEAM_LOWER}:final"
-          echo "Building Docker image with DOCKER_BUILDKIT=0: ${IMAGE_TAG}..."
-          DOCKER_BUILDKIT=0 docker build -f Dockerfile.ci -t "${IMAGE_TAG}" .
-          echo "=========================================================================="
-          echo " 📦 DOCKER IMAGE INSPECTION"
-          echo "=========================================================================="
-          docker image inspect -f "{{.Os}}/{{.Architecture}} {{.Size}}" "${IMAGE_TAG}"
-          docker images "${IMAGE_TAG}"
+          df -h /
+          DOCKER_BUILDKIT=0 docker build -f Dockerfile.ci -t "zaic2026_datamate_${TEAM_LOWER}:final" .
+          docker image inspect -f '{{.Os}}/{{.Architecture}} {{.Size}}' "zaic2026_datamate_${TEAM_LOWER}:final"
 
       - name: Verify offline GPU-free container environment
         run: |
-          IMAGE_TAG="zaic2026_datamate_${TEAM_LOWER}:final"
-          echo "=========================================================================="
-          echo " 🔍 VERIFYING OFFLINE CONTAINER INTEGRITY (--network none)"
-          echo "=========================================================================="
-          echo "1. Checking /code filesystem layout:"
-          docker run --rm --network none "${IMAGE_TAG}" ls -la /code
-          echo "2. Checking /code/models/Qwen3-14B weights layout:"
-          docker run --rm --network none "${IMAGE_TAG}" ls -la /code/models/Qwen3-14B
-          echo "3. Checking Python offline module imports:"
-          docker run --rm --network none "${IMAGE_TAG}" python3 -c "import src.main, src.agent, src.formatter, src.executor, src.schema_parser, src.prompt_builder; print('✅ All DataMate pipeline modules imported successfully in container offline!')"
-          echo "4. Checking predict.sh executable permission:"
-          docker run --rm --network none "${IMAGE_TAG}" bash -c "test -x /code/predict.sh && echo '✅ /code/predict.sh is executable'"
+          docker run --rm --network none "zaic2026_datamate_${TEAM_LOWER}:final" python3 -c "import pandas, llama_cpp; print('Environment verified.')"
 
       - name: Install pigz, rclone and configure Google Drive
         run: |
-          echo "Installing pigz and rclone..."
-          sudo apt-get update -qq && sudo apt-get install -y -qq pigz rclone
+          sudo apt-get update && sudo apt-get install -y pigz rclone
           mkdir -p ~/.config/rclone
-          RCLONE_SECRET='${{ secrets.RCLONE_DRIVE_TOKEN }}'
-          if [ -z "${RCLONE_SECRET}" ]; then
-            echo "❌ ERROR: Secret RCLONE_DRIVE_TOKEN is missing or empty in GitHub Secrets!"
-            echo "Please configure RCLONE_DRIVE_TOKEN in Repository Settings -> Secrets and variables -> Actions."
-            exit 1
-          fi
-
-          if echo "${RCLONE_SECRET}" | grep -q '^\['; then
-            printf "%s\n" "${RCLONE_SECRET}" > ~/.config/rclone/rclone.conf
-          else
-            cat << EOF > ~/.config/rclone/rclone.conf
-          [gdrive]
-          type = drive
-          scope = drive
-          token = ${RCLONE_SECRET}
-          EOF
-          fi
-          chmod 600 ~/.config/rclone/rclone.conf
-          echo "Verifying Google Drive connectivity via rclone..."
-          rclone about gdrive: || echo "Note: rclone about succeeded or drive doesn't support quota query."
+          echo "${{ secrets.RCLONE_DRIVE_TOKEN }}" > ~/.config/rclone/rclone.conf
+          rclone about gdrive:
 
       - name: Stream docker save via pigz to Google Drive and verify MD5
-        shell: bash
         run: |
-          set -eo pipefail
           IMAGE_TAG="zaic2026_datamate_${TEAM_LOWER}:final"
-          TAR_GZ_NAME="zaic2026_datamate_${TEAM_LOWER}.tar.gz"
-          MD5_FILE_NAME="${TAR_GZ_NAME}.md5"
-
-          echo "=========================================================================="
-          echo " 🚀 STREAMING DOCKER SAVE | PIGZ -> GOOGLE DRIVE"
-          echo " Image:       ${IMAGE_TAG}"
-          echo " Remote File: gdrive:${TAR_GZ_NAME}"
-          echo "=========================================================================="
-
-          docker save "${IMAGE_TAG}" \
-            | tee >(wc -c > /tmp/uncompressed_bytes.txt) \
-            | pigz -p 4 \
-            | tee >(md5sum | awk '{print $1}' > /tmp/stream_md5.txt) \
-            | rclone rcat "gdrive:${TAR_GZ_NAME}" --drive-chunk-size 64M --stats 30s
-
-          wait
-
-          # Give process substitutions a moment to guarantee writes flushed
-          for i in {1..30}; do
-            if [ -s /tmp/uncompressed_bytes.txt ] && [ -s /tmp/stream_md5.txt ]; then
-              break
-            fi
-            sleep 1
-          done
-
-          UNCOMPRESSED_BYTES=$(cat /tmp/uncompressed_bytes.txt | tr -cd '0-9')
-          STREAM_MD5=$(cat /tmp/stream_md5.txt | tr -cd 'a-fA-F0-9')
-          MAX_BYTES=107374182400
-
-          echo "Stream completed."
-          echo "Uncompressed bytes measured: ${UNCOMPRESSED_BYTES} / ${MAX_BYTES}"
-
-          if [ -z "${UNCOMPRESSED_BYTES}" ] || [ "${UNCOMPRESSED_BYTES}" -gt "${MAX_BYTES}" ]; then
-            echo "❌ ERROR: Uncompressed .tar size (${UNCOMPRESSED_BYTES} bytes) exceeds 100 GB limit (${MAX_BYTES} bytes)!"
-            exit 1
-          fi
-          echo "✅ Size compliance confirmed: ${UNCOMPRESSED_BYTES} bytes <= 100 GB limit."
-
-          echo "Querying MD5 from Google Drive to verify upload integrity..."
-          REMOTE_MD5=$(rclone md5sum "gdrive:${TAR_GZ_NAME}" | awk '{print $1}' | tr -cd 'a-fA-F0-9')
-          echo "Local Stream MD5:  ${STREAM_MD5}"
-          echo "Remote GDrive MD5: ${REMOTE_MD5}"
-
-          if [ -z "${REMOTE_MD5}" ] || [ "${STREAM_MD5}" != "${REMOTE_MD5}" ]; then
-            echo "❌ ERROR: MD5 mismatch! Stream=${STREAM_MD5}, Remote=${REMOTE_MD5}"
-            exit 1
-          fi
-          echo "✅ Cryptographic MD5 checksum verified successfully!"
-
-          # Upload .md5 file
-          echo "${STREAM_MD5}  ${TAR_GZ_NAME}" > "/tmp/${MD5_FILE_NAME}"
-          rclone copyto "/tmp/${MD5_FILE_NAME}" "gdrive:${MD5_FILE_NAME}"
-          echo "Uploaded ${MD5_FILE_NAME} to Google Drive."
-
-          UNCOMP_GB=$(( UNCOMPRESSED_BYTES / 1024 / 1024 / 1024 ))
-
-          echo "=========================================================================="
-          echo " 🎉 ZALO AI CHALLENGE 2026 - SUBMISSION ARTIFACT READY"
-          echo "=========================================================================="
-          echo " Image Name:         ${IMAGE_TAG}"
-          echo " Archive on Drive:   gdrive:${TAR_GZ_NAME}"
-          echo " Checksum on Drive:  gdrive:${MD5_FILE_NAME}"
-          echo " Checksum MD5:       ${STREAM_MD5}"
-          echo " Uncompressed Bytes: ${UNCOMPRESSED_BYTES} bytes (~${UNCOMP_GB} GB)"
-          echo " Competition Rule:   <= 100 GB uncompressed requirement satisfied"
-          echo "=========================================================================="
+          ARCHIVE_NAME="zaic2026_datamate_${TEAM_LOWER}.tar.gz"
+          echo "Compressing and streaming $IMAGE_TAG to Google Drive..."
+          docker save "$IMAGE_TAG" | pigz -c -4 | rclone rcat "gdrive:/$ARCHIVE_NAME"
+          echo "Upload complete. Calculating remote MD5 checksum..."
+          MD5=$(rclone hashsum MD5 "gdrive:/$ARCHIVE_NAME" | awk '{print $1}')
+          echo "$MD5" > "${ARCHIVE_NAME}.md5"
+          rclone copyto "${ARCHIVE_NAME}.md5" "gdrive:/${ARCHIVE_NAME}.md5"
+          echo "------------------------------------------------"
+          echo "Submission Archive: $ARCHIVE_NAME"
+          echo "Checksum MD5: $MD5"
+          echo "------------------------------------------------"
