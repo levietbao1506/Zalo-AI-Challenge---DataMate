@@ -59,7 +59,10 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y pigz rclone
           mkdir -p ~/.config/rclone
-          echo "${{ secrets.RCLONE_DRIVE_TOKEN }}" > ~/.config/rclone/rclone.conf
+          echo "[gdrive]" > ~/.config/rclone/rclone.conf
+          echo "type = drive" >> ~/.config/rclone/rclone.conf
+          echo "scope = drive" >> ~/.config/rclone/rclone.conf
+          echo 'token = ${{ secrets.RCLONE_DRIVE_TOKEN }}' >> ~/.config/rclone/rclone.conf
           rclone about gdrive:
 
       - name: Stream docker save via pigz to Google Drive and verify MD5
