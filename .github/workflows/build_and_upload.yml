@@ -19,17 +19,28 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@master
+      - name: Free runner disk space
+        uses: jlumbroso/free-disk-space@main
         with:
-          root-reserve-mb: 512
-          swap-size-mb: 1024
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
-          remove-docker-images: 'true'
-          build-mount-path: '/var/lib/docker/'
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Relocate Docker to /mnt safely
+        run: |
+          sudo systemctl stop docker docker.socket containerd || true
+          sudo mkdir -p /mnt/docker /mnt/containerd
+          sudo rm -rf /var/lib/docker /var/lib/containerd
+          sudo ln -s /mnt/docker /var/lib/docker
+          sudo ln -s /mnt/containerd /var/lib/containerd
+          sudo mkdir -p /var/lib/docker/tmp
+          sudo chmod 1777 /var/lib/docker/tmp
+          sudo systemctl start containerd docker
+          df -h / /mnt
 
       - name: Normalize team name
         id: norm_team
@@ -54,7 +65,7 @@ jobs:
               "RUN HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 python3 -c "
               "\"from huggingface_hub import snapshot_download; "
               "snapshot_download('Qwen/Qwen3-14B', local_dir='/code/models/Qwen3-14B')\" && \\\n"
-              "    rm -rf /code/models/Qwen3-14B/.cache /root/.cache/huggingface"
+              "    rm -rf /code/models/Qwen3-14B/.cache /root/.cache /tmp/*"
           )
 
           old_target = "COPY models/ /code/models/"
