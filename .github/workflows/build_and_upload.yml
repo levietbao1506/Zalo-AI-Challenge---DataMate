@@ -30,21 +30,26 @@ jobs:
           docker-images: true
           swap-storage: true
 
-      - name: Relocate Docker data-root to /mnt
+      - name: Relocate Docker and containerd to /mnt
         run: |
           if mountpoint -q /mnt; then
-            echo "Relocating Docker data-root to /mnt/docker..."
             sudo systemctl stop docker docker.socket containerd || true
-            sudo mkdir -p /mnt/docker
+            sudo mkdir -p /mnt/docker /mnt/containerd
+            sudo rm -rf /var/lib/containerd
+            sudo ln -s /mnt/containerd /var/lib/containerd
             sudo tee /etc/docker/daemon.json > /dev/null <<'EOF'
           {
-            "data-root": "/mnt/docker"
+            "data-root": "/mnt/docker",
+            "features": {
+              "containerd-snapshotter": false
+            }
           }
           EOF
+            sudo systemctl start containerd
             sudo systemctl start docker
           fi
           df -h / /mnt || true
-          docker info | grep "Docker Root Dir"
+          docker info | grep -E "Docker Root Dir|Storage Driver"
 
       - name: Normalize team name
         id: norm_team
