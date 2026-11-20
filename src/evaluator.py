@@ -12,26 +12,15 @@ Compares generated submission.jsonl against ground-truth answers per official ru
 from __future__ import annotations
 
 import argparse
-from datetime import date, datetime
+from datetime import date
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 import json
 import logging
-import math
 from pathlib import Path
 import re
-import time
-from typing import Any, Dict, List, Optional, Tuple, Union
-import unicodedata
+from typing import Any, Dict, List, Optional, Union
 
-from src.formatter import (
-    clean_string,
-    format_boolean,
-    format_date,
-    format_number,
-    format_percent,
-    format_table,
-    normalize_for_comparison,
-    normalize_unicode_nfc,
-)
+from src.formatter import normalize_for_comparison
 
 logger = logging.getLogger(__name__)
 
@@ -54,94 +43,110 @@ def is_answer_match(
     float_tol: float = 0.01,
     q_type: Optional[str] = None,
 ) -> bool:
-    """Compare predicted answer with ground truth candidate answer.
+    """Match a value using the official rule for its declared answer type.
 
-    Handles:
-    - Abstain: matches 'abstain' or None.
-    - Unanswerable: matches 'unanswerable'.
-    - Booleans: exact match.
-    - Floats & Ints: absolute difference <= float_tol.
-    - Dates: ISO date comparison ('YYYY-MM-DD' or 'YYYY-MM').
-    - Strings: NFC normalized and clean_string comparison.
-    - Lists / Tuples: element-wise match.
-    - Tables: column names and cell matching.
+    ``float_tol`` remains in the public signature for compatibility; PA uses
+    exact values after two-decimal rounding, never a numeric tolerance.
     """
-    # 1. Abstain check
-    pred_is_abstain = pred in ("abstain", None, "null", "")
-    exp_is_abstain = expected in ("abstain", None, "null", "")
-    if exp_is_abstain:
-        return pred_is_abstain
-    if pred_is_abstain:
+    if q_type is None:
+        q_type = _infer_type_from_value(expected)
+    if q_type == "abstain":
+        return _is_abstain_value(pred)
+    if _is_abstain_value(pred):
         return False
-
-    # 2. Unanswerable check
-    pred_is_unans = isinstance(pred, str) and pred.strip().lower() == "unanswerable"
-    exp_is_unans = isinstance(expected, str) and expected.strip().lower() == "unanswerable"
-    if exp_is_unans:
-        return pred_is_unans
-    if pred_is_unans:
-        return False
-
-    # 3. Boolean check (must precede numeric check)
-    if isinstance(expected, bool) or isinstance(pred, bool):
+    if q_type == "unanswerable":
+        return isinstance(pred, str) and pred.strip().lower() == "unanswerable"
+    if q_type in ("number", "percent"):
         try:
-            b_pred = format_boolean(pred)
-            b_exp = format_boolean(expected)
-            return b_pred is b_exp
-        except Exception:
-            return bool(pred) is bool(expected)
-
-    # 4. Numeric check (float / int / percent)
-    try:
-        p_num = float(pred)
-        e_num = float(expected)
-        if not (math.isnan(p_num) or math.isnan(e_num) or math.isinf(p_num) or math.isinf(e_num)):
-            return abs(p_num - e_num) <= float_tol
-    except (ValueError, TypeError):
-        pass
-
-    # 5. Date check
-    if q_type == "date" or isinstance(expected, (date, datetime)) or isinstance(pred, (date, datetime)):
-        try:
-            d_p = format_date(pred)
-            d_e = format_date(expected)
-            return d_p == d_e
-        except Exception:
-            pass
-
-    # 6. List / Tuple check
-    if isinstance(expected, (list, tuple)) and isinstance(pred, (list, tuple)):
-        if len(pred) != len(expected):
+            p_num = _rounded_number(pred, q_type)
+            e_num = _rounded_number(expected, q_type)
+            return p_num == e_num and (q_type != "percent" or p_num != 0 or p_num.is_signed() == e_num.is_signed())
+        except (ValueError, InvalidOperation):
             return False
-        return all(is_answer_match(p, e, float_tol=float_tol) for p, e in zip(pred, expected))
+    if q_type == "boolean":
+        return _boolean_value(pred) is not None and _boolean_value(pred) == _boolean_value(expected)
+    if q_type == "date":
+        return _date_value(pred) is not None and _date_value(pred) == _date_value(expected)
+    if q_type == "list":
+        return (isinstance(pred, (list, tuple)) and isinstance(expected, (list, tuple))
+                and len(pred) == len(expected)
+                and all(is_answer_match(p, e) for p, e in zip(pred, expected)))
+    if q_type == "table":
+        return _table_match(pred, expected)
+    return normalize_for_comparison(pred) == normalize_for_comparison(expected)
 
-    # 7. Table check
-    if isinstance(expected, dict) and isinstance(pred, dict):
-        if "columns" in expected and "rows" in expected and "columns" in pred and "rows" in pred:
-            p_cols = [clean_string(str(c)) for c in pred["columns"]]
-            e_cols = [clean_string(str(c)) for c in expected["columns"]]
-            if p_cols != e_cols:
-                return False
-            p_rows = pred["rows"]
-            e_rows = expected["rows"]
-            if len(p_rows) != len(e_rows):
-                return False
-            for rp, re_row in zip(p_rows, e_rows):
-                if len(rp) != len(re_row):
-                    return False
-                if not all(is_answer_match(cp, ce, float_tol=float_tol) for cp, ce in zip(rp, re_row)):
-                    return False
-            return True
 
-    # 8. String comparison (fallback)
-    p_str = clean_string(str(pred))
-    e_str = clean_string(str(expected))
-    return p_str == e_str
+def _is_abstain_value(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and value.strip().lower() == "abstain")
+
+
+def _rounded_number(value: Any, q_type: str) -> Decimal:
+    if isinstance(value, bool) or value is None:
+        raise ValueError("not a numeric answer")
+    raw = str(value).strip()
+    if q_type == "percent" and raw.endswith("%"):
+        raw = raw[:-1].strip()
+    number = Decimal(raw)
+    if not number.is_finite():
+        raise ValueError("non-finite answer")
+    return number.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+
+
+def _boolean_value(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    return None
+
+
+def _date_value(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}(?:-\d{2})?", value):
+        return None
+    try:
+        if len(value) == 7:
+            date.fromisoformat(value + "-01")
+        else:
+            date.fromisoformat(value)
+    except ValueError:
+        return None
+    return value
+
+
+def _table_match(pred: Any, expected: Any) -> bool:
+    if not (isinstance(pred, dict) and isinstance(expected, dict)):
+        return False
+    p_cols, e_cols = pred.get("columns"), expected.get("columns")
+    p_rows, e_rows = pred.get("rows"), expected.get("rows")
+    if not all(isinstance(v, (list, tuple)) for v in (p_cols, e_cols, p_rows, e_rows)):
+        return False
+    if len(p_cols) != len(e_cols) or len(p_rows) != len(e_rows):
+        return False
+    p_names = [normalize_for_comparison(c) for c in p_cols]
+    e_names = [normalize_for_comparison(c) for c in e_cols]
+    if p_names == e_names:
+        order = list(range(len(e_cols)))
+    elif len(set(p_names)) == len(p_names) and set(p_names) == set(e_names):
+        order = [p_names.index(name) for name in e_names]
+    else:
+        order = list(range(len(e_cols)))  # Official positional fallback.
+    unused = list(p_rows)
+    for e_row in e_rows:
+        if not isinstance(e_row, (list, tuple)) or len(e_row) != len(e_cols):
+            return False
+        match_index = next((i for i, p_row in enumerate(unused)
+                            if isinstance(p_row, (list, tuple)) and len(p_row) == len(p_cols)
+                            and all(is_answer_match(p_row[order[j]], e_cell)
+                                    for j, e_cell in enumerate(e_row))), None)
+        if match_index is None:
+            return False
+        unused.pop(match_index)
+    return True
 
 
 def _infer_type_from_value(val: Any) -> str:
     """Infer answer type from Python value when type field is omitted."""
-    if val in ("abstain", None):
+    if _is_abstain_value(val):
         return "abstain"
     if isinstance(val, str) and val.strip().lower() == "unanswerable":
         return "unanswerable"
@@ -156,29 +161,40 @@ def _infer_type_from_value(val: Any) -> str:
     return "string"
 
 
+def _has_execution_error(sub_item: Optional[Dict[str, Any]]) -> bool:
+    """Only classify execution failures when the submitted record supplies evidence."""
+    if not sub_item:
+        return False
+    if sub_item.get("execution_success") is False or sub_item.get("code_execution_error"):
+        return True
+    return bool(sub_item.get("error") or sub_item.get("execution_error"))
+
+
 def evaluate_submission(
     submission_file: Union[str, Path],
     ground_truth_file: Union[str, Path],
     penalty_weight: float = 1.0,
     total_duration_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Evaluate submission.jsonl against ground_truth.jsonl using exact Penalized Accuracy (PA).
+    """Evaluate submission.jsonl against ground_truth.jsonl using Penalized Accuracy.
 
     PA = (1 / N) * sum(s_i)
     where:
       * s_i = +1.0: if type matches AND value matches reference (including any alias after normalization).
       * s_i =  0.0: if type == 'abstain' or question is missing from submission.
-      * s_i = -penalty_weight: otherwise (including any non-unanswerable answer given to an unanswerable question).
+      * s_i = -1.0: otherwise (including a concrete answer to an unanswerable question).
 
     Args:
         submission_file: Path to generated submission.jsonl.
         ground_truth_file: Path to ground truth questions.jsonl.
-        penalty_weight: Penalty deducted for an incorrect answer (default: 1.0).
+        penalty_weight: Deprecated compatibility argument; only 1.0 is valid.
         total_duration_seconds: Optional measured elapsed time of inference.
 
     Returns:
         Evaluation metrics summary dictionary including type_breakdown.
     """
+    if penalty_weight != 1.0:
+        raise ValueError("Penalized Accuracy requires penalty_weight=1.0")
     sub_path = Path(submission_file).resolve()
     gt_path = Path(ground_truth_file).resolve()
 
@@ -216,6 +232,12 @@ def evaluate_submission(
 
     detailed_results = []
     type_stats: Dict[str, Dict[str, int]] = {}
+    error_names = (
+        "wrong_type", "false_answer_on_unanswerable", "missed_unanswerable",
+        "scale_or_rounding_error", "wrong_date_or_filter", "code_execution_error",
+        "abstain_rate",
+    )
+    error_counts = {name: 0 for name in error_names}
 
     for q_id, gt_item in gt_map.items():
         exp_type = gt_item.get("type")
@@ -228,7 +250,7 @@ def evaluate_submission(
         if expected_ans is not None:
             candidates.append(expected_ans)
 
-        for a_key in ("alias", "aliases"):
+        for a_key in ("alias", "aliases") if exp_type == "string" else ():
             raw_alias = gt_item.get(a_key)
             if raw_alias is not None:
                 if isinstance(raw_alias, (list, tuple, set)):
@@ -245,27 +267,21 @@ def evaluate_submission(
         else:
             predicted_type = sub_item.get("type")
             predicted_ans = sub_item.get("answer")
-            if predicted_type is None:
-                predicted_type = _infer_type_from_value(predicted_ans)
+            # Submission records must declare one of the nine answer types.
 
-        is_abstain = (predicted_type == "abstain" or predicted_ans in ("abstain", None, "null", ""))
+        is_abstain = predicted_type == "abstain" or _is_abstain_value(predicted_ans)
 
         # Check candidate value match
         value_matched = False
         for cand in candidates:
-            if is_answer_match(predicted_ans, cand, float_tol=0.01, q_type=exp_type):
+            if is_answer_match(predicted_ans, cand, q_type=exp_type):
                 value_matched = True
                 break
 
         # Check type match
         type_matched = True
         if exp_type is not None:
-            if exp_type == "unanswerable":
-                type_matched = (predicted_type == "unanswerable" or str(predicted_ans).strip().lower() == "unanswerable")
-            elif exp_type == "abstain":
-                type_matched = is_abstain
-            else:
-                type_matched = (predicted_type == exp_type)
+            type_matched = predicted_type == exp_type
 
         # Determine scoring s_i
         if is_abstain:
@@ -275,13 +291,13 @@ def evaluate_submission(
         elif exp_type == "unanswerable":
             # If the question was unanswerable:
             # Must predict unanswerable to score +1. Any non-unanswerable answer scores -1.
-            if type_matched and (predicted_type == "unanswerable" or str(predicted_ans).strip().lower() == "unanswerable"):
+            if type_matched and value_matched:
                 status = "CORRECT"
                 score = 1.0
                 correct_count += 1
             else:
                 status = "WRONG"
-                score = -penalty_weight
+                score = -1.0
                 wrong_count += 1
         elif type_matched and value_matched:
             status = "CORRECT"
@@ -289,8 +305,30 @@ def evaluate_submission(
             correct_count += 1
         else:
             status = "WRONG"
-            score = -penalty_weight
+            score = -1.0
             wrong_count += 1
+
+        error_category = None
+        if status == "ABSTAIN":
+            error_counts["abstain_rate"] += 1
+            if _has_execution_error(sub_item):
+                error_category = "code_execution_error"
+                error_counts[error_category] += 1
+        elif status == "WRONG":
+            if exp_type == "unanswerable":
+                error_category = "false_answer_on_unanswerable"
+            elif predicted_type == "unanswerable":
+                error_category = "missed_unanswerable"
+            elif predicted_type != exp_type and exp_type is not None:
+                error_category = "wrong_type"
+            elif _has_execution_error(sub_item):
+                error_category = "code_execution_error"
+            elif exp_type in ("number", "percent"):
+                error_category = "scale_or_rounding_error"
+            elif exp_type == "date":
+                error_category = "wrong_date_or_filter"
+            if error_category:
+                error_counts[error_category] += 1
 
         # Track type-level breakdown stats
         breakdown_key = exp_type or "unknown"
@@ -313,10 +351,11 @@ def evaluate_submission(
             "predicted": predicted_ans,
             "status": status,
             "score": score,
+            "error_category": error_category,
         })
 
     # Overall metric calculations
-    penalized_score = (correct_count * 1.0) - (wrong_count * penalty_weight)
+    penalized_score = float(correct_count - wrong_count)
     raw_accuracy = (correct_count / total_questions) if total_questions > 0 else 0.0
     penalized_accuracy = (penalized_score / total_questions) if total_questions > 0 else 0.0
 
@@ -339,7 +378,7 @@ def evaluate_submission(
         t_corr = stats["correct"]
         t_abs = stats["abstained"]
         t_wrg = stats["wrong"]
-        t_net = (t_corr * 1.0) - (t_wrg * penalty_weight)
+        t_net = float(t_corr - t_wrg)
         t_pa = (t_net / t_tot) if t_tot > 0 else 0.0
         type_breakdown[t] = {
             "total": t_tot,
@@ -361,6 +400,10 @@ def evaluate_submission(
         "total_duration_seconds": round(total_duration_seconds, 2) if total_duration_seconds else None,
         "average_latency_seconds": round(avg_latency, 3),
         "type_breakdown": type_breakdown,
+        "error_breakdown": {
+            name: {"count": count, "rate": round(count / total_questions, 4) if total_questions else 0.0}
+            for name, count in error_counts.items()
+        },
         "details": detailed_results,
     }
 
@@ -406,6 +449,9 @@ def print_evaluation_report(summary: Dict[str, Any]) -> None:
         f"{summary['wrong']:>9} {tot_net_str:>11} {tot_pa_pct:>10}"
     )
     print("=" * 80 + "\n")
+    print("ERROR BREAKDOWN (rate = count / total questions)")
+    for name, stats in summary.get("error_breakdown", {}).items():
+        print(f" {name:<34} {stats['count']:>6} {stats['rate'] * 100:>7.2f}%")
 
 
 def main() -> None:

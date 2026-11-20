@@ -38,6 +38,8 @@ class TestDockerAndOffline(unittest.TestCase):
         self.assertIn("TRANSFORMERS_OFFLINE=1", content, "Must declare TRANSFORMERS_OFFLINE=1")
         self.assertIn("PIP_NO_CACHE_DIR=1", content, "Must declare PIP_NO_CACHE_DIR=1")
         self.assertIn("NCCL_P2P_DISABLE=1", content, "Must declare NCCL_P2P_DISABLE=1")
+        self.assertIn("VLLM_MAX_NUM_SEQS=8", content)
+        self.assertIn("PYTHONHASHSEED=42", content)
         self.assertIn("PYTHONUNBUFFERED=1", content)
 
         # 4. Workdir /code and required directory copies
@@ -161,6 +163,10 @@ class TestDockerAndOffline(unittest.TestCase):
         self.assertIn("--limit", content)
         self.assertIn("export HF_HUB_OFFLINE=1", content)
         self.assertIn("export TRANSFORMERS_OFFLINE=1", content)
+        self.assertIn("export NCCL_P2P_DISABLE=1", content)
+        self.assertIn("export TMPDIR=/tmp", content)
+        self.assertIn("export VLLM_SEED=42", content)
+        self.assertIn("--soft_timeout", content)
 
         # Check that run_inference.sh delegates to predict.sh
         runner_content = self.runner_path.read_text(encoding="utf-8")

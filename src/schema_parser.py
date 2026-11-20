@@ -16,6 +16,7 @@ import math
 from pathlib import Path
 import re
 import sqlite3
+import unicodedata
 from typing import Any, Dict, List, Optional, Union
 
 try:
@@ -45,6 +46,13 @@ class TableSchema:
     low_cardinality_values: Dict[str, List[Any]] = field(default_factory=dict)
     sample_rows: List[Dict[str, Any]] = field(default_factory=list)
     total_rows: Optional[int] = None
+    null_rates: Dict[str, float] = field(default_factory=dict)
+    raw_date_samples: Dict[str, List[str]] = field(default_factory=dict)
+    raw_numeric_samples: Dict[str, List[str]] = field(default_factory=dict)
+    category_frequencies: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    primary_keys: List[str] = field(default_factory=list)
+    foreign_keys: List[str] = field(default_factory=list)
+    header_row: Optional[int] = None
     sheet_name: Optional[str] = None
     extra_notes: Optional[str] = None
 
@@ -60,16 +68,31 @@ class TableSchema:
             - revenue (float64)
         """
         lines = [f"Table: {self.name}"]
+        if self.total_rows is not None:
+            lines[0] += f" | rows={self.total_rows}"
+        if self.header_row is not None:
+            lines.append(f"Header row: {self.header_row}")
+        if self.primary_keys:
+            lines.append(f"Primary key: {', '.join(self.primary_keys)}")
+        if self.foreign_keys:
+            lines.append(f"Foreign keys: {'; '.join(self.foreign_keys)}")
         for col in self.columns:
             dtype_str = self.raw_column_types.get(col) or self.column_types.get(col, "object")
             parts = [f"- {col} ({dtype_str})"]
             if col in self.date_ranges:
                 parts.append(f"[Date range: {self.date_ranges[col]}]")
+                parts.append(f"[Raw dates: {self.raw_date_samples.get(col, [])}]")
+            if col in self.null_rates:
+                parts.append(f"[Null/empty: {self.null_rates[col]:.1%}]")
+            if col in self.category_frequencies:
+                parts.append(f"[Values/counts: {self.category_frequencies[col]}]")
+            if col in self.raw_numeric_samples:
+                parts.append(f"[Raw numbers: {self.raw_numeric_samples[col]}]")
             examples = self.column_examples.get(col)
             if examples:
                 formatted_vals = ", ".join(repr(str(v)) for v in examples)
                 parts.append(f"[Examples: {formatted_vals}]")
-            elif col in self.low_cardinality_values and self.low_cardinality_values[col]:
+            elif col in self.low_cardinality_values and self.low_cardinality_values[col] and col not in self.category_frequencies:
                 formatted_vals = ", ".join(repr(str(v)) for v in self.low_cardinality_values[col])
                 parts.append(f"[Examples: {formatted_vals}]")
             lines.append(" ".join(parts))
@@ -170,7 +193,8 @@ class DatasetContext:
                 sections.append(table.to_markdown())
                 sections.append("-" * 40)
 
-        return "\n\n".join(sections)
+        rendered = "\n\n".join(sections)
+        return rendered[:max_schema_chars] + ("\n[Schema truncated at context budget]" if len(rendered) > max_schema_chars else "")
 
     def to_schema_string(self, max_readme_chars: Optional[int] = None) -> str:
         """Alias for to_prompt_context()."""
@@ -278,13 +302,18 @@ def extract_date_ranges(df: "pd.DataFrame") -> Dict[str, str]:
         if pd.api.types.is_datetime64_any_dtype(df[col]):
             is_date = True
             parsed_dates = series
-        elif re.search(r"(date|time|ngay|created|updated|thoi_gian)", col_lower):
+        elif re.search(r"(date|time|ngay|created|updated|thoi_gian|ngày)", col_lower):
             try:
                 sample_s = series.head(100)
-                converted = pd.to_datetime(sample_s, errors="coerce")
+                raw_sample = sample_s.astype(str)
+                day_first = bool(raw_sample.str.match(r"^\d{1,2}/\d{1,2}/\d{4}").mean() > 0.5)
+                numeric_serial = pd.api.types.is_numeric_dtype(series) and series.between(20000, 80000).mean() > 0.5
+                converted = (pd.to_datetime(sample_s, unit="D", origin="1899-12-30", errors="coerce")
+                             if numeric_serial else pd.to_datetime(sample_s, errors="coerce", dayfirst=day_first))
                 if converted.notna().sum() >= max(1, int(len(sample_s) * 0.5)):
                     is_date = True
-                    parsed_dates = pd.to_datetime(series, errors="coerce").dropna()
+                    parsed_dates = (pd.to_datetime(series, unit="D", origin="1899-12-30", errors="coerce")
+                                    if numeric_serial else pd.to_datetime(series, errors="coerce", dayfirst=day_first)).dropna()
             except Exception:
                 pass
 
@@ -421,6 +450,63 @@ def clean_sample_records(df: "pd.DataFrame", n_rows: int = 5) -> List[Dict[str, 
     return cleaned_records
 
 
+def _profile_dataframe(df: "pd.DataFrame", schema: TableSchema, n_rows: int, top_n: int = 3) -> TableSchema:
+    """Profile every row while keeping only small examples in the prompt."""
+    df = strip_dataframe_whitespace(df)
+    df.columns = [str(c).strip() for c in df.columns]
+    schema.columns = list(df.columns)
+    schema.total_rows = len(df)
+    schema.column_types = extract_columns_and_types(df)
+    schema.raw_column_types = {str(c): str(t) for c, t in df.dtypes.items()}
+    schema.sample_rows = clean_sample_records(df, n_rows)
+    schema.column_examples = sample_unique_values(df, top_n)
+    schema.date_ranges = extract_date_ranges(df)
+    for col in schema.columns:
+        series = df[col]
+        blank = series.isna()
+        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+            blank = blank | series.map(lambda v: isinstance(v, str) and not v.strip())
+        schema.null_rates[col] = float(blank.mean()) if len(df) else 0.0
+        clean = series[~blank]
+        if clean.empty:
+            continue
+        raw = clean.astype(str).str.strip()
+        key = unicodedata.normalize("NFD", col.lower())
+        key = "".join(ch for ch in key if not unicodedata.combining(ch))
+        is_category = bool(re.search(r"status|state|trang.?thai|loai|type|category|chi.?nhanh|branch|kenh|channel|thanh.?toan|payment|return|tra.?hang", key))
+        if col in schema.date_ranges:
+            schema.raw_date_samples[col] = raw.drop_duplicates().head(3).tolist()
+        if is_category or pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+            counts = raw.value_counts(dropna=True)
+            if len(counts) <= 30:
+                schema.category_frequencies[col] = {str(v): int(n) for v, n in counts.items()}
+                schema.low_cardinality_values[col] = list(schema.category_frequencies[col])
+        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+            if re.search(r"amount|price|cost|revenue|total|money|gia|tien|doanh.?thu|so.?tien", key):
+                schema.raw_numeric_samples[col] = raw.drop_duplicates().head(3).tolist()
+    return schema
+
+
+def _detect_excel_header(excel_file: Any, sheet_name: str) -> int:
+    """Choose a header in the first five rows using cell coverage and label quality."""
+    preview = pd.read_excel(excel_file, sheet_name=sheet_name, header=None, nrows=8)
+    best_row, best_score = 0, float("-inf")
+    for index in range(min(5, len(preview))):
+        row = preview.iloc[index].dropna()
+        values = [str(v).strip() for v in row if str(v).strip()]
+        if not values:
+            continue
+        string_count = sum(isinstance(v, str) for v in row)
+        unique = len(set(values))
+        score = len(values) * 2 + string_count + unique - (len(values) - unique) * 3
+        if index + 1 < len(preview):
+            below = preview.iloc[index + 1].notna().sum()
+            score += min(int(below), len(values))
+        if score > best_score:
+            best_row, best_score = index, score
+    return best_row
+
+
 def read_business_readme(
     business_id: Optional[str] = None,
     data_dir: Union[str, Path] = "./data",
@@ -526,58 +612,16 @@ def parse_csv_head(
         logger.warning(f"CSV file not found: {path}")
         return TableSchema(name=path.name, source_type="csv", file_path=str(path))
 
-    # Fast row count estimation without loading full dataframe
-    try:
-        with open(path, "rb") as f:
-            total_rows = sum(1 for _ in f) - 1
-            if total_rows < 0:
-                total_rows = 0
-    except Exception:
-        total_rows = None
-
-    read_limit = max(n_rows, stats_rows) if stats_rows else n_rows
-
     if _HAS_PANDAS:
-        for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
+        for enc in ("utf-8-sig", "utf-8", "cp1258", "latin1"):
             try:
-                # 1. Read sample window with standard comma
-                df = pd.read_csv(path, nrows=read_limit, encoding=enc)
-
-                # Check if file uses semicolon or tab delimiter instead of comma
-                if len(df.columns) == 1 and total_rows and total_rows > 0:
-                    first_col = str(df.columns[0])
-                    if ";" in first_col:
-                        df = pd.read_csv(path, nrows=read_limit, encoding=enc, sep=";")
-                    elif "\t" in first_col:
-                        df = pd.read_csv(path, nrows=read_limit, encoding=enc, sep="\t")
-
-                # 2. Clean leading/trailing whitespace on all string/object columns
-                df = strip_dataframe_whitespace(df)
-
-                columns = [str(c) for c in df.columns]
-                col_types = extract_columns_and_types(df)
-                raw_col_types = {str(col): str(dtype) for col, dtype in df.dtypes.items()}
-                date_ranges = extract_date_ranges(df)
-                low_card = extract_low_cardinality_values(df)
-                col_examples = sample_unique_values(df, top_n=top_n_examples)
-                for col, vals in low_card.items():
-                    if col not in col_examples:
-                        col_examples[col] = vals
-                sample_rows = clean_sample_records(df, n_rows=n_rows)
-
-                return TableSchema(
-                    name=path.name,
-                    source_type="csv",
-                    file_path=str(path),
-                    columns=columns,
-                    column_types=col_types,
-                    raw_column_types=raw_col_types,
-                    column_examples=col_examples,
-                    date_ranges=date_ranges,
-                    low_cardinality_values=low_card,
-                    sample_rows=sample_rows,
-                    total_rows=total_rows,
-                )
+                with path.open("r", encoding=enc, newline="") as handle:
+                    sample = handle.read(8192)
+                delimiter = max((",", ";", "\t"), key=lambda d: sample.splitlines()[0].count(d)) if sample else ","
+                # cp1258 and latin1 decode any byte sequence. Prefer cp1258 only
+                # when it does not contain replacement/control characters.
+                df = pd.read_csv(path, encoding=enc, sep=delimiter, low_memory=False)
+                return _profile_dataframe(df, TableSchema(path.name, "csv", str(path)), n_rows, top_n_examples)
             except Exception:
                 continue
 
@@ -585,13 +629,14 @@ def parse_csv_head(
     try:
         from collections import Counter
         with open(path, mode="r", encoding="utf-8-sig", errors="replace") as f:
-            reader = csv.DictReader(f)
+            sample = f.read(8192)
+            f.seek(0)
+            delimiter = max((",", ";", "\t"), key=lambda d: sample.splitlines()[0].count(d)) if sample else ","
+            reader = csv.DictReader(f, delimiter=delimiter)
             columns = [str(c) for c in (reader.fieldnames or [])]
             sample_rows = []
             col_counters: Dict[str, Counter] = {c: Counter() for c in columns}
             for idx, row in enumerate(reader):
-                if idx >= read_limit:
-                    break
                 cleaned_row = {
                     str(k): (v.strip() if isinstance(v, str) else v)
                     for k, v in row.items()
@@ -617,7 +662,7 @@ def parse_csv_head(
             raw_column_types={c: "object" for c in columns},
             column_examples=col_examples,
             sample_rows=sample_rows,
-            total_rows=total_rows,
+            total_rows=idx + 1 if 'idx' in locals() else 0,
         )
     except Exception as e:
         logger.error(f"Error parsing CSV {path}: {e}")
@@ -654,42 +699,18 @@ def parse_excel_head(
         logger.warning("Pandas is not installed. Cannot parse Excel file.")
         return [TableSchema(name=path.name, source_type="xlsx", file_path=str(path))]
 
-    read_limit = max(n_rows, stats_rows) if stats_rows else n_rows
-
     try:
         with pd.ExcelFile(path) as excel_file:
             for sheet_name in excel_file.sheet_names:
                 try:
-                    df = pd.read_excel(excel_file, sheet_name=sheet_name, nrows=read_limit)
-                    df = strip_dataframe_whitespace(df)
-
-                    columns = [str(c) for c in df.columns]
-                    col_types = extract_columns_and_types(df)
-                    raw_col_types = {str(col): str(dtype) for col, dtype in df.dtypes.items()}
-                    date_ranges = extract_date_ranges(df)
-                    low_card = extract_low_cardinality_values(df)
-                    col_examples = sample_unique_values(df, top_n=top_n_examples)
-                    for col, vals in low_card.items():
-                        if col not in col_examples:
-                            col_examples[col] = vals
-                    sample_rows = clean_sample_records(df, n_rows=n_rows)
-
-                    schemas.append(
-                        TableSchema(
-                            name=f"{path.name} [{sheet_name}]",
-                            source_type="xlsx",
-                            file_path=str(path),
-                            columns=columns,
-                            column_types=col_types,
-                            raw_column_types=raw_col_types,
-                            column_examples=col_examples,
-                            date_ranges=date_ranges,
-                            low_cardinality_values=low_card,
-                            sample_rows=sample_rows,
-                            sheet_name=sheet_name,
-                            total_rows=len(df),
-                        )
+                    header = _detect_excel_header(excel_file, sheet_name)
+                    df = pd.read_excel(excel_file, sheet_name=sheet_name, header=header)
+                    schema = TableSchema(
+                        name=f"{path.name} [{sheet_name}]", source_type="xlsx",
+                        file_path=str(path), sheet_name=sheet_name, header_row=header + 1,
+                        extra_notes=f"Workbook sheets: {', '.join(excel_file.sheet_names)}",
                     )
+                    schemas.append(_profile_dataframe(df, schema, n_rows, top_n_examples))
                 except Exception as sheet_err:
                     logger.warning(f"Error parsing sheet '{sheet_name}' in {path}: {sheet_err}")
                     schemas.append(
@@ -739,7 +760,8 @@ def parse_sqlite_head(
         for t_name in table_names:
             try:
                 # Column definitions
-                cursor.execute(f"PRAGMA table_info('{t_name}')")
+                safe_tbl = t_name.replace('"', '""')
+                cursor.execute(f'PRAGMA table_info("{safe_tbl}")')
                 cols_info = cursor.fetchall()
                 columns = [str(c[1]) for c in cols_info]
                 col_types = {str(c[1]): (c[2] or "TEXT").lower() for c in cols_info}
@@ -749,8 +771,26 @@ def parse_sqlite_head(
                 }
 
                 # Count rows
-                cursor.execute(f"SELECT COUNT(*) FROM '{t_name}'")
+                cursor.execute(f'SELECT COUNT(*) FROM "{safe_tbl}"')
                 total_rows = cursor.fetchone()[0]
+                cursor.execute(f'PRAGMA foreign_key_list("{safe_tbl}")')
+                foreign_keys = [f"{row[3]} -> {row[2]}.{row[4]}" for row in cursor.fetchall()]
+                primary_keys = [str(c[1]) for c in sorted(cols_info, key=lambda c: c[5]) if c[5]]
+
+                if _HAS_PANDAS:
+                    full_df = pd.read_sql_query(f'SELECT * FROM "{safe_tbl}"', conn)
+                    schema = _profile_dataframe(
+                        full_df,
+                        TableSchema(
+                            name=f"{path.name} -> {t_name}", source_type="sqlite",
+                            file_path=str(path), primary_keys=primary_keys,
+                            foreign_keys=foreign_keys, extra_notes=f"SQLite Table: {t_name}",
+                        ), n_rows, top_n_examples,
+                    )
+                    schema.raw_column_types.update(raw_col_types)
+                    schema.total_rows = total_rows
+                    schemas.append(schema)
+                    continue
 
                 # Head n_rows sample (stripping string whitespace)
                 cursor.execute(f"SELECT * FROM '{t_name}' LIMIT {n_rows}")

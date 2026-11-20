@@ -1,13 +1,8 @@
-"""System Prompt & Few-Shot Instruction Builder for Tabular QA (Bước 3).
-
-Crafts highly optimized prompts tailored for offline code-generation LLMs
-(Qwen/Qwen3-14B) answering Vietnamese tabular questions over CSV, XLSX,
-and SQLite files with Chain-of-Thought analysis and unanswerable schema fallback.
-"""
+"""Compact, split-specific prompts for offline tabular question answering."""
 
 from __future__ import annotations
 
-import os
+import json
 from pathlib import Path
 from typing import Dict, Optional, Union
 
@@ -164,129 +159,94 @@ import calendar_utils
 
 start_date, end_date = calendar_utils.get_quarter_date_range(2024, 1)
 
-xlsx_path = FILE_MAP.get("ecommerce.xlsx", "ecommerce.xlsx")
-df_orders = pd.read_excel(xlsx_path, sheet_name="Orders")
+from src.calendar_utils import resolve_time_context
 
-df_orders['order_date'] = pd.to_datetime(df_orders['order_date']).dt.date
-mask = (
-    (df_orders['order_date'] >= start_date) &
-    (df_orders['order_date'] <= end_date) &
-    (df_orders['status'].str.lower() == 'completed')
-)
-valid_orders = df_orders[mask]
 
-if valid_orders.empty:
-    final_result = None
-else:
-    top_customer = (
-        valid_orders.groupby('customer_name')['total_amount']
-        .sum()
-        .sort_values(ascending=False)
-        .index[0]
-    )
-    final_result = str(top_customer).strip()
-```
+SYSTEM_PROMPT = """Bạn là Data Analyst viết Python để trả lời câu hỏi từ dữ liệu thật. Chỉ xuất một khối ```python ... ```; gán kết quả vào final_result. Không tính nhẩm, không bịa cột, bảng, bản ghi hay kết quả.
 
----
-### VÍ DỤ 5 (Trường hợp dữ liệu không tồn tại -> Abstain để tránh bị trừ điểm):
-Câu hỏi: "Tỷ lệ tăng trưởng doanh số của sản phẩm mã 'SKU-9999' so với cùng kỳ năm ngoái?"
-Ngày tham chiếu: 2024-04-10
+QUY TẮC CỨNG — Penalized Accuracy: đúng +1, sai -1, abstain 0. Chỉ trả lời khi bằng chứng đủ mạnh (>60% khả năng đúng).
+1. Code-first: mọi đếm, lọc, tổng hợp, xếp hạng và tra cứu tên sản phẩm/khách hàng phải chạy bằng Python trên file thật trong FILE_MAP. pd, np, sqlite3, calendar_utils và as_of_date có sẵn.
+2. Rulebook fidelity: doanh thu, lợi nhuận, giá vốn, bán chạy, đơn hợp lệ, đơn hủy/trả, kỳ thời gian, ranking và tie-break theo mã tăng dần phải theo rulebook của split; điều kiện nêu rõ trong câu hỏi được ưu tiên. Không tự đặt công thức doanh thu.
+3. Pha Inspect: kiểm tra file/cột bắt buộc; xem giá trị unique và tần suất cột trạng thái/danh mục; đối chiếu tên gốc, tên không dấu và viết tắt; kiểm tra min/max ngày thực tế. Chỉ dùng các cột đã xác nhận.
+4. Pha Compute & Verify: áp đúng bộ lọc rulebook; chặn ngày sau as_of_date khi câu hỏi neo hiện tại; xét hủy/trả; xử lý rỗng/NaN; kiểm tra tie top-k và mã tăng dần; percent là số điểm phần trăm (-12.45, không phải -0.1245), đúng dấu tăng/giảm. Đếm số đơn khác tổng số lượng bán và khác doanh thu.
+5. unanswerable: chỉ sau khi code kiểm tra dữ liệu/README và chứng minh thiếu trường, thiếu khoảng thời gian hoặc không thể tính; ghi `reason = "..."` ngắn bằng tiếng Việt và `final_result = "unanswerable"`. Ví dụ lợi nhuận thiếu giá vốn. Dữ liệu rỗng sau lọc chưa tự chứng minh unanswerable.
+6. abstain: câu hỏi có thể trả lời nhưng còn mơ hồ nghiêm trọng, công thức xung đột, code lỗi hoặc xác suất đúng không vượt 60%; dùng `final_result = "abstain"`. Không dùng unanswerable để che lỗi code.
+7. Tiếng Việt: sp=sản phẩm, ko=không, dc=được, thg=tháng, sl=số lượng, dt=doanh thu, ln=lợi nhuận, kh=khách hàng. Tìm kiếm linh hoạt với tên không dấu nhưng trả string/list/table bằng tên gốc có dấu, NFC.
 
-```python
-# Phân tích: Đọc inventory.csv và kiểm tra xem mã 'SKU-9999' có nằm trong cột product_id hay không. Vì không có bản ghi nào khớp, gán final_result = None để abstain an toàn.
-import pandas as pd
+OUTPUT CONTRACT: code chỉ gán final_result; bộ đóng gói xuất JSON {"id":"...","type":"...","answer":...}. type thuộc number, percent, string, date, boolean, list, table, unanswerable, abstain. number là số nguyên hoặc số làm tròn 2 chữ số; percent=-12.45; date="2024-06-19" hoặc "2024-06"; boolean=true/false; list=["A",2] đúng thứ tự; table={"columns":["Tên"],"rows":[["Hà Nội"]]}; unanswerable={"type":"unanswerable","answer":"unanswerable"} với reason trong code; abstain={"type":"abstain","answer":"abstain"}. Không in JSON thay cho code.
 
-csv_path = FILE_MAP.get("inventory.csv", "inventory.csv")
-df = pd.read_csv(csv_path)
+Trước khi truy cập `.iloc[0]`, kiểm tra rỗng. Nếu Excel có metadata trên header, dùng đúng dòng header từ schema. Trả đúng một khối Python, không có văn bản ngoài khối."""
 
-if 'SKU-9999' not in df['product_id'].astype(str).values:
-    final_result = None
-else:
-    final_result = None
-```
-
----
-### VÍ DỤ 6 (Unanswerable - Thiếu thông tin hoặc cột dữ liệu để tính toán chỉ số yêu cầu):
-Câu hỏi: "Tính tổng lợi nhuận của sản phẩm sữa tươi trong tháng 5/2024?"
-Ngày tham chiếu: 2024-06-01
-Lược đồ dữ liệu (Schema): `sales.csv` có `product_name`, `quantity`, `selling_price`. Không có cột giá vốn hay chi phí nhập hàng.
-
-```python
-# Phân tích: Câu hỏi yêu cầu tính lợi nhuận (profit = revenue - cost). Trong các bảng dữ liệu chỉ có cột selling_price và quantity, hoàn toàn không có cột giá vốn/chi phí mua hàng (cost/purchase_price). Vì thiếu thông tin cần thiết để tính toán, trả về unanswerable kèm lý do cụ thể.
-final_result = "unanswerable"
-```"""
+FEW_SHOT_EXAMPLES = ""  # Avoid examples with invented columns or split-specific status labels.
 
 
 def read_rulebook(data_dir: Union[str, Path] = "./data") -> str:
-    """Read live rulebook.md from data directory if present.
-
-    Never hardcodes rules; always reads split's actual rulebook.md dynamically.
-    """
-    base = Path(data_dir).resolve()
-    candidates = [
-        base / "rulebook.md",
-        base / "RULEBOOK.md",
-        base / "data" / "rulebook.md",
-        Path("/data/rulebook.md"),
-        Path("./rulebook.md"),
-    ]
-    for c in candidates:
-        if c.is_file():
-            try:
-                for enc in ("utf-8-sig", "utf-8", "latin-1"):
-                    try:
-                        content = c.read_text(encoding=enc).strip()
-                        if content:
-                            return content
-                    except UnicodeDecodeError:
-                        continue
-            except Exception:
-                pass
+    """Read the active split only, without falling back to another directory."""
+    path = Path(data_dir) / "rulebook.md"
+    if not path.is_file():
+        return ""
+    for encoding in ("utf-8-sig", "utf-8", "cp1258", "latin1"):
+        try:
+            return path.read_text(encoding=encoding).strip()
+        except UnicodeError:
+            continue
     return ""
 
 
 class PromptBuilder:
-    """Builds system and question prompts for the code generation LLM."""
+    """Construct immutable per-business prefixes and compact query suffixes."""
 
     def __init__(
         self,
         system_prompt: str = SYSTEM_PROMPT,
         few_shot_examples: str = FEW_SHOT_EXAMPLES,
         rulebook_content: Optional[str] = None,
-    ):
+        enable_verification: bool = False,
+    ) -> None:
         self.system_prompt = system_prompt
         self.few_shot_examples = few_shot_examples
-        self.rulebook_content = rulebook_content
+        self.rulebook_content = rulebook_content or ""
+        self.enable_verification = enable_verification
+        self._prefix_cache: Dict[tuple[str, str, str, str], str] = {}
 
-    def build_system_prompt(self, rulebook_content: Optional[str] = None) -> str:
-        """Return complete system prompt with role declaration, few-shot instructions, and rulebook."""
-        full_prompt = f"{self.system_prompt}\n\n{self.few_shot_examples}"
-        rb = rulebook_content if rulebook_content is not None else self.rulebook_content
-        if rb and rb.strip():
-            full_prompt += f"\n\n=== QUY TẮC BỔ SUNG TỪ RULEBOOK (RULEBOOK.MD) ===\n{rb.strip()}"
-        return full_prompt
+    def build_system_prompt(
+        self,
+        rulebook_content: Optional[str] = None,
+        readme_content: str = "",
+        schema_context: str = "",
+        business_id: Optional[str] = None,
+    ) -> str:
+        """Place stable data after instructions in the same order for every query."""
+        rb = self.rulebook_content if rulebook_content is None else rulebook_content
+        schema_profile = schema_context[:30000] + ("\n[Schema context budget reached]" if len(schema_context) > 30000 else "")
+        key = (business_id or "", rb, readme_content or "", schema_profile)
+        cached = self._prefix_cache.get(key)
+        if cached is not None:
+            return cached
+        sections = [
+            self.system_prompt.strip(),
+            self.few_shot_examples.strip(),
+            "=== RULEBOOK.MD (ACTIVE SPLIT) ===\n" + (rb.strip() or "[Không có rulebook]"),
+            "=== BUSINESS README.MD ===\n" + (readme_content.strip() or "[Không có README]"),
+            "=== BUSINESS SCHEMA PROFILE ===\n" + (schema_profile.strip() or "[Không có schema]"),
+        ]
+        prefix = "\n\n".join(section for section in sections if section)
+        self._prefix_cache[key] = prefix
+        return prefix
 
     def build_user_prompt(
         self,
         question: str,
-        schema_context: str,
+        schema_context: str = "",
         as_of_date: Optional[str] = None,
         file_map: Optional[Dict[str, str]] = None,
         rulebook_content: Optional[str] = None,
+        time_context: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Compose user prompt including schema context and specific question.
+        """Keep only per-question values in the user suffix.
 
-        Nối: Schema String + as_of_date (ngày hiện tại) + Câu hỏi tiếng Việt.
-
-        Args:
-            question: Natural language question in Vietnamese.
-            schema_context: Markdown summary of datasets and head(5) previews.
-            as_of_date: Date anchor string (e.g., '2024-06-15').
-            file_map: Dictionary of available filenames to absolute paths.
-            rulebook_content: Optional text of live rulebook.md.
-
-        Returns:
-            Formatted prompt string.
+        Schema and rulebook parameters remain for old callers. The caller puts
+        their content in build_system_prompt to enable prefix caching.
         """
         prompt_parts = []
         prompt_parts.append("### THÔNG TIN CẤU TRÚC BẢNG VÀ DỮ LIỆU (SCHEMA STRING):")
@@ -343,42 +303,42 @@ class PromptBuilder:
             "Chỉ in ra code trong thẻ ```python ... ```, không giải thích."
         )
 
-        return "\n".join(prompt_parts)
-
     def build_retry_prompt(
         self,
         question: str,
         previous_code: str,
         error_traceback: str,
+        previous_user_prompt: Optional[str] = None,
     ) -> str:
-        """Build self-correction prompt providing error traceback back to LLM.
-
-        Args:
-            question: Original question.
-            previous_code: Code that triggered runtime or syntax failure.
-            error_traceback: Traceback message captured by executor.
-
-        Returns:
-            Refinement prompt string.
-        """
-        # Extract a short error message (e.g. KeyError: 'revenue')
-        error_msg = error_traceback.strip().splitlines()[-1] if error_traceback.strip() else "Unknown error"
-        if ":" in error_traceback.strip().splitlines()[0]:
-            first_line = error_traceback.strip().splitlines()[0]
-            if any(first_line.startswith(err) for err in ("KeyError", "IndexError", "TypeError", "ValueError", "SyntaxError", "ZeroDivisionError", "NameError")):
-                error_msg = first_line
-
-        # Truncate traceback if overly long to prevent token overflow
-        tb_snippet = error_traceback.strip()
-        if len(tb_snippet) > 1200:
-            tb_snippet = tb_snippet[-1200:]
-
+        """Give concrete failure evidence and demand a changed repair strategy."""
+        error = error_traceback.strip() or "Output rỗng/NaN hoặc không có final_result"
+        base = previous_user_prompt or f"CÂU HỎI: {question.strip()}"
         return (
-            f"Đoạn code trên bị lỗi: {error_msg}. Hãy viết lại code sửa lỗi.\n\n"
-            f"**CÂU HỎI:** \"{question}\"\n\n"
-            f"**MÃ ĐÃ CHẠY:**\n```python\n{previous_code}\n```\n\n"
-            f"**CHI TIẾT LỖI:**\n```\n{tb_snippet}\n```\n\n"
-            "Hãy bắt đầu bằng comment `# Phân tích: ...`, sửa lại toàn bộ mã Python (dùng pandas) và gán kết quả vào `final_result`.\n"
-            "Nếu sau khi xem xét bạn nhận thấy dữ liệu thực sự không hỗ trợ trả lời câu hỏi, hãy gán `final_result = \"unanswerable\"` hoặc `final_result = None`.\n"
-            "Chỉ in ra code trong thẻ ```python ... ```, không giải thích."
+            f"{base}\nRETRY: Code trước lỗi hoặc trả rỗng/NaN.\n"
+            f"FAILED CODE:\n```python\n{previous_code}\n```\n"
+            f"EXACT ERROR/OUTPUT:\n{error[-1800:]}\n"
+            "Sửa nguyên nhân gốc: kiểm tra lại tên file/cột, dtype, giá trị trạng thái, định dạng ngày, bộ lọc và mẫu dữ liệu; không lặp lại cùng code. "
+            "Nếu cột/kỳ thật sự thiếu sau kiểm tra, đặt reason tiếng Việt và final_result = \"unanswerable\"; "
+            "nếu vẫn không chắc hoặc code tiếp tục lỗi, đặt final_result = None để abstain. "
+            "Chỉ trả một khối ```python ... ``` gán final_result."
+        )
+
+    def build_verification_prompt(
+        self,
+        question: str,
+        computed_answer: Any,
+        as_of_date: Optional[str] = None,
+        time_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Optional follow-up prompt; the caller decides whether to invoke a model."""
+        if not self.enable_verification:
+            return None
+        return (
+            f"VERIFY QUESTION: {question.strip()}\n"
+            f"as_of_date: {as_of_date or '[chưa xác định]'}\n"
+            f"TIME_CONTEXT_ISO: {json.dumps(time_context or {}, ensure_ascii=False, sort_keys=True)}\n"
+            f"COMPUTED ANSWER: {json.dumps(computed_answer, ensure_ascii=False, default=str)}\n"
+            "Đối chiếu câu hỏi, dữ liệu, khoảng ngày và RULEBOOK.MD trong system message. "
+            "Kiểm tra type, đơn vị, dấu, lọc hủy/trả, tie-break. "
+            "Chỉ viết code kiểm chứng; nếu mâu thuẫn chưa giải được, final_result = \"abstain\"."
         )

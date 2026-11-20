@@ -14,6 +14,8 @@ OUTPUT_DIR="${OUTPUT_DIR:-/result}"
 LIMIT="${LIMIT:-}"
 MODEL_PATH="${MODEL_PATH:-/code/models/Qwen3-14B}"
 TIMEOUT="${TIMEOUT:-15}"
+SOFT_TIMEOUT="${SOFT_TIMEOUT:-100}"
+TIME_BUDGET_SECONDS="${TIME_BUDGET_SECONDS:-21600}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 EXTRA_ARGS=()
@@ -50,6 +52,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --timeout|-t)
       TIMEOUT="$2"
+      shift 2
+      ;;
+    --soft-timeout|--soft_timeout)
+      SOFT_TIMEOUT="$2"
+      shift 2
+      ;;
+    --time-budget-seconds|--time_budget_seconds)
+      TIME_BUDGET_SECONDS="$2"
       shift 2
       ;;
     --max-retries|--max_retries|-r)
@@ -94,9 +104,16 @@ export OMP_NUM_THREADS=4
 export PYTHONDONTWRITEBYTECODE=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export NCCL_P2P_DISABLE=1
+export PYTHONHASHSEED=42
+export VLLM_SEED=42
+export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-8}"
 export TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-2}"
-export TMPDIR="${TMPDIR:-/tmp}"
-mkdir -p "${TMPDIR}" 2>/dev/null || true
+export TMPDIR=/tmp
+export TEMP=/tmp
+export TMP=/tmp
+mkdir -p /tmp
 
 echo "======================================================================"
 echo " Zalo AI Challenge 2026 - DataMate Prediction Entrypoint"
@@ -113,6 +130,8 @@ CMD=(python -m src.main
   --output_dir "${OUTPUT_DIR}"
   --model_path "${MODEL_PATH}"
   --timeout "${TIMEOUT}"
+  --soft_timeout "${SOFT_TIMEOUT}"
+  --time_budget_seconds "${TIME_BUDGET_SECONDS}"
   --max_retries "${MAX_RETRIES}"
   --batch_size "${BATCH_SIZE}"
 )

@@ -1,17 +1,9 @@
-"""Output Normalizer & Submission Formatter for Zalo AI Challenge 2026 - DataMate Track (Bước 5).
-
-Normalizes model outputs and Pandas query results per competition rules:
-1. Chuẩn hóa String: NFC Unicode, đưa về chữ thường, thay ký tự đặc biệt bằng khoảng trắng, xóa khoảng trắng thừa.
-2. Chuẩn hóa Number / Percent: Ép kiểu float, làm tròn đúng 2 chữ số thập phân (round(val, 2)).
-3. Quyết định Abstain: Nếu chạy quá 3 lần vẫn lỗi hoặc trả về DataFrame rỗng vô lý -> gán answer = "abstain".
-4. Format dictionary thành chuỗi JSON chứa id, type, answer và ghi append vào file submission.jsonl.
-"""
-
-from __future__ import annotations
+"""Validate and serialize DataMate submission values by their declared type."""
 
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import json
 import math
 from pathlib import Path
@@ -88,8 +80,7 @@ def format_string(text: Any, clean_text: bool = False) -> str:
     """Format string output for competition submission.
 
     When clean_text is False (default for submission), preserves the exact canonical
-    capitalization and diacritics of the product/entity from the business table,
-    stripping surrounding redundant quotes.
+    capitalization, punctuation, identifiers, and diacritics from the business table.
     When clean_text is True (for comparison), applies full clean_string normalization.
     """
     if text is None:
@@ -98,8 +89,6 @@ def format_string(text: Any, clean_text: bool = False) -> str:
         text = str(text)
 
     cleaned = text.strip()
-    if (cleaned.startswith('"') and cleaned.endswith('"')) or (cleaned.startswith("'") and cleaned.endswith("'")):
-        cleaned = cleaned[1:-1].strip()
 
     if clean_text:
         return normalize_for_comparison(cleaned)
@@ -119,63 +108,57 @@ def format_number(val: Any, round_decimals: int = 2) -> Union[int, float]:
     Returns:
         Rounded float or simplified integer.
     """
-    if val is None:
-        raise ValueError("Cannot parse None as number.")
-    if isinstance(val, bool):
-        return int(val)
+    if isinstance(val, bool) or val is None:
+        raise ValueError("A number must be a finite numeric value")
     if _HAS_NUMPY and isinstance(val, (np.integer, np.floating)):
         val = val.item()
-
-    if isinstance(val, (int, float)):
-        if isinstance(val, float):
-            if math.isnan(val) or math.isinf(val):
-                raise ValueError(f"Cannot parse {val} as number.")
-            rounded = round(val, round_decimals)
-            return int(rounded) if rounded.is_integer() else rounded
-        return int(val)
-
-    if isinstance(val, str):
-        cleaned = val.strip()
-
-        # Handle percentage strings in format_number (backward compatibility)
-        if m_pct := re.match(r"^\s*([+-]?\d+(?:\.\d+)?)\s*%\s*$", cleaned):
-            num = round(float(m_pct.group(1)), round_decimals)
-            return int(num) if num.is_integer() else num
-
-        # Strip currency symbols: vnd, vnđ, vn₫, đ, ₫, $, usd, đồng
-        cleaned = re.sub(r"(?i)(?:vnd|vnđ|vn₫|usd|đồng|dong|[$₫đ])", "", cleaned).strip()
-        cleaned = re.sub(r"\s+", "", cleaned)
-
-        if not cleaned:
-            raise ValueError(f"Cannot parse '{val}' as number.")
-
-        # Handle thousand-separator commas and dots
-        if "," in cleaned and "." in cleaned:
-            last_comma = cleaned.rfind(",")
-            last_dot = cleaned.rfind(".")
-            if last_comma > last_dot:
-                # Format: 15.000.000,50 (dot thousand, comma decimal)
-                cleaned = cleaned.replace(".", "").replace(",", ".")
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        if not math.isfinite(val):
+            raise ValueError("NaN and Infinity are invalid")
+        raw = str(val)
+    elif isinstance(val, Decimal):
+        raw = str(val)
+    elif isinstance(val, str):
+        raw = val.strip()
+        currency_pattern = r"(?i)(?:\s*(?:vnd|vnđ|vn₫|usd|đồng|dong|[₫đ])\s*$|^\s*\$\s*)"
+        currency = bool(re.search(currency_pattern, raw))
+        raw = re.sub(currency_pattern, "", raw)
+        raw = re.sub(r"\s+", "", raw)
+        if "%" in raw:
+            raise ValueError("Percent symbol is invalid for number")
+        if "," in raw and "." in raw:
+            decimal_mark = "," if raw.rfind(",") > raw.rfind(".") else "."
+            thousands_mark = "." if decimal_mark == "," else ","
+            raw = raw.replace(thousands_mark, "").replace(decimal_mark, ".")
+        elif re.fullmatch(r"[+-]?\d{1,3}(?:[.,]\d{3}){2,}(?:[.,]\d{1,2})?", raw):
+            last = raw.rsplit(",", 1)[-1].rsplit(".", 1)[-1]
+            has_decimal = len(last) <= 2 and ("," in raw or "." in raw)
+            decimal_mark = raw[-len(last)-1] if has_decimal else None
+            if has_decimal:
+                whole, fraction = raw.rsplit(decimal_mark, 1)
+                raw = re.sub(r"[.,]", "", whole) + "." + fraction
             else:
-                # Format: 15,000,000.50 (comma thousand, dot decimal)
-                cleaned = cleaned.replace(",", "")
-        elif "," in cleaned:
-            parts = cleaned.split(",")
-            if len(parts) > 2 or any(len(p) == 3 for p in parts[1:]):
-                cleaned = "".join(parts)
-            else:
-                cleaned = cleaned.replace(",", ".")
-        elif "." in cleaned:
-            parts = cleaned.split(".")
-            if len(parts) > 2:
-                cleaned = "".join(parts)
-            elif len(parts) == 2 and len(parts[1]) == 3 and any(sym in str(val).lower() for sym in ("vnd", "vnđ", "vn₫", "đ", "₫", "$")):
-                cleaned = "".join(parts)
-
-        num = round(float(cleaned), round_decimals)
-        return int(num) if num.is_integer() else num
-
-    raise ValueError(f"Cannot parse '{val}' as number.")
+                raw = re.sub(r"[.,]", "", raw)
+        elif "," in raw:
+            raw = raw.replace(",", "" if re.fullmatch(r"[+-]?\d{1,3},\d{3}", raw) else ".")
+        elif "." in raw and currency and re.fullmatch(r"[+-]?\d{1,3}\.\d{3}", raw):
+            raw = raw.replace(".", "")
+    else:
+        raise ValueError(f"Cannot parse {type(val).__name__} as number")
+    try:
+        numeric = Decimal(raw)
+        if not numeric.is_finite():
+            raise ValueError("NaN and Infinity are invalid")
+        rounded = numeric.quantize(Decimal(1).scaleb(-round_decimals), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"Invalid number: {val!r}") from exc
+    if rounded == 0:
+        return 0
+    if rounded == rounded.to_integral_value():
+        return int(rounded)
+    return float(rounded)
 
 
 def format_percent(val: Any, round_decimals: int = 2) -> Union[int, float]:
@@ -185,42 +168,18 @@ def format_percent(val: Any, round_decimals: int = 2) -> Union[int, float]:
     rounded to 2 decimal places with exact sign.
 
     Args:
-        val: Numeric percentage, string percentage ('-12.45%'), or ratio (-0.1245).
+        val: Numeric percentage or string percentage such as '-12.45%'.
         round_decimals: Decimal places to round to (default: 2).
 
     Returns:
         Rounded float or integer percentage value.
     """
-    if val is None:
-        raise ValueError("Cannot parse None as percent.")
-    if _HAS_NUMPY and isinstance(val, (np.integer, np.floating)):
-        val = val.item()
-
     if isinstance(val, str):
         cleaned = val.strip()
-        has_pct_sym = "%" in cleaned
-        cleaned = cleaned.replace("%", "").strip()
-        cleaned = re.sub(r"\s+", "", cleaned)
-        if "," in cleaned and "." not in cleaned:
-            cleaned = cleaned.replace(",", ".")
-        num = float(cleaned)
-        # If input was a raw ratio string like "-0.1245" without % sign
-        if not has_pct_sym and 0 < abs(num) < 1.0:
-            num = num * 100.0
-        rounded = round(num, round_decimals)
-        return int(rounded) if rounded.is_integer() else rounded
-
-    if isinstance(val, (int, float)):
-        if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
-            raise ValueError(f"Cannot parse {val} as percent.")
-        num = float(val)
-        # Convert float ratio e.g. -0.1245 -> -12.45
-        if 0 < abs(num) < 1.0:
-            num = num * 100.0
-        rounded = round(num, round_decimals)
-        return int(rounded) if rounded.is_integer() else rounded
-
-    raise ValueError(f"Cannot parse '{val}' as percent.")
+        if cleaned.endswith("%"):
+            cleaned = cleaned[:-1].strip()
+        return format_number(cleaned, round_decimals)
+    return format_number(val, round_decimals)
 
 
 def format_date(val: Any, as_month: bool = False) -> str:
@@ -233,49 +192,22 @@ def format_date(val: Any, as_month: bool = False) -> str:
     Returns:
         Clean ISO formatted date string.
     """
-    if val is None:
-        raise ValueError("Cannot format None as date.")
+    if val is None or (_HAS_PANDAS and val is pd.NaT):
+        raise ValueError("Missing date")
     if isinstance(val, datetime):
-        if as_month:
-            return val.strftime("%Y-%m")
-        if val.hour or val.minute or val.second:
-            return val.strftime("%Y-%m-%d %H:%M:%S")
-        return val.strftime("%Y-%m-%d")
-    if isinstance(val, date):
-        return val.strftime("%Y-%m") if as_month else val.strftime("%Y-%m-%d")
-    if _HAS_PANDAS and isinstance(val, pd.Timestamp):
-        if as_month:
-            return val.strftime("%Y-%m")
-        if val.hour or val.minute or val.second:
-            return val.strftime("%Y-%m-%d %H:%M:%S")
-        return val.strftime("%Y-%m-%d")
-
-    s = str(val).strip()
-    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-        s = s[1:-1].strip()
-
-    # YYYY-MM-DD HH:MM:SS
-    if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", s):
-        return s[:7] if as_month else s
-    # YYYY-MM-DD or YYYY/MM/DD
-    if m := re.match(r"^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$", s):
-        d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        return d.strftime("%Y-%m") if as_month else d.strftime("%Y-%m-%d")
-    # YYYY-MM or YYYY/MM
-    if m := re.match(r"^(\d{4})[/-](\d{1,2})$", s):
-        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}"
-    # DD/MM/YYYY or DD-MM-YYYY
-    if m := re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$", s):
-        d = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
-        return d.strftime("%Y-%m") if as_month else d.strftime("%Y-%m-%d")
-    # MM/YYYY or MM-YYYY
-    if m := re.match(r"^(\d{1,2})[/-](\d{4})$", s):
-        return f"{int(m.group(2)):04d}-{int(m.group(1)):02d}"
-    # Vietnamese "tháng M/YYYY" or "tháng MM năm YYYY"
-    if m := re.search(r"tháng\s*(\d{1,2})(?:[/-]|\s*năm\s*)(\d{4})", s, re.IGNORECASE):
-        return f"{int(m.group(2)):04d}-{int(m.group(1)):02d}"
-
-    return s
+        parsed = val.date()
+    elif isinstance(val, date):
+        parsed = val
+    else:
+        raw = str(val).strip()
+        if re.fullmatch(r"\d{4}-\d{2}", raw):
+            date.fromisoformat(raw + "-01")
+            return raw
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}(?: 00:00:00)?", raw):
+            parsed = date.fromisoformat(raw[:10])
+        else:
+            raise ValueError(f"Invalid ISO date: {val!r}")
+    return parsed.strftime("%Y-%m") if as_month else parsed.isoformat()
 
 
 def format_boolean(val: Any) -> bool:
@@ -289,7 +221,9 @@ def format_boolean(val: Any) -> bool:
     """
     if isinstance(val, bool):
         return val
-    if isinstance(val, (int, float)):
+    if _HAS_NUMPY and isinstance(val, np.bool_):
+        return bool(val)
+    if isinstance(val, (int, float)) and val in (0, 1):
         return bool(val)
     if isinstance(val, str):
         s = val.strip().lower()
@@ -297,7 +231,7 @@ def format_boolean(val: Any) -> bool:
             return True
         if s in ("false", "0", "f", "no", "sai", "không", "khong"):
             return False
-    return bool(val)
+    raise ValueError(f"Invalid boolean: {val!r}")
 
 
 def sort_ranking_items(
@@ -351,30 +285,38 @@ def format_list(val: Any, round_decimals: int = 2, clean_text: bool = False) -> 
         val = val.tolist()
     elif _HAS_NUMPY and isinstance(val, np.ndarray):
         val = val.tolist()
-    elif isinstance(val, (tuple, set)):
+    elif isinstance(val, tuple):
         val = list(val)
     elif isinstance(val, str):
-        s = val.strip()
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                parsed = json.loads(s)
-                if isinstance(parsed, list):
-                    val = parsed
-            except Exception:
-                pass
-        if not isinstance(val, list):
-            if "," in s:
-                val = [p.strip() for p in s.split(",") if p.strip()]
-            else:
-                val = [s]
+        val = json.loads(val)
+    if not isinstance(val, list) or not val:
+        raise ValueError("List must be a nonempty ordered array")
+    return [_format_cell(item, round_decimals) for item in val]
 
-    if not isinstance(val, list):
-        val = [val]
 
-    return [
-        format_scalar(item, round_decimals=round_decimals, clean_text=clean_text)
-        for item in val
-    ]
+def _format_cell(value: Any, round_decimals: int = 2) -> Union[str, int, float, bool]:
+    """Normalize a table/list cell without turning text identifiers into numbers."""
+    if value is None:
+        raise ValueError("Null cell")
+    if _HAS_NUMPY and isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float, Decimal)):
+        return format_number(value, round_decimals)
+    if isinstance(value, str):
+        text = format_string(value)
+        if not text or text.casefold() in {"nan", "none", "null", "inf", "infinity"}:
+            raise ValueError("Empty or non-finite cell")
+        numeric_text = re.fullmatch(r"[+-]?(?:\d+(?:\.\d+)?|\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?)", text)
+        currency_text = re.search(r"(?i)(?:vnd|vnđ|vn₫|đồng|dong|[₫đ])\s*$|^\s*\$", text)
+        leading_zero_code = bool(re.fullmatch(r"[+-]?0\d+", text))
+        if (numeric_text or currency_text) and not leading_zero_code:
+            return format_number(text, round_decimals)
+        return text
+    if isinstance(value, (date, datetime)):
+        return format_date(value)
+    raise ValueError(f"Unsupported cell type: {type(value).__name__}")
 
 
 def format_table(val: Any, round_decimals: int = 2, clean_text: bool = False) -> Dict[str, Any]:
@@ -391,55 +333,33 @@ def format_table(val: Any, round_decimals: int = 2, clean_text: bool = False) ->
         Structured table dict {"columns": [...], "rows": [[...], ...]}.
     """
     if _HAS_PANDAS and isinstance(val, pd.DataFrame):
-        columns = [normalize_unicode_nfc(str(c)) for c in val.columns]
-        if val.empty:
-            return {"columns": columns, "rows": []}
-        rows = [
-            [format_scalar(cell, round_decimals=round_decimals, clean_text=clean_text) for cell in row]
-            for row in val.itertuples(index=False)
-        ]
-        return {"columns": columns, "rows": rows}
-
-    if isinstance(val, dict):
-        if "columns" in val and "rows" in val:
-            columns = [normalize_unicode_nfc(str(c)) for c in val["columns"]]
-            rows = [
-                [format_scalar(cell, round_decimals=round_decimals, clean_text=clean_text) for cell in row]
-                if isinstance(row, (list, tuple))
-                else [format_scalar(row, round_decimals=round_decimals, clean_text=clean_text)]
-                for row in val["rows"]
-            ]
-            return {"columns": columns, "rows": rows}
-        columns = [normalize_unicode_nfc(str(k)) for k in val.keys()]
-        if columns and all(isinstance(v, (list, tuple)) for v in val.values()):
-            num_rows = len(val[columns[0]]) if columns else 0
-            rows = []
-            for i in range(num_rows):
-                rows.append([
-                    format_scalar(val[c][i], round_decimals=round_decimals, clean_text=clean_text)
-                    for c in columns
-                ])
-            return {"columns": columns, "rows": rows}
-
-    if isinstance(val, list):
-        if not val:
-            return {"columns": [], "rows": []}
-        if all(isinstance(item, dict) for item in val):
-            columns = [normalize_unicode_nfc(str(k)) for k in val[0].keys()]
-            rows = [
-                [format_scalar(item.get(c), round_decimals=round_decimals, clean_text=clean_text) for c in columns]
-                for item in val
-            ]
-            return {"columns": columns, "rows": rows}
-        if all(isinstance(item, (list, tuple)) for item in val):
-            rows = [
-                [format_scalar(cell, round_decimals=round_decimals, clean_text=clean_text) for cell in item]
-                for item in val
-            ]
-            columns = [f"col_{i}" for i in range(len(rows[0]))] if rows else []
-            return {"columns": columns, "rows": rows}
-
-    return {"columns": [], "rows": []}
+        columns, rows = list(val.columns), list(val.itertuples(index=False, name=None))
+    elif isinstance(val, dict) and set(val) == {"columns", "rows"}:
+        columns, rows = val["columns"], val["rows"]
+    elif isinstance(val, dict) and val and all(isinstance(v, (list, tuple)) for v in val.values()):
+        columns = list(val)
+        lengths = {len(v) for v in val.values()}
+        if len(lengths) != 1:
+            raise ValueError("Table columns have unequal lengths")
+        rows = [list(row) for row in zip(*val.values())]
+    elif isinstance(val, list) and val and all(isinstance(row, dict) for row in val):
+        columns = list(val[0])
+        if any(set(row) != set(columns) for row in val):
+            raise ValueError("Table records have unequal columns")
+        rows = [[row[column] for column in columns] for row in val]
+    else:
+        raise ValueError("Table must contain columns and rows")
+    if not isinstance(columns, (list, tuple)) or not columns or not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError("Table columns and rows are required")
+    normalized_columns = [format_string(column) for column in columns]
+    if any(not column for column in normalized_columns):
+        raise ValueError("Empty table column name")
+    normalized_rows = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) != len(normalized_columns):
+            raise ValueError("Table row width does not match columns")
+        normalized_rows.append([_format_cell(cell, round_decimals) for cell in row])
+    return {"columns": normalized_columns, "rows": normalized_rows}
 
 
 def is_abstain_signal(val: Any, success: bool = True) -> bool:
@@ -546,7 +466,10 @@ def format_scalar(
     if q_type == "table":
         if is_abstain_signal(val):
             return abstain_fallback
-        return format_table(val, round_decimals=round_decimals, clean_text=clean_text)
+        try:
+            return format_table(val, round_decimals=round_decimals, clean_text=clean_text)
+        except (ValueError, TypeError):
+            return abstain_fallback
 
     val = unwrap_container(val)
 
@@ -573,10 +496,19 @@ def format_scalar(
             return abstain_fallback
 
     if q_type == "boolean":
-        return format_boolean(val)
+        try:
+            return format_boolean(val)
+        except ValueError:
+            return abstain_fallback
 
     if q_type == "list":
-        return format_list(val, round_decimals=round_decimals, clean_text=clean_text)
+        try:
+            return format_list(val, round_decimals=round_decimals, clean_text=clean_text)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return abstain_fallback
+
+    if q_type == "string":
+        return format_string(val, clean_text=clean_text)
 
     # Inferred types
     if isinstance(val, (datetime, date)) or (_HAS_PANDAS and isinstance(val, pd.Timestamp)):
@@ -589,34 +521,33 @@ def format_scalar(
         return val
 
     if isinstance(val, float):
-        if math.isnan(val) or math.isinf(val):
+        try:
+            return format_number(val, round_decimals)
+        except ValueError:
             return abstain_fallback
-        rounded = round(val, round_decimals)
-        return int(rounded) if rounded.is_integer() else rounded
 
     if isinstance(val, str):
         cleaned = val.strip()
-        if (cleaned.startswith('"') and cleaned.endswith('"')) or (cleaned.startswith("'") and cleaned.endswith("'")):
-            cleaned = cleaned[1:-1].strip()
 
         # Handle percent strings (e.g. '15.5%')
         if m_pct := re.match(r"^\s*([+-]?\d+(?:\.\d+)?)\s*%\s*$", cleaned):
-            num = round(float(m_pct.group(1)), round_decimals)
-            return int(num) if num.is_integer() else num
+            return format_percent(m_pct.group(1), round_decimals)
 
         # Handle numeric strings
         try:
             if re.match(r"^[+-]?\d+$", cleaned):
                 return int(cleaned)
             if re.match(r"^[+-]?\d+\.\d+$", cleaned):
-                num = round(float(cleaned), round_decimals)
-                return int(num) if num.is_integer() else num
+                return format_number(cleaned, round_decimals)
         except Exception:
             pass
 
         # Handle ISO Date string preservation (e.g. '2024-05-15')
-        if re.match(r"^\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}:\d{2})?$", cleaned):
-            return format_date(cleaned)
+        if re.match(r"^\d{4}-\d{2}-\d{2}(?: 00:00:00)?$", cleaned):
+            try:
+                return format_date(cleaned)
+            except ValueError:
+                return abstain_fallback
 
         if clean_text:
             return clean_string(cleaned)
@@ -684,49 +615,29 @@ def format_submission_record(
     abstain_token: str = DEFAULT_ABSTAIN_TOKEN,
     reason: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Format dictionary cuối cùng chứa id, type, answer theo luật BTC DataMate.
-
-    Đảm bảo:
-    - Bỏ qua trường 'alias' (strictly omit alias).
-    - Khớp chuẩn: {"id": ..., "type": ..., "answer": ...} (hoặc có thêm "reason" cho unanswerable).
-    - Không chứa placeholder rác ("None", "null", "nan", "N/A", "").
-
-    Args:
-        q_id: Question ID.
-        answer: Normalized answer value.
-        q_type: Question type (optional, auto-inferred if None).
-        abstain_token: Token indicating an abstain response.
-        reason: Optional explanation string for unanswerable questions.
-
-    Returns:
-        Dictionary {'id': ..., 'type': ..., 'answer': ...} (không chứa alias).
-    """
-    is_abstain = False
-    if answer is None:
-        is_abstain = True
-    elif isinstance(answer, str) and answer.strip().lower() in (abstain_token.lower(), "abstain"):
-        is_abstain = True
-    elif q_type == "abstain":
-        is_abstain = True
-
-    is_unans = False
-    if isinstance(answer, str) and answer == "unanswerable":
-        is_unans = True
-    elif q_type == "unanswerable":
-        is_unans = True
-
-    if is_abstain:
-        return {
-            "id": str(q_id),
-            "type": "abstain",
-        }
-    elif is_unans:
+    """Return a valid typed record, or ``{id, type: abstain}`` on invalid input."""
+    record_id = str(q_id)
+    abstain = {"id": record_id, "type": "abstain"}
+    if isinstance(answer, dict) and answer.get("type") == "unanswerable":
+        reason = answer.get("reason", reason)
+        answer = None
         q_type = "unanswerable"
-        answer = "unanswerable"
-    elif q_type is None:
+    if q_type == "abstain":
+        return abstain
+    if q_type == "unanswerable" or (isinstance(answer, str) and answer.strip().casefold() == "unanswerable"):
+        valid_marker = answer is None or (isinstance(answer, str) and answer.strip().casefold() == "unanswerable")
+        if not isinstance(reason, str) or not reason.strip() or not valid_marker:
+            return abstain
+        return {"id": record_id, "type": "unanswerable", "reason": format_string(reason)}
+    if answer is None or (
+        isinstance(answer, str) and answer.strip().casefold() in {abstain_token.casefold(), "abstain"}
+    ):
+        return abstain
+
+    if q_type is None:
         if isinstance(answer, bool):
             q_type = "boolean"
-        elif isinstance(answer, (int, float)):
+        elif isinstance(answer, (int, float, Decimal)):
             q_type = "number"
         elif isinstance(answer, (list, tuple)):
             q_type = "list"
@@ -736,23 +647,32 @@ def format_submission_record(
             q_type = "table"
         else:
             q_type = "string"
-
-    # Enforce table formatting if type is table
-    if q_type == "table" and not is_abstain and not is_unans:
-        answer = format_table(answer)
-
-    record: Dict[str, Any] = {
-        "id": str(q_id),
-        "type": str(q_type),
-        "answer": answer,
-    }
-
-    if reason is not None and (q_type == "unanswerable" or answer == "unanswerable"):
-        record["reason"] = str(reason)
-
-    # Strictly omit alias field
-    record.pop("alias", None)
-    return record
+    try:
+        if q_type == "number":
+            normalized = format_number(answer)
+        elif q_type == "percent":
+            normalized = format_percent(answer)
+        elif q_type == "string":
+            if not isinstance(answer, str):
+                return abstain
+            normalized = format_string(answer)
+            if not normalized or normalized.casefold() in {"nan", "none", "null", "inf", "infinity"}:
+                return abstain
+        elif q_type == "date":
+            normalized = format_date(answer)
+        elif q_type == "boolean":
+            normalized = format_boolean(answer)
+        elif q_type == "list":
+            normalized = format_list(answer)
+        elif q_type == "table":
+            normalized = format_table(answer)
+        else:
+            return abstain
+        record = {"id": record_id, "type": q_type, "answer": normalized}
+        json.dumps(record, ensure_ascii=False, allow_nan=False)
+        return record
+    except (ValueError, TypeError, OverflowError, InvalidOperation):
+        return abstain
 
 
 def format_submission_json(
@@ -770,7 +690,7 @@ def format_submission_json(
         abstain_token=abstain_token,
         reason=reason,
     )
-    return json.dumps(record, ensure_ascii=False)
+    return json.dumps(record, ensure_ascii=False, allow_nan=False)
 
 
 def append_submission_line(
@@ -778,6 +698,12 @@ def append_submission_line(
     record: Dict[str, Any],
 ) -> None:
     """Append a single JSON record to submission.jsonl file."""
+    if not isinstance(record, dict) or "id" not in record:
+        raise ValueError("Submission record needs an id")
+    safe_record = format_submission_record(
+        record["id"], record.get("answer"), q_type=record.get("type"),
+        reason=record.get("reason"),
+    )
     path = Path(output_file).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:

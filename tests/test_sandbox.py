@@ -195,8 +195,8 @@ print("Computed output: 999")
         # Verify the feedback message contained the required text
         self.assertEqual(len(mock_agent.captured_prompts), 1)
         retry_prompt = mock_agent.captured_prompts[0]
-        self.assertIn("Đoạn code trên bị lỗi: KeyError", retry_prompt)
-        self.assertIn("Hãy viết lại code sửa lỗi", retry_prompt)
+        self.assertIn("KeyError", retry_prompt)
+        self.assertIn("FAILED CODE", retry_prompt)
 
     def test_self_correction_max_3_retries_limit(self):
         """Test self-correction terminates after exactly max 3 retries if code keeps failing."""

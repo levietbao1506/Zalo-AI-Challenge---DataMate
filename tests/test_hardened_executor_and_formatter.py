@@ -3,6 +3,7 @@
 from datetime import date, datetime
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unicodedata
 import unittest
@@ -17,6 +18,13 @@ from src.executor import (
     execute_local,
     execute_subprocess,
     execute_with_retry,
+    fuzzy_match_name,
+    normalize_vietnamese,
+    parse_mixed_date,
+    parse_vnd_amount,
+    read_csv_safe,
+    read_excel_safe,
+    read_sqlite_safe,
 )
 from src.formatter import (
     DEFAULT_ABSTAIN_TOKEN,
@@ -48,6 +56,68 @@ class TestHardenedExecutor(unittest.TestCase):
 
     def tearDown(self):
         self.scratch_dir.cleanup()
+
+    def test_packaged_vietnamese_helpers(self):
+        self.assertEqual(normalize_vietnamese("Cà Phê Đá"), "ca phe da")
+        self.assertEqual(fuzzy_match_name("ca phe da", ["Cà Phê Đá", "Trà Sữa"]), "Cà Phê Đá")
+        self.assertEqual(parse_vnd_amount("1.500.000 đ"), 1500000)
+        self.assertEqual(parse_vnd_amount("1,500,000 VND"), 1500000)
+        self.assertEqual(parse_vnd_amount("500k"), 500000)
+        self.assertEqual(str(parse_mixed_date("31/12/2024")), "2024-12-31")
+        self.assertEqual(str(parse_mixed_date(45292)), "2024-01-01")
+
+    def test_packaged_readers(self):
+        csv_path = Path(self.data_dir) / "orders.csv"
+        csv_path.write_text(" Mã ; Số tiền \nA;1.500.000\n", encoding="utf-8-sig")
+        self.assertEqual(read_csv_safe(csv_path).columns.tolist(), ["Mã", "Số tiền"])
+        sqlite_path = Path(self.data_dir) / "sales.sqlite"
+        connection = sqlite3.connect(sqlite_path)
+        try:
+            connection.execute('CREATE TABLE sales (" Mã " TEXT)')
+            connection.execute('INSERT INTO sales VALUES ("A")')
+            connection.commit()
+        finally:
+            connection.close()
+        self.assertEqual(read_sqlite_safe(sqlite_path, "sales").columns.tolist(), ["Mã"])
+        excel_path = Path(self.data_dir) / "sales.xlsx"
+        with pd.ExcelWriter(excel_path) as writer:
+            pd.DataFrame({"Mã": ["A"], "Giá": [100]}).to_excel(writer, sheet_name="Dữ liệu", index=False)
+        self.assertEqual(read_excel_safe(excel_path, "Dữ liệu").columns.tolist(), ["Mã", "Giá"])
+
+    def test_subprocess_restricts_writes_and_bounds_stdout(self):
+        denied = execute_subprocess('open("../escape.txt", "w").write("x")', data_dir=self.data_dir)
+        self.assertFalse(denied.success)
+        self.assertIn("PermissionError", denied.stderr)
+        denied_read = execute_subprocess('open("../outside.txt").read()', data_dir=self.data_dir)
+        self.assertFalse(denied_read.success)
+        self.assertIn("PermissionError", denied_read.stderr)
+        bounded = execute_subprocess('print("A" * 12000)\nfinal_result = 5', data_dir=self.data_dir)
+        self.assertTrue(bounded.success, bounded.stderr)
+        self.assertEqual(bounded.return_value, 5)
+        self.assertLess(len(bounded.stdout), 9000)
+        self.assertIn("stdout truncated", bounded.stdout)
+
+    def test_unanswerable_preserves_reason(self):
+        code = 'print(FILE_MAP)\nreason = "Thiếu dữ liệu giá vốn"\nfinal_result = "unanswerable"'
+        result = execute_subprocess(code, data_dir=self.data_dir)
+        self.assertTrue(result.success, result.stderr)
+        self.assertEqual(result.return_value, {"type": "unanswerable", "reason": "Thiếu dữ liệu giá vốn"})
+
+    def test_time_context_uses_split_calendar_above_business_dir(self):
+        split_root = Path(self.data_dir)
+        business_dir = split_root / "data" / "shop"
+        business_dir.mkdir(parents=True)
+        calendar_path = split_root / "calendar.csv"
+        calendar_path.write_text("date,holiday\n2024-02-10,Tet Nguyen Dan\n", encoding="utf-8")
+        (split_root / "rulebook.md").write_text("Tuần bắt đầu Chủ nhật.", encoding="utf-8")
+        result = execute_subprocess(
+            'final_result = time_context(as_of_date, DATA_DIR)["week_start"]',
+            data_dir=str(business_dir),
+            file_map={"calendar.csv": str(calendar_path)},
+            as_of_date=date(2024, 2, 12),
+        )
+        self.assertTrue(result.success, result.stderr)
+        self.assertEqual(result.return_value, "sunday")
 
     def test_execute_subprocess_basic_success(self):
         """Subprocess execution should run clean code and return structured 4-tuple."""
@@ -224,9 +294,9 @@ class TestHardenedFormatter(unittest.TestCase):
         self.assertEqual(format_percent("+8.25%"), 8.25)
 
         # Ratio floats e.g. -0.1245 -> -12.45
-        self.assertEqual(format_percent(-0.1245), -12.45)
-        self.assertEqual(format_percent(0.0825), 8.25)
-        self.assertEqual(format_percent("-0.1245"), -12.45)
+        self.assertEqual(format_percent(-0.1245), -0.12)
+        self.assertEqual(format_percent(0.0825), 0.08)
+        self.assertEqual(format_percent("-0.1245"), -0.12)
 
         # Pre-multiplied percentage numbers
         self.assertEqual(format_percent(-12.45), -12.45)
@@ -239,7 +309,7 @@ class TestHardenedFormatter(unittest.TestCase):
 
         # Canonical output (for submission.jsonl): preserves casing, accents, removes wrapper quotes
         canonical = format_string(raw_product, clean_text=False)
-        self.assertEqual(canonical, "Cà Phê Sữa Đá (Đặc Biệt) - Size L")
+        self.assertEqual(canonical, '"Cà Phê Sữa Đá (Đặc Biệt) - Size L"')
         self.assertEqual(canonical, unicodedata.normalize("NFC", canonical))
 
         # Comparison helper (for evaluation matching): lowercase, replaces punctuation with spaces, collapses runs
@@ -255,15 +325,14 @@ class TestHardenedFormatter(unittest.TestCase):
 
         # Datetime
         dt_full = datetime(2024, 6, 1, 15, 30, 45)
-        self.assertEqual(format_date(dt_full), "2024-06-01 15:30:45")
+        self.assertEqual(format_date(dt_full), "2024-06-01")
         self.assertEqual(format_date(dt_full, as_month=True), "2024-06")
 
         # String dates
-        self.assertEqual(format_date("01/06/2024"), "2024-06-01")
-        self.assertEqual(format_date("01-06-2024"), "2024-06-01")
-        self.assertEqual(format_date("06/2024"), "2024-06")
-        self.assertEqual(format_date("tháng 6/2024"), "2024-06")
-        self.assertEqual(format_date("tháng 06 năm 2024"), "2024-06")
+        self.assertEqual(format_date("2024-06-01 00:00:00"), "2024-06-01")
+        self.assertEqual(format_date("2024-06"), "2024-06")
+        with self.assertRaises(ValueError):
+            format_date("01/06/2024")
 
     def test_boolean_formatting(self):
         """Boolean should be strict Python bool True/False (JSON true/false)."""
@@ -327,7 +396,7 @@ class TestHardenedFormatter(unittest.TestCase):
         """format_output should strictly dispatch based on q_type."""
         # percent
         self.assertEqual(format_output("-12.45%", success=True, q_type="percent"), -12.45)
-        self.assertEqual(format_output(-0.1245, success=True, q_type="percent"), -12.45)
+        self.assertEqual(format_output(-0.1245, success=True, q_type="percent"), -0.12)
 
         # number with VND
         self.assertEqual(format_output("15,000,000 VND", success=True, q_type="number"), 15000000)
@@ -336,7 +405,7 @@ class TestHardenedFormatter(unittest.TestCase):
         self.assertIs(format_output("đúng", success=True, q_type="boolean"), True)
 
         # date
-        self.assertEqual(format_output("15/08/2024", success=True, q_type="date"), "2024-08-15")
+        self.assertEqual(format_output("2024-08-15", success=True, q_type="date"), "2024-08-15")
 
         # table
         df = pd.DataFrame({"col": [1, 2]})
@@ -358,7 +427,7 @@ class TestHardenedFormatter(unittest.TestCase):
         )
         self.assertEqual(rec_unans["id"], "q_100")
         self.assertEqual(rec_unans["type"], "unanswerable")
-        self.assertEqual(rec_unans["answer"], "unanswerable")
+        self.assertNotIn("answer", rec_unans)
         self.assertEqual(rec_unans["reason"], "Thiếu thông tin chi nhánh trong câu hỏi")
         self.assertNotIn("alias", rec_unans)
 

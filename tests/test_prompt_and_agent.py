@@ -12,6 +12,8 @@ from src.agent import (
     verification_gate,
 )
 from src.executor import SandboxedExecutor
+from src import executor as executor_module
+from src.main import _format_chatml_prompt
 from src.prompt_builder import (
     FEW_SHOT_EXAMPLES,
     SYSTEM_PROMPT,
@@ -19,136 +21,89 @@ from src.prompt_builder import (
 )
 
 
-class TestPromptBuilder(unittest.TestCase):
-    """Test suite for System Prompt, Few-Shot examples, and User Prompt composition."""
+class TestPromptArchitecture(unittest.TestCase):
+    """Prompt architecture checks; no local model is loaded."""
 
     def setUp(self):
-        self.builder = PromptBuilder()
+        self.builder = PromptBuilder(rulebook_content="Doanh thu chỉ gồm đơn COMPLETED.")
 
-    def test_system_prompt_role_declaration(self):
-        """Ensure System Prompt contains the exact required role declaration."""
-        expected_role = (
-            "Bạn là một Data Analyst chuyên nghiệp. Hãy viết mã Python "
-            "(dùng thư viện pandas) để trả lời câu hỏi sau. Chỉ in ra code, không giải thích."
-        )
-        self.assertIn(expected_role, SYSTEM_PROMPT)
-        system_full = self.builder.build_system_prompt()
-        self.assertIn(expected_role, system_full)
+    def test_static_prefix_is_stable_and_ordered(self):
+        kw = dict(business_id="biz_1", readme_content="README của biz_1",
+                  schema_context="Table: orders.csv\n- status (string)")
+        first = self.builder.build_system_prompt(**kw)
+        self.assertIs(first, self.builder.build_system_prompt(**kw))
+        self.assertLess(first.index("RULEBOOK.MD (ACTIVE SPLIT)"), first.index("BUSINESS README.MD"))
+        self.assertLess(first.index("BUSINESS README.MD"), first.index("BUSINESS SCHEMA PROFILE"))
+        self.assertIn("Doanh thu chỉ gồm đơn COMPLETED", first)
+        self.assertIn("README của biz_1", first)
+        self.assertIn("Table: orders.csv", first)
+        self.assertNotIn("2025-08-04", first)
+        other = self.builder.build_system_prompt(**{**kw, "business_id": "biz_2", "readme_content": "README khác"})
+        self.assertNotEqual(first, other)
 
-    def test_user_prompt_concatenation(self):
-        """Ensure User Prompt connects Schema String + as_of_date + Vietnamese Question."""
-        schema_sample = "### Table: `sales.csv` (CSV)\n- Columns: `order_id`, `revenue`"
-        as_of_date = "2024-06-15"
-        question = "Tính tổng doanh số chi nhánh Đà Nẵng hôm qua?"
-        file_map = {"sales.csv": "/app/data/sales.csv"}
+    def test_dynamic_query_suffix_and_time_context(self):
+        one = self.builder.build_user_prompt("Doanh thu hôm qua?", schema_context="Table: orders.csv",
+                                             as_of_date="2024-06-19")
+        two = self.builder.build_user_prompt("Số đơn hôm qua?", as_of_date="2024-06-20")
+        self.assertNotEqual(one, two)
+        self.assertNotIn("Table: orders.csv", one)
+        self.assertNotIn("Doanh thu chỉ gồm đơn COMPLETED", one)
+        self.assertIn('"yesterday":"2024-06-18"', one)
+        self.assertIn("CÂU HỎI: Doanh thu hôm qua?", one)
+        self.assertLess(one.index("as_of_date"), one.index("TIME_CONTEXT_ISO"))
 
-        user_prompt = self.builder.build_user_prompt(
-            question=question,
-            schema_context=schema_sample,
-            as_of_date=as_of_date,
-            file_map=file_map,
-        )
+    def test_batch_chatml_keeps_common_prefix(self):
+        prefix = self.builder.build_system_prompt(
+            business_id="biz_1", readme_content="README", schema_context="Table: sales.csv")
+        queries = [self.builder.build_user_prompt(q, as_of_date="2024-06-19")
+                   for q in ("Doanh thu?", "Số đơn?")]
+        prompts = [_format_chatml_prompt(prefix, query) for query in queries]
+        common = f"<|im_start|>system\n{prefix}<|im_end|>\n<|im_start|>user\n"
+        self.assertTrue(all(prompt.startswith(common) for prompt in prompts))
+        self.assertNotEqual(prompts[0], prompts[1])
 
-        # 1. Contains Schema String
-        self.assertIn("THÔNG TIN CẤU TRÚC BẢNG VÀ DỮ LIỆU (SCHEMA STRING)", user_prompt)
-        self.assertIn(schema_sample, user_prompt)
+    def test_rules_and_output_contract(self):
+        for phrase in ("Code-first", "Rulebook fidelity", "Pha Inspect", "Pha Compute & Verify",
+                       "unanswerable", "abstain", "top-k", "tie-break", "-12.45", "FILE_MAP",
+                       "kh=khách hàng", "number, percent, string, date, boolean, list, table,"):
+            self.assertIn(phrase, SYSTEM_PROMPT)
+        self.assertIn('final_result = "unanswerable"', SYSTEM_PROMPT)
+        self.assertIn('final_result = "abstain"', SYSTEM_PROMPT)
+        self.assertIn('"columns":["Tên"]', SYSTEM_PROMPT)
+        self.assertEqual(FEW_SHOT_EXAMPLES, "")
 
-        # 2. Contains as_of_date
-        self.assertIn("Ngày tham chiếu (as_of_date): `2024-06-15`", user_prompt)
+    def test_retry_and_optional_verification(self):
+        retry = self.builder.build_retry_prompt("Đếm đơn?", "df['missing']", "KeyError: missing",
+                                                previous_user_prompt="TIME_CONTEXT_ISO: {}")
+        self.assertIn("KeyError: missing", retry)
+        self.assertIn("df['missing']", retry)
+        self.assertIn("TIME_CONTEXT_ISO: {}", retry)
+        self.assertIn("không lặp lại cùng code", retry)
+        self.assertIn("rỗng/NaN", self.builder.build_retry_prompt("Đếm đơn?", "final_result = None", ""))
+        self.assertIsNone(self.builder.build_verification_prompt("Đếm đơn?", 4))
+        enabled = PromptBuilder(enable_verification=True)
+        verify = enabled.build_verification_prompt("Đếm đơn?", 4, "2024-06-19")
+        self.assertIn("COMPUTED ANSWER: 4", verify)
+        self.assertIn("RULEBOOK.MD", verify)
+        self.assertIn("2024-06-19", verify)
 
-        # 3. Contains File Map
-        self.assertIn("`sales.csv`", user_prompt)
-
-        # 4. Contains Question
-        self.assertIn(f"\"{question}\"", user_prompt)
-
-        # 5. Core instruction
-        self.assertIn("Chỉ in ra code trong thẻ ```python ... ```, không giải thích.", user_prompt)
-
-    def test_user_prompt_defaults_without_as_of_date(self):
-        """Ensure User Prompt handles missing as_of_date and empty file_map gracefully."""
-        user_prompt = self.builder.build_user_prompt(
-            question="Số lượng khách hàng mới là bao nhiêu?",
-            schema_context="Table: users.csv",
-            as_of_date=None,
-        )
-        self.assertIn("Chưa chỉ định", user_prompt)
-        self.assertIn("Số lượng khách hàng mới là bao nhiêu?", user_prompt)
-
-    def test_few_shot_examples_content(self):
-        """Verify Few-Shot examples cover date filtering, unaccented search, Excel, and abstain."""
-        # Ví dụ 1: Filter ngày tháng với as_of_date
-        self.assertIn("Lọc dữ liệu thời gian tương đối dựa vào as_of_date", FEW_SHOT_EXAMPLES)
-        self.assertIn("calendar_utils.resolve_vietnamese_relative_date", FEW_SHOT_EXAMPLES)
-
-        # Ví dụ 2: Query từ khóa tiếng Việt không dấu
-        self.assertIn("Tìm kiếm từ khóa tiếng Việt không dấu", FEW_SHOT_EXAMPLES)
-        self.assertIn("remove_accents", FEW_SHOT_EXAMPLES)
-        self.assertIn("da nang", FEW_SHOT_EXAMPLES)
-
-        # Ví dụ 4: Excel với sheet
-        self.assertIn("Đọc file Excel nhiều sheets", FEW_SHOT_EXAMPLES)
-        self.assertIn("sheet_name=\"Orders\"", FEW_SHOT_EXAMPLES)
-
-        # Ví dụ 5: Penalized Accuracy safe abstain
-        self.assertIn("Trường hợp dữ liệu không tồn tại -> Abstain để tránh bị trừ điểm", FEW_SHOT_EXAMPLES)
-        self.assertIn("result = None", FEW_SHOT_EXAMPLES)
-
-    def test_chain_of_thought_and_unanswerable_prompts(self):
-        """Ensure SYSTEM_PROMPT and all FEW_SHOT_EXAMPLES enforce CoT and Unanswerable rules."""
-        import re
-
-        # 1. System Prompt CoT and Unanswerable requirements
-        self.assertIn(
-            "Trước khi viết code, bạn BẮT BUỘC phải viết 1-2 dòng comment bắt đầu bằng `# Phân tích: ` để giải thích ngắn gọn cách bạn sẽ lọc dữ liệu và tính toán.",
-            SYSTEM_PROMPT,
-        )
-        self.assertIn(
-            "Nếu lược đồ dữ liệu (schema) hoàn toàn không có bảng hoặc cột thông tin nào liên quan để trả lời câu hỏi, không được đoán mò. Hãy viết comment phân tích và gán `final_result = \"unanswerable\"`.",
-            SYSTEM_PROMPT,
-        )
-
-        # 2. Example 3 (Unanswerable) presence in FEW_SHOT_EXAMPLES
-        self.assertIn("cho biết tên nhân viên bán được nhiều hàng nhất", FEW_SHOT_EXAMPLES)
-        self.assertIn('final_result = "unanswerable"', FEW_SHOT_EXAMPLES)
-
-        # 3. Every python block in FEW_SHOT_EXAMPLES must start with "# Phân tích: "
-        code_blocks = re.findall(r"```python\n(.*?)```", FEW_SHOT_EXAMPLES, re.DOTALL)
-        self.assertGreaterEqual(len(code_blocks), 5)
-        for block in code_blocks:
-            self.assertTrue(
-                block.lstrip().startswith("# Phân tích: "),
-                f"Code block does not start with '# Phân tích: ':\n{block[:80]}",
+    def test_retry_builder_is_used_after_each_failure(self):
+        generated_prompts = []
+        def generate(prompt):
+            generated_prompts.append(prompt)
+            return "```python\nfinal_result = 3\n```"
+        feedback = lambda base, code, error: self.builder.build_retry_prompt(
+            "Đếm đơn?", code, error, previous_user_prompt=base)
+        with patch.object(executor_module, "execute_local", side_effect=[
+            (False, None, "KeyError: status"), (False, None, "ValueError: date"), (True, 3, "")
+        ]):
+            result = executor_module.execute_with_retry(
+                "CÂU HỎI: Đếm đơn?", generate, ".", max_retries=3,
+                retry_prompt_fn=feedback,
             )
-
-    def test_retry_prompt_formatting(self):
-        """Ensure retry prompt formats code and error traceback for self-correction."""
-        retry_prompt = self.builder.build_retry_prompt(
-            question="Đếm đơn hàng?",
-            previous_code="result = df['missing_col'].sum()",
-            error_traceback="KeyError: 'missing_col'",
-        )
-        self.assertIn("KeyError: 'missing_col'", retry_prompt)
-        self.assertIn("result = df['missing_col'].sum()", retry_prompt)
-        self.assertIn("Đếm đơn hàng?", retry_prompt)
-        self.assertIn("result = None", retry_prompt)
-
-    def test_critical_rules_and_error_prevention_prompts(self):
-        """Ensure SYSTEM_PROMPT contains CRITICAL RULES, strict output format, and error prevention."""
-        self.assertIn("CRITICAL RULES", SYSTEM_PROMPT)
-        self.assertIn("VI PHẠM BẤT KỲ QUY TẮC NÀO DƯỚI ĐÂY SẼ LÀM HỆ THỐNG CRASH", SYSTEM_PROMPT)
-        self.assertIn("TUYỆT ĐỐI CẤM", SYSTEM_PROMPT)
-        self.assertIn("TUYỆT ĐỐI KHÔNG tự bịa", SYSTEM_PROMPT)
-        self.assertIn(".fillna()", SYSTEM_PROMPT)
-        self.assertIn("df.empty", SYSTEM_PROMPT)
-        self.assertIn("final_result", SYSTEM_PROMPT)
-
-        user_prompt = self.builder.build_user_prompt(
-            question="Doanh thu?",
-            schema_context="Table: orders.csv",
-        )
-        self.assertIn("CRITICAL RULES", user_prompt)
-        self.assertIn("TRÁNH CRASH HỆ THỐNG", user_prompt)
+        self.assertTrue(result[0])
+        self.assertIn("KeyError: status", generated_prompts[1])
+        self.assertIn("ValueError: date", generated_prompts[2])
 
 
 class TestVLLMAgent(unittest.TestCase):
@@ -245,11 +200,12 @@ class TestVLLMAgent(unittest.TestCase):
         fake_sampling = MagicMock()
 
         with (
+            patch.dict("os.environ", {"TENSOR_PARALLEL_SIZE": ""}),
             patch("src.agent._HAS_VLLM", True),
             patch("src.agent.LLM", return_value=fake_llm_instance) as mock_llm_cls,
             patch("src.agent.SamplingParams", return_value=fake_sampling) as mock_sp_cls,
         ):
-            agent = CodeAgent("./models/Qwen3-14B")
+            agent = CodeAgent("./models/Qwen3-14B", tensor_parallel_size=1)
 
         self.assertEqual(agent.backend, "vllm")
         self.assertFalse(agent.dry_run)
@@ -262,7 +218,12 @@ class TestVLLMAgent(unittest.TestCase):
         self.assertEqual(call_kwargs["tensor_parallel_size"], 1)
         self.assertEqual(call_kwargs["max_model_len"], 4096)
         self.assertEqual(call_kwargs["gpu_memory_utilization"], 0.85)
+        self.assertEqual(call_kwargs["seed"], 42)
+        self.assertEqual(call_kwargs["max_num_seqs"], 8)
+        self.assertTrue(call_kwargs["enable_prefix_caching"])
         mock_sp_cls.assert_called_once()
+        self.assertEqual(mock_sp_cls.call_args.kwargs["top_p"], 1.0)
+        self.assertEqual(mock_sp_cls.call_args.kwargs["seed"], 42)
 
     def test_llama_cpp_gguf_initialization_and_generation(self):
         """Verify .gguf model_path initializes llama_cpp backend, generates code via chat completion, and batches sequentially."""
@@ -301,7 +262,7 @@ class TestVLLMAgent(unittest.TestCase):
 
         # Sequential batch generation
         self.assertEqual(agent.generate_code_batch([]), [])
-        with patch.object(agent, "generate_code", side_effect=["r0", "r1"]) as mock_gen:
+        with patch.object(agent, "generate_code", side_effect=["r0", "r1"]) as mock_gen, patch("builtins.print"):
             batch_out = agent.generate_code_batch(["p0", "p1"])
         self.assertEqual(batch_out, ["r0", "r1"])
         self.assertEqual(mock_gen.call_count, 2)
@@ -310,7 +271,8 @@ class TestVLLMAgent(unittest.TestCase):
 
         # Error handling returns ""
         mock_llama_instance.create_chat_completion.side_effect = Exception("CUDA error")
-        err_out = agent.generate_code("Error test")
+        with patch("builtins.print"):
+            err_out = agent.generate_code("Error test")
         self.assertEqual(err_out, "")
 
     def test_extract_thinking_helper(self):
@@ -321,13 +283,14 @@ class TestVLLMAgent(unittest.TestCase):
 
         # No thinking tags
         self.assertIsNone(extract_thinking("```python\nresult = 100\n```"))
+        self.assertEqual(extract_thinking("<think>  raw\nline  </think>"), "  raw\nline  ")
 
     def test_agent_verification_gate_pa_guard(self):
         """Verify agent's verification_gate guards against negative PA scores."""
         agent = CodeAgent(dry_run=True, abstain_threshold=0.6)
 
         # 1. Successful execution with valid answer
-        res_ok = agent.verify_prediction(execution_success=True, raw_result=150.0, q_type="number")
+        res_ok = agent.verify_prediction(execution_success=True, raw_result=150.0, q_type="number", code_str="final_result = 150.0")
         self.assertTrue(res_ok["passed"])
         self.assertEqual(res_ok["type"], "number")
         self.assertEqual(res_ok["answer"], 150.0)
@@ -338,6 +301,7 @@ class TestVLLMAgent(unittest.TestCase):
             raw_result=200,
             q_type="number",
             retry_results=[100, 200],
+            code_str="final_result = 200",
         )
         self.assertEqual(res_conflict["type"], "abstain")
         self.assertEqual(res_conflict["answer"], "abstain")

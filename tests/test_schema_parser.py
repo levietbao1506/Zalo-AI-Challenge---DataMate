@@ -320,5 +320,49 @@ class TestSchemaParser(unittest.TestCase):
         self.assertEqual(mtime_before, mtime_after)
 
 
+class TestRichProfiling(unittest.TestCase):
+    def test_full_csv_profile_and_delimiter(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "orders.csv"
+            with path.open("w", encoding="utf-8-sig") as handle:
+                handle.write("status;order_date;amount\n")
+                for i in range(35):
+                    handle.write(f"{'Đã hủy' if i == 34 else 'Hoàn thành'};{(i % 28) + 1:02d}/06/2024;1.500.000\n")
+                handle.write(";;\n")
+            schema = parse_csv_head(path)
+            self.assertEqual(schema.total_rows, 36)
+            self.assertEqual(schema.category_frequencies["status"], {"Hoàn thành": 34, "Đã hủy": 1})
+            self.assertAlmostEqual(schema.null_rates["status"], 1 / 36)
+            self.assertEqual(schema.raw_numeric_samples["amount"], ["1.500.000"])
+            self.assertIn("01/06/2024", schema.raw_date_samples["order_date"])
+            self.assertEqual(schema.date_ranges["order_date"], "2024-06-01 to 2024-06-28")
+
+    def test_excel_header_and_sqlite_keys(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = Path(root) / "data" / "biz_a"
+            folder.mkdir(parents=True)
+            workbook = folder / "book.xlsx"
+            with pd.ExcelWriter(workbook, engine="openpyxl") as writer:
+                pd.DataFrame([["Report title", None], [None, None], ["sku", "qty"], ["A", 2]]).to_excel(
+                    writer, sheet_name="Stocks", header=False, index=False)
+                pd.DataFrame({"code": ["X"]}).to_excel(writer, sheet_name="Other", index=False)
+            db = folder / "warehouse.sqlite"
+            with sqlite3.connect(db) as conn:
+                conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+                conn.execute("CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))")
+                conn.execute("INSERT INTO parent VALUES (1)")
+                conn.execute("INSERT INTO child VALUES (2, 1)")
+            conn.close()
+            context = SchemaParser(root).parse("biz_a")
+            stocks = next(t for t in context.tables if t.sheet_name == "Stocks")
+            self.assertEqual(stocks.header_row, 3)
+            self.assertEqual(stocks.columns, ["sku", "qty"])
+            self.assertIn("Other", [t.sheet_name for t in context.tables])
+            child = next(t for t in context.tables if t.name.endswith("-> child"))
+            self.assertEqual(child.primary_keys, ["id"])
+            self.assertEqual(child.foreign_keys, ["parent_id -> parent.id"])
+            self.assertEqual(child.total_rows, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
