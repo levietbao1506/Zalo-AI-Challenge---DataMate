@@ -14,6 +14,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 try:
@@ -31,39 +32,27 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Known Vietnamese Lunar New Year fallback dates (used only if calendar.csv and lunarcalendar are unavailable)
-VIETNAMESE_TET_SOLAR_MAP: dict[int, date] = {
-    2020: date(2020, 1, 25),
-    2021: date(2021, 2, 12),
-    2022: date(2022, 2, 1),
-    2023: date(2023, 1, 22),
-    2024: date(2024, 2, 10),
-    2025: date(2025, 1, 29),
-    2026: date(2026, 2, 17),
-    2027: date(2027, 2, 6),
-    2028: date(2028, 1, 26),
-    2029: date(2029, 2, 13),
-    2030: date(2030, 2, 3),
-}
-
 _GLOBAL_CALENDAR_PATH: Optional[str] = None
 _GLOBAL_CALENDAR_CACHE: Optional[Any] = None
 _GLOBAL_CALENDAR_MTIME: Optional[float] = None
+_GLOBAL_CALENDAR_LOADED_PATH: Optional[str] = None
 
 
 def set_calendar_csv_path(path: Optional[Union[str, Path]]) -> None:
     """Set global path to calendar.csv for dynamic runtime resolution."""
-    global _GLOBAL_CALENDAR_PATH, _GLOBAL_CALENDAR_CACHE, _GLOBAL_CALENDAR_MTIME
+    global _GLOBAL_CALENDAR_PATH, _GLOBAL_CALENDAR_CACHE, _GLOBAL_CALENDAR_MTIME, _GLOBAL_CALENDAR_LOADED_PATH
     if path:
         str_p = str(Path(path).resolve())
         if str_p != _GLOBAL_CALENDAR_PATH:
             _GLOBAL_CALENDAR_PATH = str_p
             _GLOBAL_CALENDAR_CACHE = None
             _GLOBAL_CALENDAR_MTIME = None
+            _GLOBAL_CALENDAR_LOADED_PATH = None
     else:
         _GLOBAL_CALENDAR_PATH = None
         _GLOBAL_CALENDAR_CACHE = None
         _GLOBAL_CALENDAR_MTIME = None
+        _GLOBAL_CALENDAR_LOADED_PATH = None
 
 
 def get_calendar_csv_path() -> Optional[Path]:
@@ -75,13 +64,8 @@ def get_calendar_csv_path() -> Optional[Path]:
     if env_p and Path(env_p).is_file():
         return Path(env_p)
 
-    data_dir = os.environ.get("DATA_DIR", "./data")
-    candidates = [
-        Path(data_dir) / "calendar.csv",
-        Path("/data/calendar.csv"),
-        Path("./data/calendar.csv"),
-        Path("calendar.csv"),
-    ]
+    data_dir = os.environ.get("DATA_DIR", "/data")
+    candidates = [Path(data_dir) / "calendar.csv"]
     for c in candidates:
         if c.is_file():
             return c.resolve()
@@ -93,7 +77,7 @@ def load_calendar(calendar_path: Optional[Union[str, Path]] = None) -> Optional[
 
     Standardizes solar dates, lunar dates, and holiday indicators.
     """
-    global _GLOBAL_CALENDAR_CACHE, _GLOBAL_CALENDAR_MTIME
+    global _GLOBAL_CALENDAR_CACHE, _GLOBAL_CALENDAR_MTIME, _GLOBAL_CALENDAR_LOADED_PATH
     if not _HAS_PANDAS:
         return None
 
@@ -103,12 +87,16 @@ def load_calendar(calendar_path: Optional[Union[str, Path]] = None) -> Optional[
 
     try:
         mtime = target_path.stat().st_mtime
-        if _GLOBAL_CALENDAR_CACHE is not None and _GLOBAL_CALENDAR_MTIME == mtime:
+        if (_GLOBAL_CALENDAR_CACHE is not None and _GLOBAL_CALENDAR_MTIME == mtime
+                and _GLOBAL_CALENDAR_LOADED_PATH == str(target_path)):
             return _GLOBAL_CALENDAR_CACHE
 
-        for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        for enc in ("utf-8-sig", "utf-8", "cp1258", "latin1"):
             try:
-                df = pd.read_csv(target_path, encoding=enc)
+                with target_path.open("r", encoding=enc) as handle:
+                    first_line = handle.readline()
+                delimiter = max((",", ";", "\t"), key=first_line.count)
+                df = pd.read_csv(target_path, encoding=enc, sep=delimiter)
                 break
             except Exception:
                 continue
@@ -131,7 +119,8 @@ def load_calendar(calendar_path: Optional[Union[str, Path]] = None) -> Optional[
         if not solar_col:
             return None
 
-        df["_solar_date"] = pd.to_datetime(df[solar_col], errors="coerce").dt.date
+        day_first = df[solar_col].astype(str).str.match(r"^\d{1,2}/\d{1,2}/\d{4}").mean() > 0.5
+        df["_solar_date"] = pd.to_datetime(df[solar_col], errors="coerce", dayfirst=day_first).dt.date
         df = df.dropna(subset=["_solar_date"]).copy()
 
         # Identify lunar date column
@@ -187,6 +176,7 @@ def load_calendar(calendar_path: Optional[Union[str, Path]] = None) -> Optional[
 
         _GLOBAL_CALENDAR_CACHE = df
         _GLOBAL_CALENDAR_MTIME = mtime
+        _GLOBAL_CALENDAR_LOADED_PATH = str(target_path)
         return df
     except Exception as e:
         logger.warning(f"Error dynamically loading calendar from {target_path}: {e}")
@@ -427,20 +417,15 @@ def get_tet_date(
         except Exception:
             pass
 
-    # 4. Fallback map
-    return VIETNAMESE_TET_SOLAR_MAP.get(year)
+    return None
 
 
 def get_tet_window(
     year: Optional[int] = None,
     as_of: Optional[Union[str, date, datetime]] = None,
     calendar_path: Optional[Union[str, Path]] = None,
-) -> Tuple[date, date]:
-    """Compute the Tết holiday window (start_date, end_date inclusive).
-
-    Dynamically extracts Tết dates from calendar.csv if available; otherwise computes
-    the standard holiday period (from 29 tháng Chạp to Mùng 5 Tết).
-    """
+) -> Optional[Tuple[date, date]]:
+    """Return the split calendar's Tết window, or None when it is undefined."""
     ref_date = resolve_as_of_date(as_of)
     target_year = year if year is not None else ref_date.year
 
@@ -457,14 +442,7 @@ def get_tet_window(
             return matching["_solar_date"].min(), matching["_solar_date"].max()
 
     # 2. Derive window from Tết Mùng 1 (29 tháng Chạp -> Mùng 5 Tết)
-    tet_mung_1 = get_tet_date(target_year, calendar_path=calendar_path)
-    if tet_mung_1:
-        start_tet = tet_mung_1 - timedelta(days=2)
-        end_tet = tet_mung_1 + timedelta(days=5)
-        return start_tet, end_tet
-
-    # 3. Fallback
-    return date(target_year, 1, 25), date(target_year, 2, 5)
+    return None
 
 
 def get_holiday_range(
@@ -494,6 +472,102 @@ def get_holiday_range(
     if not matching.empty:
         return matching["_solar_date"].min(), matching["_solar_date"].max()
     return None
+
+
+def load_rulebook(data_dir: Optional[Union[str, Path]] = None) -> str:
+    """Read only the active split's rulebook; never search another split."""
+    root = Path(data_dir or os.environ.get("DATA_DIR", "/data"))
+    path = root / "rulebook.md"
+    return path.read_text(encoding="utf-8-sig") if path.is_file() else ""
+
+
+def _plain(text: str) -> str:
+    text = unicodedata.normalize("NFD", text.lower().replace("đ", "d"))
+    return "".join(ch for ch in text if not unicodedata.combining(ch))
+
+
+def resolve_time_context(
+    as_of_date: Union[str, date, datetime],
+    calendar_df: Optional[Any] = None,
+    rulebook_text: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return ISO date anchors from the active split for prompts or generated code.
+
+    Holiday windows are absent when the split calendar does not define them.
+    No revenue rule is interpreted here; the original rulebook remains available
+    to callers for business calculations.
+    """
+    if isinstance(as_of_date, str):
+        anchor = date.fromisoformat(as_of_date)
+    elif isinstance(as_of_date, datetime):
+        anchor = as_of_date.date()
+    elif isinstance(as_of_date, date):
+        anchor = as_of_date
+    else:
+        raise ValueError("as_of_date must be an ISO date or date object")
+    rb = rulebook_text if rulebook_text is not None else load_rulebook()
+    week_rule = _plain(rb)
+    sunday_start = bool(re.search(
+        r"(?:tuan|week).{0,100}(?:chu nhat|sunday).{0,35}(?:thu bay|saturday)|"
+        r"(?:chu nhat|sunday).{0,35}(?:thu bay|saturday).{0,100}(?:tuan|week)|"
+        r"(?:tuan|week).{0,40}(?:bat dau|start).{0,20}(?:chu nhat|sunday)",
+        week_rule, re.DOTALL,
+    ))
+
+    def span(start: date, end: date) -> Dict[str, str]:
+        return {"start": start.isoformat(), "end": end.isoformat()}
+
+    week_offset = (anchor.weekday() + (1 if sunday_start else 0)) % 7
+    week_start = anchor - timedelta(days=week_offset)
+    month_start = anchor.replace(day=1)
+    prev_month_end = month_start - timedelta(days=1)
+    quarter_start = date(anchor.year, ((anchor.month - 1) // 3) * 3 + 1, 1)
+    prev_quarter_end = quarter_start - timedelta(days=1)
+    prev_quarter_start = date(prev_quarter_end.year, ((prev_quarter_end.month - 1) // 3) * 3 + 1, 1)
+    prior_mtd_end = date(anchor.year - 1, anchor.month, min(anchor.day, calendar.monthrange(anchor.year - 1, anchor.month)[1]))
+    prior_month_start = date(anchor.year - 1, anchor.month, 1)
+    prior_month_end = date(anchor.year - 1, anchor.month, calendar.monthrange(anchor.year - 1, anchor.month)[1])
+    context: Dict[str, Any] = {
+        "as_of_date": anchor.isoformat(),
+        "weekday": anchor.strftime("%A"),
+        "yesterday": (anchor - timedelta(days=1)).isoformat(),
+        "week_start": "sunday" if sunday_start else "monday",
+        "this_week": span(week_start, week_start + timedelta(days=6)),
+        "last_week": span(week_start - timedelta(days=7), week_start - timedelta(days=1)),
+        "this_month": span(month_start, anchor),
+        "last_month": span(prev_month_end.replace(day=1), prev_month_end),
+        "same_month_last_year_mtd": span(prior_month_start, prior_mtd_end),
+        "same_month_last_year_full": span(prior_month_start, prior_month_end),
+        "this_quarter": span(quarter_start, anchor),
+        "last_quarter": span(prev_quarter_start, prev_quarter_end),
+        "this_year": span(date(anchor.year, 1, 1), anchor),
+        "last_year": span(date(anchor.year - 1, 1, 1), date(anchor.year - 1, 12, 31)),
+        "lunar_windows": {},
+    }
+
+    df = calendar_df if calendar_df is not None else load_calendar()
+    if df is not None and _HAS_PANDAS and not df.empty:
+        date_col = "_solar_date" if "_solar_date" in df else next(
+            (c for c in ("date", "solar_date", "duong_lich", "ngay_duong") if c in df), None
+        )
+        event_col = "_event" if "_event" in df else next(
+            (c for c in ("holiday", "holiday_name", "event", "su_kien", "ten_le", "ghi_chu") if c in df), None
+        )
+        if date_col and event_col:
+            day_first = df[date_col].astype(str).str.match(r"^\d{1,2}/\d{1,2}/\d{4}").mean() > 0.5
+            dates = pd.to_datetime(df[date_col], errors="coerce", dayfirst=day_first).dt.date
+            events = df[event_col].fillna("").astype(str).map(_plain)
+            for year in (anchor.year, anchor.year - 1):
+                yearly: Dict[str, Dict[str, str]] = {}
+                for name, pattern in (("tet_nguyen_dan", r"\btet\b|tet nguyen dan"),
+                                      ("trung_thu", r"trung thu|mid.?autumn")):
+                    selected = dates[(dates.map(lambda d: d is not None and not pd.isna(d) and d.year == year))
+                                     & events.str.contains(pattern, regex=True)]
+                    if not selected.empty:
+                        yearly[name] = span(selected.min(), selected.max())
+                if yearly:
+                    context["lunar_windows"][str(year)] = yearly
+    return context
 
 
 def resolve_vietnamese_relative_date(

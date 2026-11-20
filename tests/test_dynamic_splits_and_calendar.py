@@ -158,10 +158,8 @@ class TestDynamicSplitsAndCalendar(unittest.TestCase):
         self.assertEqual(shifted_e, date(2023, 3, 15))
 
         # 'Tết'
-        tet_s, tet_e = calendar_utils.resolve_vietnamese_relative_date("dịp Tết", as_of=as_of)
-        self.assertIsInstance(tet_s, date)
-        self.assertIsInstance(tet_e, date)
-        self.assertLess(tet_s, tet_e)
+        # Without the active split's calendar, no holiday window is invented.
+        self.assertIsNone(calendar_utils.resolve_vietnamese_relative_date("dịp Tết", as_of=as_of))
 
     def test_live_rulebook_injection_and_unanswerable_instruction(self):
         """Verify prompt builder injects live rulebook.md and instructs unanswerable when columns are missing."""
@@ -194,6 +192,46 @@ class TestDynamicSplitsAndCalendar(unittest.TestCase):
         self.assertIn("### QUY TẮC TẬP DỮ LIỆU HIỆN TẠI (RULEBOOK.MD):", user_prompt)
         self.assertIn("KIỂM TRA sự tồn tại của cột/bảng trước khi tính toán", user_prompt)
         self.assertIn("final_result = \"unanswerable\"", user_prompt)
+
+
+class TestTimeContext(unittest.TestCase):
+    def test_split_files_and_cache_isolation(self):
+        with tempfile.TemporaryDirectory() as root:
+            a, b = Path(root) / "a", Path(root) / "b"
+            a.mkdir(); b.mkdir()
+            (a / "rulebook.md").write_text("Tuần bắt đầu từ Chủ Nhật.", encoding="utf-8")
+            (b / "rulebook.md").write_text("Tuần bắt đầu từ thứ Hai.", encoding="utf-8")
+            (a / "calendar.csv").write_text("date,holiday\n2024-02-10,Tết\n", encoding="utf-8")
+            (b / "calendar.csv").write_text("date,holiday\n2024-02-11,Tết\n", encoding="utf-8")
+            self.assertIn("Chủ Nhật", calendar_utils.load_rulebook(a))
+            self.assertIn("thứ Hai", calendar_utils.load_rulebook(b))
+            self.assertEqual(calendar_utils.load_calendar(a / "calendar.csv")["_solar_date"].iloc[0], date(2024, 2, 10))
+            self.assertEqual(calendar_utils.load_calendar(b / "calendar.csv")["_solar_date"].iloc[0], date(2024, 2, 11))
+
+    def test_rulebook_week_and_year_boundaries(self):
+        calendar_df = pd.DataFrame({
+            "date": ["2024-02-09", "2024-02-10", "2023-01-21", "2023-01-22", "2024-09-17"],
+            "holiday": ["Nghỉ Tết", "Tết Nguyên Đán", "Nghỉ Tết", "Tết Nguyên Đán", "Trung Thu"],
+        })
+        context = calendar_utils.resolve_time_context(
+            "2024-06-19", calendar_df,
+            "Tuần tính từ Chủ Nhật đến thứ Bảy. Doanh thu chỉ tính đơn hoàn thành.",
+        )
+        self.assertEqual(context["this_week"], {"start": "2024-06-16", "end": "2024-06-22"})
+        self.assertEqual(context["this_month"], {"start": "2024-06-01", "end": "2024-06-19"})
+        self.assertEqual(context["same_month_last_year_mtd"]["end"], "2023-06-19")
+        self.assertEqual(context["this_year"]["end"], "2024-06-19")
+        self.assertEqual(context["lunar_windows"]["2024"]["tet_nguyen_dan"],
+                         {"start": "2024-02-09", "end": "2024-02-10"})
+        self.assertEqual(context["lunar_windows"]["2024"]["trung_thu"]["start"], "2024-09-17")
+        self.assertEqual(context["lunar_windows"]["2023"]["tet_nguyen_dan"]["end"], "2023-01-22")
+        self.assertNotIn("revenue", context)
+
+    def test_no_calendar_does_not_invent_holidays(self):
+        context = calendar_utils.resolve_time_context("2024-02-29", pd.DataFrame(), "")
+        self.assertEqual(context["week_start"], "monday")
+        self.assertEqual(context["same_month_last_year_mtd"]["end"], "2023-02-28")
+        self.assertEqual(context["lunar_windows"], {})
 
 
 if __name__ == "__main__":
