@@ -162,36 +162,23 @@ class TestDynamicSplitsAndCalendar(unittest.TestCase):
         self.assertIsNone(calendar_utils.resolve_vietnamese_relative_date("dịp Tết", as_of=as_of))
 
     def test_live_rulebook_injection_and_unanswerable_instruction(self):
-        """Verify prompt builder injects live rulebook.md and instructs unanswerable when columns are missing."""
-        rulebook_file = self.base_dir / "rulebook.md"
-        rulebook_text = (
-            "### QUY TẮC TÍNH TOÁN:\n"
-            "- Doanh thu chỉ tính các đơn hàng có trạng thái 'COMPLETED'.\n"
-            "- Tuần tính từ Chủ Nhật đến thứ Bảy.\n"
-            "- Lợi nhuận = Doanh thu - Giá vốn (cost)."
+        rulebook = "Doanh thu chỉ tính đơn COMPLETED. Tuần từ Chủ Nhật đến thứ Bảy."
+        (self.base_dir / "rulebook.md").write_text(rulebook, encoding="utf-8")
+        loaded = read_rulebook(self.base_dir)
+        self.assertEqual(loaded, rulebook)
+        builder = PromptBuilder(rulebook_content=loaded)
+        system = builder.build_system_prompt(
+            readme_content="README của doanh nghiệp",
+            schema_context="Table: sales.csv\n- revenue (float64)",
+            business_id="biz_a",
         )
-        rulebook_file.write_text(rulebook_text, encoding="utf-8")
-
-        # 1. read_rulebook helper
-        loaded_rb = read_rulebook(self.base_dir)
-        self.assertEqual(loaded_rb, rulebook_text)
-
-        # 2. System prompt injection
-        builder = PromptBuilder(rulebook_content=loaded_rb)
-        sys_prompt = builder.build_system_prompt()
-        self.assertIn("=== QUY TẮC BỔ SUNG TỪ RULEBOOK (RULEBOOK.MD) ===", sys_prompt)
-        self.assertIn("Doanh thu chỉ tính các đơn hàng có trạng thái 'COMPLETED'", sys_prompt)
-        self.assertIn("TUÂN THỦ QUY TẮC TỪ RULEBOOK ĐỘNG", sys_prompt)
-
-        # 3. User prompt unanswerable rule
-        user_prompt = builder.build_user_prompt(
-            question="Tính tổng lợi nhuận của sản phẩm sữa tươi?",
-            schema_context="Table: sales.csv\n- product_name (string)\n- revenue (float64)",
-            as_of_date="2024-06-01",
-        )
-        self.assertIn("### QUY TẮC TẬP DỮ LIỆU HIỆN TẠI (RULEBOOK.MD):", user_prompt)
-        self.assertIn("KIỂM TRA sự tồn tại của cột/bảng trước khi tính toán", user_prompt)
-        self.assertIn("final_result = \"unanswerable\"", user_prompt)
+        self.assertIn("=== RULEBOOK.MD (ACTIVE SPLIT) ===", system)
+        self.assertIn(rulebook, system)
+        self.assertIn('final_result = "unanswerable"', system)
+        user = builder.build_user_prompt("Tính lợi nhuận?", as_of_date="2024-06-01")
+        self.assertNotIn(rulebook, user)
+        self.assertNotIn("Table: sales.csv", user)
+        self.assertIn("Tính lợi nhuận?", user)
 
 
 class TestTimeContext(unittest.TestCase):

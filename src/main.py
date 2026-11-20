@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
-from functools import partial
 import json
 import logging
 import os
@@ -223,11 +222,13 @@ def process_single_question(
     # 1. Compose user prompt
     user_prompt = prompt_builder.build_user_prompt(
         question=question_text,
-        schema_context=active_schema_str,
         as_of_date=q_as_of,
-        file_map=safe_file_map,
     )
-    system_prompt = prompt_builder.build_system_prompt()
+    system_prompt = prompt_builder.build_system_prompt(
+        readme_content=active_context.readme_content or "",
+        schema_context=active_context.to_enriched_schema_string(),
+        business_id=active_context.business_id,
+    )
 
     # 2. Agent generates code
     code = agent.generate_code(user_prompt, system_prompt=system_prompt)
@@ -378,18 +379,23 @@ def iter_process_batch_chunk(
         )
         user_prompt = prompt_builder.build_user_prompt(
             question=question_text,
-            schema_context=active_schema_str,
             as_of_date=q_as_of,
-            file_map=safe_file_map,
         )
-        batch_prompts.append(_format_chatml_prompt(system_prompt, user_prompt))
+        active_system_prompt = prompt_builder.build_system_prompt(
+            readme_content=active_context.readme_content or "",
+            schema_context=active_context.to_enriched_schema_string(),
+            business_id=active_context.business_id,
+        )
+        batch_prompts.append(_format_chatml_prompt(active_system_prompt, user_prompt))
         batch_meta.append({
             "q_id": q_id,
+            "question": question_text,
             "q_type": q_data.get("type"),
             "data_dir": active_context.data_dir,
             "file_map": safe_file_map,
             "as_of_date": q_as_of,
             "user_prompt": user_prompt,
+            "system_prompt": active_system_prompt,
             "q_start": time.perf_counter(),
         })
 
@@ -403,7 +409,6 @@ def iter_process_batch_chunk(
     if len(batch_responses) < len(batch_meta):
         batch_responses = list(batch_responses) + [""] * (len(batch_meta) - len(batch_responses))
 
-    single_generate_fn = partial(agent.generate_code, system_prompt=system_prompt)
     retry_budget = max(0, max_retries - 1)
 
     # Step C: Execute each initial completion, falling back to sequential retry only on failure
@@ -442,23 +447,17 @@ def iter_process_batch_chunk(
             if success and not executor.is_empty_result(raw_result):
                 final_success, final_result = True, raw_result
             elif retry_budget > 0:
-                if not success:
-                    failed_block = f"```python\n{code_str}\n```" if code_str else "```python\n# (No code extracted)\n```"
-                    retry_initial_prompt = (
-                        f"{meta['user_prompt']}\n\n"
-                        f"**FAILED CODE:**\n{failed_block}\n\n"
-                        f"**EXACT ERROR:**\n```\n{error_msg}\n```\n"
-                        f"Đoạn code trên bị lỗi: {error_msg}. Hãy viết lại code sửa lỗi.\n"
-                        f"{executor.RETRY_STRICT_INSTRUCTION}"
-                    )
-                else:
-                    failed_code = f"```python\n{code_str}\n```\n" if code_str else ""
-                    retry_initial_prompt = f"{meta['user_prompt']}\n{failed_code}{EMPTY_RESULT_FEEDBACK}"
+                retry_initial_prompt = prompt_builder.build_retry_prompt(
+                    question=meta["question"],
+                    previous_code=code_str,
+                    error_traceback=error_msg if not success else EMPTY_RESULT_FEEDBACK,
+                    previous_user_prompt=meta["user_prompt"],
+                )
 
                 def retry_gen_wrapper(p: str) -> str:
                     nonlocal llm_call_count
                     llm_call_count += 1
-                    resp = single_generate_fn(p)
+                    resp = agent.generate_code(p, system_prompt=meta["system_prompt"])
                     th = getattr(agent, "last_thinking", None) or extract_thinking(resp)
                     if th:
                         thinkings.append(th)
@@ -482,6 +481,12 @@ def iter_process_batch_chunk(
                     timeout_seconds=timeout,
                     base_prompt=meta["user_prompt"],
                     on_attempt=handle_retry_attempt,
+                    retry_prompt_fn=lambda _base, failed_code, feedback: prompt_builder.build_retry_prompt(
+                        question=meta["question"],
+                        previous_code=failed_code,
+                        error_traceback=feedback,
+                        previous_user_prompt=meta["user_prompt"],
+                    ),
                 )
             else:
                 final_success, final_result = False, None
@@ -662,7 +667,11 @@ def main() -> None:
 
     # Step 2: Initialize Agent and Prompt Builder
     prompt_builder = PromptBuilder(rulebook_content=rulebook_content)
-    system_prompt = prompt_builder.build_system_prompt()
+    system_prompt = prompt_builder.build_system_prompt(
+        readme_content=context.readme_content or "",
+        schema_context=context.to_enriched_schema_string(),
+        business_id=context.business_id,
+    )
 
     agent = CodeAgent(model_path, dry_run=args.dry_run, tensor_parallel_size=args.tensor_parallel_size)
 

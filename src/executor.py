@@ -575,6 +575,7 @@ def execute_with_retry(
     base_prompt: Optional[str] = None,
     on_attempt: Optional[Callable[[str, bool, Any, str], None]] = None,
     use_subprocess: bool = False,
+    retry_prompt_fn: Optional[Callable[[str, str, str], str]] = None,
 ) -> tuple[bool, Any, str]:
     """Run LLM code generation and local sandbox execution with a self-correction retry loop.
 
@@ -636,8 +637,12 @@ def execute_with_retry(
 
         if success:
             error_msg = EMPTY_RESULT_FEEDBACK
-            current_prompt += f"\n{EMPTY_RESULT_FEEDBACK}"
+            current_prompt = (retry_prompt_fn(base_schema_question, code_str, error_msg)
+                              if retry_prompt_fn else current_prompt + f"\n{EMPTY_RESULT_FEEDBACK}")
         else:
+            if retry_prompt_fn:
+                current_prompt = retry_prompt_fn(base_schema_question, code_str, error_msg)
+                continue
             failed_block = f"```python\n{code_str}\n```" if code_str else "```python\n# (No code extracted)\n```"
             feedback_line = f"\nĐoạn code trên bị lỗi: {error_msg}. Hãy viết lại code sửa lỗi."
             strict_line = f"\n{RETRY_STRICT_INSTRUCTION}"
