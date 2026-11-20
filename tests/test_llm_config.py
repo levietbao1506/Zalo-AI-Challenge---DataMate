@@ -41,6 +41,9 @@ class TestLLMConfigAndManifest(unittest.TestCase):
         self.assertTrue(cfg.local_files_only)
         self.assertTrue(cfg.trust_remote_code)
         self.assertFalse(cfg.enable_thinking)
+        self.assertEqual(cfg.max_num_seqs, 8)
+        self.assertTrue(cfg.enable_prefix_caching)
+        self.assertTrue(cfg.to_engine_kwargs()["enable_prefix_caching"])
 
     def test_sampling_params_thinking_vs_non_thinking(self):
         """Verify sampling parameters for enable_thinking=True vs enable_thinking=False."""
@@ -53,16 +56,16 @@ class TestLLMConfigAndManifest(unittest.TestCase):
         )
         self.assertEqual(temp, 0.0)
 
-        # Thinking mode: exploratory reasoning
+        # Thinking mode remains greedy for reproducibility.
         thinking_params = get_sampling_params(enable_thinking=True)
         if hasattr(thinking_params, "temperature"):
-            self.assertEqual(thinking_params.temperature, 0.6)
-            self.assertEqual(thinking_params.top_p, 0.95)
-            self.assertEqual(thinking_params.top_k, 20)
+            self.assertEqual(thinking_params.temperature, 0.0)
+            self.assertEqual(thinking_params.top_p, 1.0)
+            self.assertEqual(thinking_params.top_k, -1)
         else:
-            self.assertEqual(thinking_params["temperature"], 0.6)
-            self.assertEqual(thinking_params["top_p"], 0.95)
-            self.assertEqual(thinking_params["top_k"], 20)
+            self.assertEqual(thinking_params["temperature"], 0.0)
+            self.assertEqual(thinking_params["top_p"], 1.0)
+            self.assertEqual(thinking_params["top_k"], -1)
 
     def test_qwen3_offline_engine_dry_run_and_env(self):
         """Verify engine initialization sets offline env and supports dry-run inference."""

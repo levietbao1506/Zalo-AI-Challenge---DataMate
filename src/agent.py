@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple, Union
+from src.llm_config import DEFAULT_MAX_NUM_SEQS, DEFAULT_SEED
 
 logger = logging.getLogger(__name__)
 
@@ -126,11 +127,16 @@ def load_vllm_engine(
         max_model_len=max_model_len,
         trust_remote_code=trust_remote_code,
         enforce_eager=False,
+        seed=DEFAULT_SEED,
+        max_num_seqs=int(os.environ.get("VLLM_MAX_NUM_SEQS", DEFAULT_MAX_NUM_SEQS)),
+        enable_prefix_caching=True,
     )
 
     # Greedy decoding for reproducible, deterministic code generation
     sampling_params = SamplingParams(
         temperature=temperature,
+        top_p=1.0,
+        seed=DEFAULT_SEED,
         max_tokens=max_tokens,
         stop=DEFAULT_STOP_TOKENS,
     )

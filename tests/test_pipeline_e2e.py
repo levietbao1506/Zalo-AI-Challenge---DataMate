@@ -20,6 +20,7 @@ from src.main import (
     parse_arguments,
     process_batch_chunk,
     process_single_question,
+    sort_questions_by_business,
 )
 from src.agent import VLLMAgent
 from src.executor import SandboxedExecutor
@@ -34,6 +35,35 @@ class TestPipelineE2E(unittest.TestCase):
         self.sample_data_dir = Path("./data/sample_dataset").resolve()
         self.questions_file = self.sample_data_dir / "questions.jsonl"
         self.ground_truth_file = self.sample_data_dir / "ground_truth.jsonl"
+
+    def test_business_grouping_is_stable_and_preserves_ids(self):
+        questions = [
+            {"id": "b1", "business_id": "b"}, {"id": "a1", "business_id": "a"},
+            {"id": "b2", "business_id": "b"}, {"id": "a2", "business_id": "a"},
+        ]
+        self.assertEqual([q["id"] for q in sort_questions_by_business(questions)], ["a1", "a2", "b1", "b2"])
+        self.assertEqual([q["id"] for q in questions], ["b1", "a1", "b2", "a2"])
+
+    def test_soft_timeout_skips_retries(self):
+        parser = SchemaParser(self.sample_data_dir)
+        context = parser.parse()
+        retry_calls = []
+
+        class FailingAgent:
+            def generate_code_batch(self, prompts):
+                return ["final_result = 1 / 0"]
+
+            def generate_code(self, prompt, system_prompt=None):
+                retry_calls.append(prompt)
+                return "final_result = 5"
+
+        records = process_batch_chunk(
+            [{"id": "slow", "type": "number", "question": "Tính tổng?"}],
+            context, context.to_prompt_context(), FailingAgent(), PromptBuilder(),
+            system_prompt="", max_retries=4, timeout=5, soft_timeout=0,
+        )
+        self.assertEqual(records[0]["type"], "abstain")
+        self.assertEqual(retry_calls, [])
 
     def test_load_questions(self):
         """Ensure load_questions reads all valid records and ignores blank/corrupt lines."""

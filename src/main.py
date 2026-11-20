@@ -12,6 +12,7 @@ import argparse
 from datetime import datetime
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import shutil
@@ -145,6 +146,10 @@ def parse_arguments() -> argparse.Namespace:
         default=12.0,
         help="Execution timeout per question attempt in seconds (default: 12.0)",
     )
+    parser.add_argument("--soft_timeout", type=float, default=100.0,
+                        help="Maximum wall time per question before stopping retries (default: 100s)")
+    parser.add_argument("--time_budget_seconds", type=float, default=21600.0,
+                        help="Total inference wall-time budget (default: six hours)")
     parser.add_argument(
         "--max_retries",
         type=int,
@@ -199,6 +204,14 @@ def load_questions(questions_path: Path) -> List[Dict[str, Any]]:
 
     logger.info(f"Loaded {len(questions)} questions from {questions_path}")
     return questions
+
+
+def sort_questions_by_business(questions: List[Dict[str, Any]], default_business_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Keep input order within each business while grouping identical static prefixes."""
+    return [item for _, item in sorted(
+        enumerate(questions),
+        key=lambda pair: (str(pair[1].get("business_id") or pair[1].get("db_id") or default_business_id or ""), pair[0]),
+    )]
 
 
 def process_single_question(
@@ -308,14 +321,16 @@ def _resolve_question_context(
 
 def make_json_serializable(val: Any) -> Any:
     """Ensure raw output values or containers are JSON-serializable."""
+    if isinstance(val, float) and not math.isfinite(val):
+        return str(val)
     if val is None or isinstance(val, (int, float, str, bool)):
         return val
     try:
         import numpy as np
         if isinstance(val, np.generic):
-            return val.item()
+            return make_json_serializable(val.item())
         if isinstance(val, np.ndarray):
-            return val.tolist()
+            return make_json_serializable(val.tolist())
     except ImportError:
         pass
 
@@ -324,7 +339,7 @@ def make_json_serializable(val: Any) -> Any:
         if isinstance(val, pd.DataFrame):
             if val.empty:
                 return None
-            return val.to_dict(orient="records")
+            return make_json_serializable(val.to_dict(orient="records"))
         if isinstance(val, pd.Series):
             if val.empty:
                 return None
@@ -358,6 +373,7 @@ def iter_process_batch_chunk(
     scratch_dir: Optional[Path] = None,
     calendar_csv_path: Optional[str] = None,
     on_log: Optional[Callable[[Dict[str, Any]], None]] = None,
+    soft_timeout: float = 100.0,
 ) -> Iterator[Dict[str, Any]]:
     """Process one batch chunk of questions: build prompts, run vLLM batch, execute & retry sequentially.
 
@@ -402,10 +418,10 @@ def iter_process_batch_chunk(
             "as_of_date": q_as_of,
             "user_prompt": user_prompt,
             "system_prompt": active_system_prompt,
-            "q_start": time.perf_counter(),
         })
 
     # Step B: Simultaneous vLLM batch inference for initial code generation
+    batch_started = time.perf_counter()
     try:
         batch_responses = agent.generate_code_batch(batch_prompts)
     except Exception as e:
@@ -414,13 +430,14 @@ def iter_process_batch_chunk(
 
     if len(batch_responses) < len(batch_meta):
         batch_responses = list(batch_responses) + [""] * (len(batch_meta) - len(batch_responses))
+    batch_inference_seconds = time.perf_counter() - batch_started
 
     retry_budget = max(0, min(max_retries, 4) - 1)
 
     # Step C: Execute each initial completion, falling back to sequential retry only on failure
     for idx, (meta, raw_response) in enumerate(zip(batch_meta, batch_responses)):
         q_id = meta["q_id"]
-        q_start = meta["q_start"]
+        q_start = time.perf_counter() - batch_inference_seconds
 
         thinkings: List[str] = []
         init_th = None
@@ -453,7 +470,7 @@ def iter_process_batch_chunk(
 
             if success and not executor.is_empty_result(raw_result):
                 final_success, final_result = True, raw_result
-            elif retry_budget > 0:
+            elif retry_budget > 0 and time.perf_counter() - q_start < soft_timeout:
                 retry_initial_prompt = prompt_builder.build_retry_prompt(
                     question=meta["question"],
                     previous_code=code_str,
@@ -463,6 +480,8 @@ def iter_process_batch_chunk(
 
                 def retry_gen_wrapper(p: str) -> str:
                     nonlocal llm_call_count
+                    if time.perf_counter() - q_start >= soft_timeout:
+                        raise TimeoutError("Question soft timeout before retry generation")
                     llm_call_count += 1
                     resp = agent.generate_code(p, system_prompt=meta["system_prompt"])
                     th = getattr(agent, "last_thinking", None)
@@ -479,6 +498,8 @@ def iter_process_batch_chunk(
                     if c_succ and c_res is not None:
                         retry_outputs.append(c_res)
                     last_output = c_res if c_succ and c_res is not None else (c_err if c_err else None)
+                    if not c_succ and time.perf_counter() - q_start >= soft_timeout:
+                        raise TimeoutError("Question soft timeout after retry execution")
 
                 final_success, final_result, _ = executor.execute_with_retry(
                     initial_prompt=retry_initial_prompt,
@@ -543,6 +564,7 @@ def iter_process_batch_chunk(
                 prompt_builder.enable_verification
                 and gate_res.get("passed")
                 and llm_call_count < 4
+                and time.perf_counter() - q_start < soft_timeout
             ):
                 verify_prompt = prompt_builder.build_verification_prompt(
                     question=meta["question"],
@@ -584,9 +606,16 @@ def iter_process_batch_chunk(
 
         elapsed_ms = max(0, int((time.perf_counter() - q_start) * 1000))
 
-        thinking_field = thinkings
+        thinking_field = thinkings if any(thinking for thinking in thinkings) else None
 
-        log_answer = None if formatted_answer in (None, "abstain", "unanswerable") else formatted_answer
+        submission_record = format_submission_record(
+            q_id=q_id, answer=formatted_answer, q_type=resolved_q_type,
+            abstain_token="abstain",
+            reason=gate_res.get("reason") if isinstance(gate_res, dict) and resolved_q_type == "unanswerable" else None,
+        )
+        log_answer = {"type": submission_record["type"], "answer": submission_record.get("answer")}
+        if "reason" in submission_record:
+            log_answer["reason"] = submission_record["reason"]
         log_output = make_json_serializable(last_output) if executed_code is not None else None
 
         log_record = {
@@ -601,13 +630,7 @@ def iter_process_batch_chunk(
         if on_log is not None:
             on_log(log_record)
 
-        yield format_submission_record(
-            q_id=q_id,
-            answer=formatted_answer,
-            q_type=resolved_q_type,
-            abstain_token="abstain",
-            reason=gate_res.get("reason") if isinstance(gate_res, dict) and resolved_q_type == "unanswerable" else None,
-        )
+        yield submission_record
 
 
 def process_batch_chunk(
@@ -623,6 +646,7 @@ def process_batch_chunk(
     scratch_dir: Optional[Path] = None,
     calendar_csv_path: Optional[str] = None,
     on_log: Optional[Callable[[Dict[str, Any]], None]] = None,
+    soft_timeout: float = 100.0,
 ) -> List[Dict[str, Any]]:
     """Process a batch chunk and return formatted submission records in order."""
     return list(
@@ -639,6 +663,7 @@ def process_batch_chunk(
             scratch_dir=scratch_dir,
             calendar_csv_path=calendar_csv_path,
             on_log=on_log,
+            soft_timeout=soft_timeout,
         )
     )
 
@@ -722,6 +747,7 @@ def main() -> None:
     if args.limit is not None and args.limit > 0:
         questions = questions[:args.limit]
         logger.info(f"Applied --limit: processing {len(questions)} questions.")
+    questions = sort_questions_by_business(questions, context.business_id)
 
     # Determine log destinations (competition requires /result/logs/predictions.jsonl and output logs)
     logs_files: List[Path] = []
@@ -753,9 +779,11 @@ def main() -> None:
     # Step 4: Process questions in BATCH_SIZE chunks and stream to output JSONL
     ensure_output_directories(output_file)
     total_q = len(questions)
+    inference_deadline = time.perf_counter() + max(0.0, args.time_budget_seconds)
     answered_count = 0
     abstained_count = 0
     processed_count = 0
+    total_question_elapsed_ms = 0
 
     log_file_handles = []
     for lf in logs_files:
@@ -766,7 +794,9 @@ def main() -> None:
             logger.warning(f"Could not open log file {lf}: {e}")
 
     def on_question_log(log_rec: Dict[str, Any]) -> None:
-        line_str = json.dumps(log_rec, ensure_ascii=False) + "\n"
+        nonlocal total_question_elapsed_ms
+        total_question_elapsed_ms += log_rec["elapsed_ms"]
+        line_str = json.dumps(log_rec, ensure_ascii=False, allow_nan=False) + "\n"
         for handle in log_file_handles:
             try:
                 handle.write(line_str)
@@ -787,20 +817,25 @@ def main() -> None:
                     f"questions {batch_start + 1}-{min(batch_start + len(chunk), total_q)}/{total_q}"
                 )
 
-                for record in iter_process_batch_chunk(
-                    chunk=chunk,
-                    dataset_context=context,
-                    schema_prompt_str=schema_prompt_str,
-                    agent=agent,
-                    prompt_builder=prompt_builder,
-                    system_prompt=system_prompt,
-                    max_retries=args.max_retries,
-                    timeout=args.timeout,
-                    parser=parser,
-                    scratch_dir=scratch_dir,
-                    calendar_csv_path=calendar_csv_path,
-                    on_log=on_question_log,
-                ):
+                remaining_budget = max(0.0, inference_deadline - time.perf_counter())
+                remaining_questions = max(1, total_q - processed_count)
+                per_question_budget = min(args.soft_timeout, remaining_budget / remaining_questions)
+
+                def budget_abstentions() -> Iterator[Dict[str, Any]]:
+                    for position, question in enumerate(chunk, batch_start + 1):
+                        q_id = str(question.get("id") or question.get("question_id") or f"unknown_{position}")
+                        on_question_log({"id": q_id, "answer": {"type": "abstain", "answer": None},
+                                         "elapsed_ms": 0, "thinking": None, "code": None, "output": None})
+                        yield format_submission_record(q_id, None, q_type="abstain")
+
+                records = budget_abstentions() if remaining_budget <= 0 else iter_process_batch_chunk(
+                    chunk=chunk, dataset_context=context, schema_prompt_str=schema_prompt_str,
+                    agent=agent, prompt_builder=prompt_builder, system_prompt=system_prompt,
+                    max_retries=args.max_retries, timeout=min(args.timeout, max(1.0, per_question_budget)),
+                    parser=parser, scratch_dir=scratch_dir, calendar_csv_path=calendar_csv_path,
+                    on_log=on_question_log, soft_timeout=per_question_budget,
+                )
+                for record in records:
                     processed_count += 1
                     if record.get("answer") in (None, "abstain"):
                         abstained_count += 1
@@ -809,12 +844,15 @@ def main() -> None:
 
                     # Strictly omit alias field
                     record.pop("alias", None)
-                    out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    out_f.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
                     out_f.flush()
                     try:
                         os.fsync(out_f.fileno())
                     except OSError:
                         pass
+                logger.info("Processed %s/%s; mean question time %.2fs",
+                            processed_count, total_q,
+                            total_question_elapsed_ms / max(processed_count, 1) / 1000)
     finally:
         for handle in log_file_handles:
             try:

@@ -31,6 +31,19 @@ class TestExecutionLogging(unittest.TestCase):
         self.sample_data_dir = Path("./data/sample_dataset").resolve()
         self.questions_file = self.sample_data_dir / "questions.jsonl"
 
+    def test_exhausted_budget_writes_submission_and_log_for_every_id(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_dir = Path(tmp_dir) / "result"
+            args = ["main.py", "--data_dir", str(self.sample_data_dir),
+                    "--output_dir", str(out_dir), "--dry_run", "--time_budget_seconds", "0"]
+            with patch.object(sys, "argv", args):
+                main()
+            submissions = [json.loads(line) for line in (out_dir / "submission.jsonl").read_text(encoding="utf-8").splitlines()]
+            logs = [json.loads(line) for line in (out_dir / "logs" / "predictions.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([record["id"] for record in logs], [record["id"] for record in submissions])
+            self.assertTrue(all(record["type"] == "abstain" for record in submissions))
+            self.assertTrue(all(record["thinking"] is None for record in logs))
+
     def test_make_json_serializable(self):
         """Ensure diverse pandas/numpy/python data structures are cleanly serialized."""
         df = pd.DataFrame({"col1": [1, 2], "col2": ["a", "b"]})
@@ -118,10 +131,7 @@ class TestExecutionLogging(unittest.TestCase):
                 self.assertGreaterEqual(log_rec["elapsed_ms"], 0)
 
                 # answer handling
-                if sub_rec.get("type") == "abstain" or sub_rec.get("answer") in ("abstain", None):
-                    self.assertIsNone(log_rec["answer"])
-                else:
-                    self.assertEqual(log_rec["answer"], sub_rec["answer"])
+                self.assertEqual(log_rec["answer"], {"type": sub_rec["type"], "answer": sub_rec.get("answer")})
 
                 # code must be str or None
                 if log_rec["code"] is not None:
@@ -178,7 +188,7 @@ class TestExecutionLogging(unittest.TestCase):
             rec = records[0]
 
             self.assertEqual(rec["id"], "q_retry_1")
-            self.assertEqual(rec["answer"], 12345)
+            self.assertEqual(rec["answer"], {"type": "number", "answer": 12345})
             # Two calls were made: verify list of strings in call order
             self.assertIsInstance(rec["thinking"], list)
             self.assertEqual(rec["thinking"], ["Batch attempt reasoning.", "Retry attempt reasoning."])

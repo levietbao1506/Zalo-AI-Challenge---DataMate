@@ -15,8 +15,12 @@ ENTRYPOINT []
 # Strict offline and runtime environment flags
 ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
+    HF_DATASETS_OFFLINE=1 \
     PIP_NO_CACHE_DIR=1 \
     NCCL_P2P_DISABLE=1 \
+    PYTHONHASHSEED=42 \
+    VLLM_SEED=42 \
+    VLLM_MAX_NUM_SEQS=8 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TOKENIZERS_PARALLELISM=false \
@@ -36,6 +40,9 @@ COPY training_code/ /code/training_code/
 COPY predict.sh /code/predict.sh
 COPY README.md /code/README.md
 COPY src/ /code/src/
+
+# Fail the build if the local weights are absent or the declared model exceeds 15B.
+RUN python -c 'import json,pathlib; manifest=json.loads(pathlib.Path("/code/training_code/data_manifest.json").read_text()); assert manifest["parameters_total"] <= 15_000_000_000; assert pathlib.Path("/code/models/Qwen3-14B/config.json").is_file()'
 
 # Ensure predict script is executable and has Unix LF line endings
 RUN sed -i 's/\r$//' /code/predict.sh && \

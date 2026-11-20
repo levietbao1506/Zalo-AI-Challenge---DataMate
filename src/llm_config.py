@@ -19,9 +19,9 @@ DEFAULT_OFFLINE_MODEL_PATH = "/code/models/Qwen3-14B"
 FALLBACK_LOCAL_MODEL_PATH = "models/Qwen3-14B"
 
 # Thinking mode sampling parameters
-THINKING_TEMPERATURE = 0.6
-THINKING_TOP_P = 0.95
-THINKING_TOP_K = 20
+THINKING_TEMPERATURE = 0.0
+THINKING_TOP_P = 1.0
+THINKING_TOP_K = -1
 
 # Non-thinking (deterministic) sampling parameters
 NON_THINKING_TEMPERATURE = 0.0
@@ -31,6 +31,7 @@ DEFAULT_MAX_MODEL_LEN = 32768
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.85
 DEFAULT_TENSOR_PARALLEL_SIZE = int(os.environ.get("TENSOR_PARALLEL_SIZE", 2))
 DEFAULT_MAX_TOKENS = 8192
+DEFAULT_MAX_NUM_SEQS = 8
 
 DEFAULT_STOP_TOKENS = [
     "<|im_end|>",
@@ -60,6 +61,8 @@ class VLLMConfig:
     trust_remote_code: bool = True
     enable_thinking: bool = False
     max_tokens: int = DEFAULT_MAX_TOKENS
+    max_num_seqs: int = DEFAULT_MAX_NUM_SEQS
+    enable_prefix_caching: bool = True
     stop_tokens: List[str] = field(default_factory=lambda: list(DEFAULT_STOP_TOKENS))
 
     def resolve_model_path(self) -> str:
@@ -79,6 +82,8 @@ class VLLMConfig:
             "gpu_memory_utilization": self.gpu_memory_utilization,
             "max_model_len": self.max_model_len,
             "seed": self.seed,
+            "max_num_seqs": self.max_num_seqs,
+            "enable_prefix_caching": self.enable_prefix_caching,
             "trust_remote_code": self.trust_remote_code,
         }
         if self.local_files_only:
@@ -100,8 +105,7 @@ def get_sampling_params(
     """Build SamplingParams for vLLM supporting thinking mode vs deterministic mode.
 
     Args:
-        enable_thinking: If True, uses exploratory sampling (temp=0.6, top_p=0.95, top_k=20).
-                         If False, uses greedy deterministic decoding (temp=0.0).
+        enable_thinking: Controls the prompt mode; both modes use greedy decoding.
         max_tokens: Maximum tokens to generate.
         stop_tokens: Optional list of stop string tokens.
         seed: Random seed for deterministic generation.
@@ -124,6 +128,7 @@ def get_sampling_params(
     else:
         params = {
             "temperature": NON_THINKING_TEMPERATURE,
+            "top_p": 1.0,
             "max_tokens": max_tokens,
             "stop": stop,
             "seed": seed,
