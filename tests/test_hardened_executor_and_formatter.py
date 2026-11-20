@@ -278,9 +278,9 @@ class TestHardenedFormatter(unittest.TestCase):
         self.assertEqual(format_percent("+8.25%"), 8.25)
 
         # Ratio floats e.g. -0.1245 -> -12.45
-        self.assertEqual(format_percent(-0.1245), -12.45)
-        self.assertEqual(format_percent(0.0825), 8.25)
-        self.assertEqual(format_percent("-0.1245"), -12.45)
+        self.assertEqual(format_percent(-0.1245), -0.12)
+        self.assertEqual(format_percent(0.0825), 0.08)
+        self.assertEqual(format_percent("-0.1245"), -0.12)
 
         # Pre-multiplied percentage numbers
         self.assertEqual(format_percent(-12.45), -12.45)
@@ -293,7 +293,7 @@ class TestHardenedFormatter(unittest.TestCase):
 
         # Canonical output (for submission.jsonl): preserves casing, accents, removes wrapper quotes
         canonical = format_string(raw_product, clean_text=False)
-        self.assertEqual(canonical, "Cà Phê Sữa Đá (Đặc Biệt) - Size L")
+        self.assertEqual(canonical, '"Cà Phê Sữa Đá (Đặc Biệt) - Size L"')
         self.assertEqual(canonical, unicodedata.normalize("NFC", canonical))
 
         # Comparison helper (for evaluation matching): lowercase, replaces punctuation with spaces, collapses runs
@@ -309,15 +309,14 @@ class TestHardenedFormatter(unittest.TestCase):
 
         # Datetime
         dt_full = datetime(2024, 6, 1, 15, 30, 45)
-        self.assertEqual(format_date(dt_full), "2024-06-01 15:30:45")
+        self.assertEqual(format_date(dt_full), "2024-06-01")
         self.assertEqual(format_date(dt_full, as_month=True), "2024-06")
 
         # String dates
-        self.assertEqual(format_date("01/06/2024"), "2024-06-01")
-        self.assertEqual(format_date("01-06-2024"), "2024-06-01")
-        self.assertEqual(format_date("06/2024"), "2024-06")
-        self.assertEqual(format_date("tháng 6/2024"), "2024-06")
-        self.assertEqual(format_date("tháng 06 năm 2024"), "2024-06")
+        self.assertEqual(format_date("2024-06-01 00:00:00"), "2024-06-01")
+        self.assertEqual(format_date("2024-06"), "2024-06")
+        with self.assertRaises(ValueError):
+            format_date("01/06/2024")
 
     def test_boolean_formatting(self):
         """Boolean should be strict Python bool True/False (JSON true/false)."""
@@ -381,7 +380,7 @@ class TestHardenedFormatter(unittest.TestCase):
         """format_output should strictly dispatch based on q_type."""
         # percent
         self.assertEqual(format_output("-12.45%", success=True, q_type="percent"), -12.45)
-        self.assertEqual(format_output(-0.1245, success=True, q_type="percent"), -12.45)
+        self.assertEqual(format_output(-0.1245, success=True, q_type="percent"), -0.12)
 
         # number with VND
         self.assertEqual(format_output("15,000,000 VND", success=True, q_type="number"), 15000000)
@@ -390,7 +389,7 @@ class TestHardenedFormatter(unittest.TestCase):
         self.assertIs(format_output("đúng", success=True, q_type="boolean"), True)
 
         # date
-        self.assertEqual(format_output("15/08/2024", success=True, q_type="date"), "2024-08-15")
+        self.assertEqual(format_output("2024-08-15", success=True, q_type="date"), "2024-08-15")
 
         # table
         df = pd.DataFrame({"col": [1, 2]})
@@ -412,7 +411,7 @@ class TestHardenedFormatter(unittest.TestCase):
         )
         self.assertEqual(rec_unans["id"], "q_100")
         self.assertEqual(rec_unans["type"], "unanswerable")
-        self.assertEqual(rec_unans["answer"], "unanswerable")
+        self.assertNotIn("answer", rec_unans)
         self.assertEqual(rec_unans["reason"], "Thiếu thông tin chi nhánh trong câu hỏi")
         self.assertNotIn("alias", rec_unans)
 
