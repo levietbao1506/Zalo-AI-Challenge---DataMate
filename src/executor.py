@@ -11,6 +11,8 @@ Executes generated Pandas, DuckDB, and SQLite scripts safely with:
 from __future__ import annotations
 
 import base64
+from difflib import SequenceMatcher
+from functools import lru_cache
 from dataclasses import dataclass
 import datetime
 from datetime import date, datetime as dt, timedelta
@@ -77,8 +79,133 @@ logger = logging.getLogger(__name__)
 # Disallowed builtins and dangerous modules
 BLOCKED_MODULES: Set[str] = {
     "os", "subprocess", "shutil", "socket", "urllib", "requests", "http", "ftplib",
-    "smtplib", "telnetlib", "posix", "nt", "pty", "commands",
+    "smtplib", "telnetlib", "posix", "nt", "pty", "commands", "ctypes",
+    "multiprocessing", "importlib", "builtins", "sys",
 }
+
+
+def normalize_vietnamese(value: Any) -> str:
+    """Accent-insensitive search key; callers return the untouched original value."""
+    text = unicodedata.normalize("NFD", str(value or "").casefold().replace("đ", "d"))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return " ".join(re.sub(r"[^\w\s]", " ", text).split())
+
+
+def fuzzy_match_name(query: str, candidates: Any, min_score: float = 0.8) -> Optional[str]:
+    """Return a unique best original name; ambiguous matches abstain as None."""
+    target = normalize_vietnamese(query)
+    scored = [(SequenceMatcher(None, target, normalize_vietnamese(name)).ratio(), str(name))
+              for name in candidates if name is not None]
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0], reverse=True)
+    if scored[0][0] < min_score or (len(scored) > 1 and scored[0][0] == scored[1][0]
+                                     and scored[0][1] != scored[1][1]):
+        return None
+    return scored[0][1]
+
+
+def parse_vnd_amount(value: Any) -> float:
+    """Parse Vietnamese money text without guessing a decimal separator as thousands."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+        if math.isfinite(number):
+            return number
+        raise ValueError("non-finite money value")
+    text = str(value).strip().lower()
+    text = re.sub(r"(?i)(?:vnd|vnđ|đồng|dong|₫|đ)", "", text).strip()
+    multiplier = 1000 if text.endswith("k") else 1
+    if multiplier != 1:
+        text = text[:-1].strip()
+    text = re.sub(r"\s+", "", text)
+    if re.fullmatch(r"[+-]?\d{1,3}(?:[.,]\d{3})+", text):
+        text = re.sub(r"[.,]", "", text)
+    elif "," in text and "." in text:
+        decimal_separator = "," if text.rfind(",") > text.rfind(".") else "."
+        thousands_separator = "." if decimal_separator == "," else ","
+        text = text.replace(thousands_separator, "").replace(decimal_separator, ".")
+    elif "," in text:
+        text = text.replace(",", ".")
+    number = float(text) * multiplier
+    if not math.isfinite(number):
+        raise ValueError("non-finite money value")
+    return number
+
+
+def parse_mixed_date(value: Any) -> date:
+    """Parse ISO, Vietnamese day-first, Excel serial, or date objects."""
+    if isinstance(value, dt):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return (dt(1899, 12, 30) + timedelta(days=float(value))).date()
+    text = str(value).strip()
+    for pattern in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return dt.strptime(text, pattern).date()
+        except ValueError:
+            pass
+    raise ValueError(f"unsupported date: {text}")
+
+
+@lru_cache(maxsize=2)
+def read_csv_safe(path: Union[str, Path]) -> pd.DataFrame:
+    """Read a full CSV once per process, detecting common Vietnamese encodings."""
+    file = Path(path)
+    for encoding in ("utf-8-sig", "utf-8", "cp1258", "latin1"):
+        try:
+            with file.open(encoding=encoding) as handle:
+                first = handle.readline()
+            delimiter = max((",", ";", "\t"), key=first.count)
+            frame = pd.read_csv(file, sep=delimiter, encoding=encoding, low_memory=False)
+            frame.columns = frame.columns.astype(str).str.strip()
+            return frame
+        except (UnicodeError, pd.errors.ParserError):
+            continue
+    raise ValueError(f"Cannot read CSV: {file}")
+
+
+@lru_cache(maxsize=2)
+def read_excel_safe(path: Union[str, Path], sheet_name: str) -> pd.DataFrame:
+    """Use the schema profiler's detected header row for an Excel sheet."""
+    from src.schema_parser import _detect_excel_header
+    with pd.ExcelFile(path) as book:
+        if sheet_name not in book.sheet_names:
+            raise KeyError(f"Missing sheet: {sheet_name}")
+        header = _detect_excel_header(book, sheet_name)
+        frame = pd.read_excel(book, sheet_name=sheet_name, header=header)
+    frame.columns = frame.columns.astype(str).str.strip()
+    return frame
+
+
+@lru_cache(maxsize=2)
+def read_sqlite_safe(path: Union[str, Path], table_name: str) -> pd.DataFrame:
+    """Read a SQLite table through a read-only connection."""
+    file = Path(path).resolve()
+    conn = sqlite3.connect(f"file:{file.as_posix()}?mode=ro", uri=True)
+    try:
+        quoted = table_name.replace('"', '""')
+        frame = pd.read_sql_query(f'SELECT * FROM "{quoted}"', conn)
+    finally:
+        conn.close()
+    frame.columns = frame.columns.astype(str).str.strip()
+    return frame
+
+
+def time_context(as_of: Union[str, date, dt], data_dir: Union[str, Path] = "/data") -> Dict[str, Any]:
+    """Resolve split-specific anchors for generated code."""
+    split_root = Path(data_dir)
+    calendar_path = split_root / "calendar.csv"
+    if not calendar_path.is_file():
+        configured = calendar_utils.get_calendar_csv_path()
+        if configured is not None:
+            calendar_path = Path(configured)
+            split_root = calendar_path.parent
+    return calendar_utils.resolve_time_context(
+        as_of, calendar_df=calendar_utils.load_calendar(calendar_path),
+        rulebook_text=calendar_utils.load_rulebook(split_root),
+    )
 
 
 def _safe_import(name: str, *args: Any, **kwargs: Any) -> Any:
@@ -204,6 +331,14 @@ def _build_local_namespace(
         "dt": dt,
         "timedelta": timedelta,
         "calendar_utils": calendar_utils,
+        "read_csv_safe": read_csv_safe,
+        "read_excel_safe": read_excel_safe,
+        "read_sqlite_safe": read_sqlite_safe,
+        "normalize_vietnamese": normalize_vietnamese,
+        "fuzzy_match_name": fuzzy_match_name,
+        "parse_vnd_amount": parse_vnd_amount,
+        "parse_mixed_date": parse_mixed_date,
+        "time_context": time_context,
         "resolve_as_of_date": calendar_utils.resolve_as_of_date,
         "parse_vietnamese_date": calendar_utils.parse_vietnamese_date,
         "resolve_vietnamese_relative_date": calendar_utils.resolve_vietnamese_relative_date,
@@ -253,7 +388,7 @@ def _resolve_subprocess_working_dir(working_dir: Optional[Union[str, Path]] = No
         p = Path(working_dir).resolve()
         p.mkdir(parents=True, exist_ok=True)
         return p
-    tmp_dir = Path("/tmp")
+    tmp_dir = Path("/tmp") if os.name != "nt" else Path(tempfile.gettempdir())
     if tmp_dir.exists() and tmp_dir.is_dir():
         return tmp_dir
     scratch = Path(tempfile.gettempdir()) / "datamate_tmp"
@@ -311,6 +446,8 @@ import os
 import pickle
 import re
 import sys
+import io
+from pathlib import Path
 import unicodedata
 import datetime
 from datetime import date, datetime as dt, timedelta
@@ -346,6 +483,8 @@ try:
     import calendar_utils
 except ImportError:
     from src import calendar_utils
+from src import executor as packaged_helpers
+from src import schema_parser as _schema_parser
 
 # Decode configuration
 data_dir = base64.b64decode("{data_dir_b64}").decode("utf-8")
@@ -353,6 +492,62 @@ file_map = json.loads(base64.b64decode("{file_map_b64}").decode("utf-8"))
 result_pkl_path = base64.b64decode("{pkl_b64}").decode("utf-8")
 as_of_date_str = "{resolved_as_of}"
 user_code = base64.b64decode("{code_b64}").decode("utf-8")
+
+class BoundedOutput(io.TextIOBase):
+    def __init__(self, limit=4000):
+        self.limit = limit
+        self.head = ""
+        self.tail = ""
+        self.total = 0
+    def write(self, value):
+        self.total += len(value)
+        if len(self.head) < self.limit:
+            taken = min(len(value), self.limit - len(self.head))
+            self.head += value[:taken]
+        self.tail = (self.tail + value)[-self.limit:]
+        return len(value)
+    def flush(self):
+        return None
+    def getvalue(self):
+        if self.total <= self.limit:
+            return self.head
+        if self.total <= 2 * self.limit:
+            return self.head + self.tail[self.limit - self.total:]
+        return self.head + "\\n[stdout truncated; middle omitted]\\n" + self.tail
+
+captured_output = BoundedOutput()
+original_stdout = sys.stdout
+sys.stdout = captured_output
+
+data_root = Path(data_dir).resolve()
+scratch_root = Path(result_pkl_path).resolve().parent
+python_path = Path(sys.prefix).resolve()
+calendar_root = Path(file_map["calendar.csv"]).resolve().parent if "calendar.csv" in file_map else data_root
+def within(path, root):
+    return path == root or root in path.parents
+def audit_generated_code(event, args):
+    if event == "open" and args and isinstance(args[0], (str, bytes, os.PathLike)):
+        path = Path(args[0]).resolve()
+        mode = str(args[1]) if len(args) > 1 else "r"
+        flags = args[2] if len(args) > 2 and isinstance(args[2], int) else 0
+        writing = any(ch in mode for ch in "wax+") or bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
+        if writing and not within(path, scratch_root):
+            raise PermissionError("Sandbox permits writes only in /tmp scratch")
+        if not writing and not any(within(path, root) for root in (data_root, calendar_root, scratch_root, python_path)):
+            raise PermissionError("Sandbox permits data reads only from the active split")
+    if event == "sqlite3.connect" and args:
+        target = str(args[0])
+        if target != ":memory:" and "mode=ro" not in target:
+            raise PermissionError("SQLite files must be opened read-only")
+    if event == "os.mkdir" and args and within(Path(args[0]).resolve(), scratch_root):
+        return
+    if event.startswith((
+        "socket.", "subprocess.", "os.system", "os.remove", "os.rename", "os.rmdir",
+        "os.mkdir", "os.chmod", "os.chown", "os.link", "os.symlink", "os.truncate",
+        "os.utime", "os.startfile",
+    )):
+        raise PermissionError("Operation blocked in generated-code sandbox")
+sys.addaudithook(audit_generated_code)
 
 if file_map and "calendar.csv" in file_map:
     try:
@@ -364,7 +559,7 @@ as_of_date = calendar_utils.resolve_as_of_date(as_of_date_str)
 
 # Pre-populated execution namespace
 exec_globals = {{
-    "__builtins__": __builtins__,
+    "__builtins__": {{**vars(__import__("builtins")), "__import__": packaged_helpers._safe_import}},
     "pd": pd,
     "np": np,
     "sqlite3": sqlite3,
@@ -378,6 +573,14 @@ exec_globals = {{
     "dt": dt,
     "timedelta": timedelta,
     "calendar_utils": calendar_utils,
+    "read_csv_safe": packaged_helpers.read_csv_safe,
+    "read_excel_safe": packaged_helpers.read_excel_safe,
+    "read_sqlite_safe": packaged_helpers.read_sqlite_safe,
+    "normalize_vietnamese": packaged_helpers.normalize_vietnamese,
+    "fuzzy_match_name": packaged_helpers.fuzzy_match_name,
+    "parse_vnd_amount": packaged_helpers.parse_vnd_amount,
+    "parse_mixed_date": packaged_helpers.parse_mixed_date,
+    "time_context": packaged_helpers.time_context,
     "resolve_as_of_date": calendar_utils.resolve_as_of_date,
     "parse_vietnamese_date": calendar_utils.parse_vietnamese_date,
     "resolve_vietnamese_relative_date": calendar_utils.resolve_vietnamese_relative_date,
@@ -419,6 +622,10 @@ try:
             extracted_result = exec_globals[var_name]
             break
 
+    if isinstance(extracted_result, str) and extracted_result == "unanswerable":
+        reason = exec_locals.get("reason", exec_globals.get("reason", ""))
+        extracted_result = {{"type": "unanswerable", "reason": str(reason or "")}}
+
     try:
         with open(result_pkl_path, "wb") as f:
             pickle.dump(extracted_result, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -428,9 +635,13 @@ try:
                 pickle.dump(str(extracted_result), f, protocol=pickle.HIGHEST_PROTOCOL)
         except Exception:
             pass
+    sys.stdout = original_stdout
+    print(captured_output.getvalue(), end="")
     sys.exit(0)
 except Exception as e:
     import traceback
+    sys.stdout = original_stdout
+    print(captured_output.getvalue(), end="")
     traceback.print_exc(file=sys.stderr)
     sys.exit(1)
 '''
@@ -440,6 +651,7 @@ except Exception as e:
 
         env = os.environ.copy()
         env["PYTHONPATH"] = project_root + os.pathsep + env.get("PYTHONPATH", "")
+        env["PYTHONIOENCODING"] = "utf-8"
 
         proc = subprocess.run(
             [sys.executable, str(script_path)],
@@ -448,6 +660,8 @@ except Exception as e:
             timeout=timeout_seconds,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
 
         stdout = proc.stdout or ""
@@ -472,6 +686,8 @@ except Exception as e:
 
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
         stderr = f"TimeoutError: Execution exceeded time limit of {timeout_seconds:.1f}s"
         return SubprocessResult(False, None, stdout, stderr)
     except Exception as exc:
@@ -814,6 +1030,14 @@ class SandboxedExecutor:
             "timedelta": timedelta,
             # Calendar & domain helpers
             "calendar_utils": calendar_utils,
+            "read_csv_safe": read_csv_safe,
+            "read_excel_safe": read_excel_safe,
+            "read_sqlite_safe": read_sqlite_safe,
+            "normalize_vietnamese": normalize_vietnamese,
+            "fuzzy_match_name": fuzzy_match_name,
+            "parse_vnd_amount": parse_vnd_amount,
+            "parse_mixed_date": parse_mixed_date,
+            "time_context": time_context,
             "resolve_as_of_date": calendar_utils.resolve_as_of_date,
             "parse_vietnamese_date": calendar_utils.parse_vietnamese_date,
             "resolve_vietnamese_relative_date": calendar_utils.resolve_vietnamese_relative_date,

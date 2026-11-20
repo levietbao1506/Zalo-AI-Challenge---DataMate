@@ -34,9 +34,9 @@ class TestIsAnswerMatch(unittest.TestCase):
     def test_boolean_matching(self):
         self.assertTrue(is_answer_match(True, True))
         self.assertTrue(is_answer_match("True", True))
-        self.assertTrue(is_answer_match("Có", True))
+        self.assertFalse(is_answer_match("Có", True))
         self.assertTrue(is_answer_match(False, False))
-        self.assertTrue(is_answer_match("Không", False))
+        self.assertFalse(is_answer_match("Không", False))
         self.assertFalse(is_answer_match(True, False))
         self.assertFalse(is_answer_match("Có", False))
 
@@ -48,7 +48,7 @@ class TestIsAnswerMatch(unittest.TestCase):
 
     def test_date_matching(self):
         self.assertTrue(is_answer_match("2024-05-01", "2024-05-01", q_type="date"))
-        self.assertTrue(is_answer_match("2024/05/01", "2024-05-01", q_type="date"))
+        self.assertFalse(is_answer_match("2024/05/01", "2024-05-01", q_type="date"))
         self.assertTrue(is_answer_match("2024-05", "2024-05", q_type="date"))
         self.assertFalse(is_answer_match("2024-05-02", "2024-05-01", q_type="date"))
 
@@ -208,6 +208,20 @@ class TestEvaluateSubmission(unittest.TestCase):
 class TestVerificationGate(unittest.TestCase):
     """Test confidence verification gate in src/agent.py."""
 
+    def test_computed_answer_requires_executed_code(self):
+        result = verification_gate(execution_success=True, result=42, q_type="number")
+        self.assertEqual(result["type"], "abstain")
+
+    def test_unanswerable_requires_source_inspection(self):
+        result = verification_gate(execution_success=True, result="unanswerable", q_type="unanswerable")
+        self.assertEqual(result["type"], "abstain")
+
+    def test_percent_and_date_flags(self):
+        percent = verification_gate(execution_success=True, result=-0.1245, q_type="percent", code_str="final_result = -0.1245", question="Tỷ lệ tăng trưởng là bao nhiêu %?")
+        self.assertEqual(percent["type"], "abstain")
+        month = verification_gate(execution_success=True, result="2024-05-12", q_type="date", code_str="final_result = '2024-05-12'", question="Tháng nào bán nhiều nhất?")
+        self.assertEqual(month["type"], "abstain")
+
     def test_hard_execution_failure_abstains(self):
         res = verification_gate(
             execution_success=False,
@@ -245,7 +259,7 @@ class TestVerificationGate(unittest.TestCase):
         res_abs = verification_gate(execution_success=True, result="không xác định", q_type="string")
         self.assertEqual(res_abs["type"], "abstain")
 
-        res_unans = verification_gate(execution_success=True, result="unanswerable", q_type="unanswerable")
+        res_unans = verification_gate(execution_success=True, result={"type": "unanswerable", "reason": "Thiếu dữ liệu giá vốn"}, q_type="unanswerable", code_str="if 'cost' not in FILE_MAP: final_result = 'unanswerable'")
         self.assertEqual(res_unans["type"], "unanswerable")
         self.assertEqual(res_unans["answer"], "unanswerable")
         self.assertTrue(res_unans["passed"])
@@ -270,6 +284,7 @@ class TestVerificationGate(unittest.TestCase):
             execution_success=True,
             result=250,
             q_type="number",
+            code_str="final_result = 250",
             retry_results=[100, 250],
             threshold=DEFAULT_ABSTAIN_THRESHOLD,
         )
@@ -284,6 +299,7 @@ class TestVerificationGate(unittest.TestCase):
             execution_success=True,
             result=100.0,
             q_type="number",
+            code_str="final_result = 100.0",
             retry_results=[100, 100.0],
             threshold=DEFAULT_ABSTAIN_THRESHOLD,
         )
@@ -298,6 +314,7 @@ class TestVerificationGate(unittest.TestCase):
             execution_success=True,
             result=45.5,
             q_type="number",
+            code_str="final_result = 45.5",
         )
         self.assertEqual(res["type"], "number")
         self.assertEqual(res["answer"], 45.5)

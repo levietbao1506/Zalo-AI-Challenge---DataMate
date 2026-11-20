@@ -278,13 +278,14 @@ class TestVLLMAgent(unittest.TestCase):
 
         # No thinking tags
         self.assertIsNone(extract_thinking("```python\nresult = 100\n```"))
+        self.assertEqual(extract_thinking("<think>  raw\nline  </think>"), "  raw\nline  ")
 
     def test_agent_verification_gate_pa_guard(self):
         """Verify agent's verification_gate guards against negative PA scores."""
         agent = CodeAgent(dry_run=True, abstain_threshold=0.6)
 
         # 1. Successful execution with valid answer
-        res_ok = agent.verify_prediction(execution_success=True, raw_result=150.0, q_type="number")
+        res_ok = agent.verify_prediction(execution_success=True, raw_result=150.0, q_type="number", code_str="final_result = 150.0")
         self.assertTrue(res_ok["passed"])
         self.assertEqual(res_ok["type"], "number")
         self.assertEqual(res_ok["answer"], 150.0)
@@ -295,6 +296,7 @@ class TestVLLMAgent(unittest.TestCase):
             raw_result=200,
             q_type="number",
             retry_results=[100, 200],
+            code_str="final_result = 200",
         )
         self.assertEqual(res_conflict["type"], "abstain")
         self.assertEqual(res_conflict["answer"], "abstain")

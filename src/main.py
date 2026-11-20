@@ -20,7 +20,7 @@ import tempfile
 import time
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
-from src import calendar_utils, executor
+from src import calendar_utils, evaluator, executor
 from src.agent import CodeAgent, VLLMAgent, extract_thinking, verification_gate
 from src.executor import EMPTY_RESULT_FEEDBACK, SandboxedExecutor
 from src.formatter import format_output, format_submission_record
@@ -51,7 +51,8 @@ def get_scratch_dir() -> Path:
         test_file.unlink()
         return tmp_path
     except (PermissionError, OSError):
-        fallback = Path(tempfile.gettempdir()) / "datamate_tmp"
+        base_temp = Path(tempfile.gettempdir())
+        fallback = base_temp if base_temp.name == "datamate_tmp" else base_temp / "datamate_tmp"
         fallback.mkdir(parents=True, exist_ok=True)
         return fallback
 
@@ -141,8 +142,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--timeout",
         type=float,
-        default=25.0,
-        help="Execution timeout per question attempt in seconds (default: 25.0)",
+        default=12.0,
+        help="Execution timeout per question attempt in seconds (default: 12.0)",
     )
     parser.add_argument(
         "--max_retries",
@@ -161,6 +162,11 @@ def parse_arguments() -> argparse.Namespace:
         "--dry_run",
         action="store_true",
         help="Run in mock/dry-run mode without loading full vLLM weights",
+    )
+    parser.add_argument(
+        "--verify_with_model",
+        action="store_true",
+        help="Use one extra code verification call when the four-call budget permits",
     )
     parser.add_argument(
         "--tensor_parallel_size",
@@ -409,7 +415,7 @@ def iter_process_batch_chunk(
     if len(batch_responses) < len(batch_meta):
         batch_responses = list(batch_responses) + [""] * (len(batch_meta) - len(batch_responses))
 
-    retry_budget = max(0, max_retries - 1)
+    retry_budget = max(0, min(max_retries, 4) - 1)
 
     # Step C: Execute each initial completion, falling back to sequential retry only on failure
     for idx, (meta, raw_response) in enumerate(zip(batch_meta, batch_responses)):
@@ -420,14 +426,14 @@ def iter_process_batch_chunk(
         init_th = None
         if hasattr(agent, "last_batch_thinking") and len(agent.last_batch_thinking) > idx:
             init_th = agent.last_batch_thinking[idx]
-        if not init_th:
+        if init_th is None:
             init_th = extract_thinking(raw_response)
-        if init_th:
-            thinkings.append(init_th)
+        thinkings.append(init_th if init_th is not None else "")
 
         llm_call_count = 1
         code_str = executor.extract_code(raw_response)
         executed_code = code_str if code_str else None
+        code_history: List[str] = [code_str] if code_str else []
         last_output = None
 
         retry_outputs: List[Any] = []
@@ -438,6 +444,7 @@ def iter_process_batch_chunk(
                 file_map=meta["file_map"],
                 as_of_date=meta["as_of_date"],
                 timeout_seconds=timeout,
+                use_subprocess=True,
             )
             if code_str:
                 last_output = raw_result if success and raw_result is not None else (error_msg if error_msg else None)
@@ -458,15 +465,17 @@ def iter_process_batch_chunk(
                     nonlocal llm_call_count
                     llm_call_count += 1
                     resp = agent.generate_code(p, system_prompt=meta["system_prompt"])
-                    th = getattr(agent, "last_thinking", None) or extract_thinking(resp)
-                    if th:
-                        thinkings.append(th)
+                    th = getattr(agent, "last_thinking", None)
+                    if th is None:
+                        th = extract_thinking(resp)
+                    thinkings.append(th if th is not None else "")
                     return resp
 
                 def handle_retry_attempt(c_code: str, c_succ: bool, c_res: Any, c_err: str) -> None:
                     nonlocal executed_code, last_output
                     if c_code:
                         executed_code = c_code
+                        code_history.append(c_code)
                     if c_succ and c_res is not None:
                         retry_outputs.append(c_res)
                     last_output = c_res if c_succ and c_res is not None else (c_err if c_err else None)
@@ -479,6 +488,7 @@ def iter_process_batch_chunk(
                     file_map=meta["file_map"],
                     as_of_date=meta["as_of_date"],
                     timeout_seconds=timeout,
+                    use_subprocess=True,
                     base_prompt=meta["user_prompt"],
                     on_attempt=handle_retry_attempt,
                     retry_prompt_fn=lambda _base, failed_code, feedback: prompt_builder.build_retry_prompt(
@@ -502,6 +512,7 @@ def iter_process_batch_chunk(
                         code_str=executed_code,
                         retry_results=retry_outputs,
                         error_msg=last_output if not final_success else None,
+                        question=meta["question"],
                     )
                 except Exception:
                     gate_res = None
@@ -520,12 +531,45 @@ def iter_process_batch_chunk(
                     code_str=executed_code,
                     retry_results=retry_outputs,
                     error_msg=last_output if not final_success else None,
+                    question=meta["question"],
                     threshold=(
                         float(getattr(agent, "abstain_threshold", None))
                         if isinstance(getattr(agent, "abstain_threshold", None), (int, float))
                         else None
                     ),
                 )
+
+            if (
+                prompt_builder.enable_verification
+                and gate_res.get("passed")
+                and llm_call_count < 4
+            ):
+                verify_prompt = prompt_builder.build_verification_prompt(
+                    question=meta["question"],
+                    computed_answer=gate_res["answer"],
+                    as_of_date=str(meta["as_of_date"]),
+                )
+                if verify_prompt:
+                    llm_call_count += 1
+                    verify_response = agent.generate_code(verify_prompt, system_prompt=meta["system_prompt"])
+                    verify_thinking = getattr(agent, "last_thinking", None)
+                    if verify_thinking is None:
+                        verify_thinking = extract_thinking(verify_response)
+                    thinkings.append(verify_thinking if verify_thinking is not None else "")
+                    verify_code = executor.extract_code(verify_response)
+                    verified, verify_result, verify_error = executor.execute_local(
+                        verify_code, meta["data_dir"], file_map=meta["file_map"],
+                        as_of_date=meta["as_of_date"], timeout_seconds=timeout,
+                        use_subprocess=True,
+                    )
+                    if verify_code:
+                        code_history.append(verify_code)
+                        last_output = verify_result if verified else verify_error
+                    if not verified or executor.is_empty_result(verify_result) or not evaluator.is_answer_match(
+                        verify_result, gate_res["answer"], q_type=gate_res["type"],
+                    ):
+                        gate_res = {"type": "abstain", "answer": "abstain", "passed": False,
+                                    "reason": "Model verification failed or contradicted computed result"}
 
             if gate_res.get("type") == "abstain":
                 formatted_answer = "abstain"
@@ -540,10 +584,7 @@ def iter_process_batch_chunk(
 
         elapsed_ms = max(0, int((time.perf_counter() - q_start) * 1000))
 
-        if llm_call_count > 1:
-            thinking_field = thinkings if len(thinkings) > 0 else None
-        else:
-            thinking_field = thinkings[0] if len(thinkings) > 0 else None
+        thinking_field = thinkings
 
         log_answer = None if formatted_answer in (None, "abstain", "unanswerable") else formatted_answer
         log_output = make_json_serializable(last_output) if executed_code is not None else None
@@ -553,7 +594,7 @@ def iter_process_batch_chunk(
             "answer": log_answer,
             "elapsed_ms": elapsed_ms,
             "thinking": thinking_field,
-            "code": executed_code,
+            "code": "\n\n".join(f"# ATTEMPT {attempt}\n{script}" for attempt, script in enumerate(code_history, 1)) if code_history else None,
             "output": log_output,
         }
 
@@ -565,6 +606,7 @@ def iter_process_batch_chunk(
             answer=formatted_answer,
             q_type=resolved_q_type,
             abstain_token="abstain",
+            reason=gate_res.get("reason") if isinstance(gate_res, dict) and resolved_q_type == "unanswerable" else None,
         )
 
 
@@ -666,7 +708,7 @@ def main() -> None:
         logger.info(f"Dataset as_of_date detected: {context.as_of_date}")
 
     # Step 2: Initialize Agent and Prompt Builder
-    prompt_builder = PromptBuilder(rulebook_content=rulebook_content)
+    prompt_builder = PromptBuilder(rulebook_content=rulebook_content, enable_verification=args.verify_with_model)
     system_prompt = prompt_builder.build_system_prompt(
         readme_content=context.readme_content or "",
         schema_context=context.to_enriched_schema_string(),

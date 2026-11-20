@@ -35,8 +35,7 @@ def extract_thinking(text: str) -> Optional[str]:
             thinking_body = after_think.split("</think>", 1)[0]
         else:
             thinking_body = after_think
-        stripped = thinking_body.strip()
-        return stripped if stripped else None
+        return thinking_body
     return None
 
 # Try importing vLLM
@@ -513,6 +512,7 @@ class CodeAgent:
         retry_results: Optional[List[Any]] = None,
         error_msg: Optional[str] = None,
         threshold: Optional[float] = None,
+        question: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Apply verification gate using configured abstain threshold.
 
@@ -530,6 +530,7 @@ class CodeAgent:
             retry_results=retry_results,
             error_msg=error_msg,
             threshold=eff_threshold,
+            question=question,
         )
 
     # Alias
@@ -545,6 +546,7 @@ def verification_gate(
     retry_results: Optional[List[Any]] = None,
     error_msg: Optional[str] = None,
     threshold: Optional[float] = None,
+    question: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Verification gate to guard against negative Penalized Accuracy scores (-1 vs 0).
 
@@ -568,6 +570,19 @@ def verification_gate(
     """
     from src import executor, formatter, evaluator
 
+    def contains_invalid(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, float):
+            return not math.isfinite(value)
+        if isinstance(value, dict):
+            return any(contains_invalid(item) for item in value.values())
+        if isinstance(value, (list, tuple, set)):
+            return any(contains_invalid(item) for item in value)
+        if isinstance(value, executor.pd.DataFrame):
+            return bool(value.isna().to_numpy().any())
+        return False
+
     eff_threshold = float(threshold) if isinstance(threshold, (int, float)) else ABSTAIN_THRESHOLD
     result = result if result is not None else raw_result
 
@@ -581,6 +596,13 @@ def verification_gate(
             "reason": f"Execution failed after retries: {error_msg or 'runtime exception'}",
         }
 
+    computed_types = {"number", "percent", "list", "table"}
+    if q_type in computed_types and not (code_str or "").strip():
+        return {
+            "type": "abstain", "answer": "abstain", "confidence": 0.0,
+            "passed": False, "reason": "No successfully executed code for computed answer",
+        }
+
     # a.2 None check
     if result is None:
         return {
@@ -592,7 +614,7 @@ def verification_gate(
         }
 
     # a.3 Float NaN or Inf check
-    if isinstance(result, float) and (math.isnan(result) or math.isinf(result)):
+    if isinstance(result, (int, float)) and not math.isfinite(result):
         return {
             "type": "abstain",
             "answer": "abstain",
@@ -611,6 +633,25 @@ def verification_gate(
             "reason": "Execution returned logically empty container or string",
         }
 
+    if contains_invalid(result):
+        return {
+            "type": "abstain", "answer": "abstain", "confidence": 0.0,
+            "passed": False, "reason": "Execution output contains None, NaN, or Inf",
+        }
+
+    source_checked = bool(
+        code_str
+        and re.search(r"\.columns|read_csv|read_excel|read_sql|PRAGMA|sqlite_master|FILE_MAP|README|schema", code_str, re.IGNORECASE)
+        and re.search(r"\bif\b[\s\S]*?\bnot\b|\bmissing\b|\bthiếu\b", code_str, re.IGNORECASE)
+    )
+    if isinstance(result, dict) and result.get("type") == "unanswerable":
+        reason = result.get("reason")
+        if source_checked and isinstance(reason, str) and reason.strip():
+            return {"type": "unanswerable", "answer": "unanswerable", "confidence": 1.0,
+                    "passed": True, "reason": reason.strip()}
+        return {"type": "abstain", "answer": "abstain", "confidence": 0.0,
+                "passed": False, "reason": "Unanswerable requires inspected source and a reason"}
+
     # a.5 Explicit abstain / unanswerable strings
     if isinstance(result, str):
         s_norm = result.strip().lower()
@@ -623,16 +664,30 @@ def verification_gate(
                 "reason": f"Result explicitly indicates abstain: {result}",
             }
         if s_norm == "unanswerable" or q_type == "unanswerable":
-            return {
-                "type": "unanswerable",
-                "answer": "unanswerable",
-                "confidence": 1.0,
-                "passed": True,
-                "reason": "Question is unanswerable",
-            }
+            return {"type": "abstain", "answer": "abstain", "confidence": 0.0,
+                    "passed": False, "reason": "Unanswerable requires inspected source and a reason"}
 
     confidence = 1.0
     reason_notes: List[str] = []
+
+    question_text = (question or "").casefold()
+    if q_type == "percent" and re.search(r"tỷ lệ|tỉ lệ|phần trăm|%|tăng trưởng|chiếm", question_text):
+        try:
+            numeric = float(str(result).strip().rstrip("%"))
+        except (TypeError, ValueError):
+            numeric = None
+        if numeric is not None and (0 < abs(numeric) < 1 and "%" not in str(result) or abs(numeric) > 10000):
+            return {
+                "type": "abstain", "answer": "abstain", "confidence": 0.0,
+                "passed": False, "reason": "Suspicious percent scale; verify multiplication by 100",
+            }
+
+    if q_type in {"list", "table", "number", "percent", "string"} and re.search(r"\btop\s*\d+|nhất|cao nhất|thấp nhất", question_text):
+        if not code_str or not re.search(r"sort_values|sorted\(|\.sort\(|nlargest|nsmallest|ORDER\s+BY", code_str, re.IGNORECASE):
+            return {
+                "type": "abstain", "answer": "abstain", "confidence": 0.0,
+                "passed": False, "reason": "Ranking code has no visible ordering or tie-break",
+            }
 
     # b.1 Output schema & type constraints check
     formatted_answer: Any = result
@@ -661,6 +716,10 @@ def verification_gate(
     elif q_type == "date":
         try:
             formatted_answer = formatter.format_date(result)
+            if "tháng nào" in question_text and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(formatted_answer)):
+                return {"type": "abstain", "answer": "abstain", "confidence": 0.0, "passed": False, "reason": "Month question requires yyyy-mm"}
+            if "ngày nào" in question_text and re.fullmatch(r"\d{4}-\d{2}", str(formatted_answer)):
+                return {"type": "abstain", "answer": "abstain", "confidence": 0.0, "passed": False, "reason": "Day question requires yyyy-mm-dd"}
             if not (re.match(r"^\d{4}-\d{2}-\d{2}$", str(formatted_answer)) or re.match(r"^\d{4}-\d{2}$", str(formatted_answer))):
                 confidence -= 0.5
                 reason_notes.append("Date string does not match standard ISO format")
