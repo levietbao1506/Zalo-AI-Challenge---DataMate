@@ -1,0 +1,81 @@
+name: Build and Upload Docker Submission Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      team_name:
+        description: 'Team name for submission image (e.g., datamate_team)'
+        required: true
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    name: Build & Upload Image
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Normalize team name
+        run: |
+          TEAM_LOWER=$(echo "${{ github.event.inputs.team_name }}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_')
+          echo "TEAM_LOWER=$TEAM_LOWER" >> $GITHUB_ENV
+
+      - name: Generate Dockerfile.ci
+        run: |
+          cat << 'EOF' > Dockerfile.ci
+          FROM python:3.12-slim
+          ENV PYTHONUNBUFFERED=1
+          RUN apt-get update && apt-get install -y --no-install-recommends build-essential gcc g++ && rm -rf /var/lib/apt/lists/*
+          RUN pip install --root-user-action=ignore --no-cache-dir pandas openpyxl lunarcalendar hf_transfer huggingface_hub llama-cpp-python
+          RUN HF_HUB_ENABLE_HF_TRANSFER=1 HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-14B', local_dir='/code/models/Qwen3-14B', local_dir_use_symlinks=False, max_workers=4)" \
+              && rm -rf /code/models/Qwen3-14B/.cache /root/.cache /tmp/*
+          COPY . /code
+          WORKDIR /code
+          CMD ["bash", "/code/predict.sh"]
+          EOF
+
+      - name: Build and inspect Docker submission image
+        run: |
+          df -h /
+          DOCKER_BUILDKIT=0 docker build -f Dockerfile.ci -t "zaic2026_datamate_${TEAM_LOWER}:final" .
+          docker image inspect -f '{{.Os}}/{{.Architecture}} {{.Size}}' "zaic2026_datamate_${TEAM_LOWER}:final"
+
+      - name: Verify offline GPU-free container environment
+        run: |
+          docker run --rm --network none "zaic2026_datamate_${TEAM_LOWER}:final" python3 -c "import pandas, llama_cpp; print('Environment verified.')"
+
+      - name: Install pigz, rclone and configure Google Drive
+        run: |
+          sudo apt-get update && sudo apt-get install -y pigz rclone
+          mkdir -p ~/.config/rclone
+          echo "[gdrive]" > ~/.config/rclone/rclone.conf
+          echo "type = drive" >> ~/.config/rclone/rclone.conf
+          echo "scope = drive" >> ~/.config/rclone/rclone.conf
+          echo 'token = ${{ secrets.RCLONE_DRIVE_TOKEN }}' >> ~/.config/rclone/rclone.conf
+          rclone about gdrive:
+
+      - name: Stream docker save via pigz to Google Drive and verify MD5
+        run: |
+          IMAGE_TAG="zaic2026_datamate_${TEAM_LOWER}:final"
+          ARCHIVE_NAME="zaic2026_datamate_${TEAM_LOWER}.tar.gz"
+          echo "Compressing and streaming $IMAGE_TAG to Google Drive..."
+          docker save "$IMAGE_TAG" | pigz -c -4 | rclone rcat "gdrive:/$ARCHIVE_NAME"
+          echo "Upload complete. Calculating remote MD5 checksum..."
+          MD5=$(rclone hashsum MD5 "gdrive:/$ARCHIVE_NAME" | awk '{print $1}')
+          echo "$MD5" > "${ARCHIVE_NAME}.md5"
+          rclone copyto "${ARCHIVE_NAME}.md5" "gdrive:/${ARCHIVE_NAME}.md5"
+          echo "------------------------------------------------"
+          echo "Submission Archive: $ARCHIVE_NAME"
+          echo "Checksum MD5: $MD5"
+          echo "------------------------------------------------"

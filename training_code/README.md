@@ -7,7 +7,7 @@ This directory contains the training environment specification, dataset validati
 ## 📌 Model Training & Fine-Tuning Disclosure
 
 > **Official Declaration**:
-> In accordance with the competition rules, **no model weight fine-tuning was performed** for this submission. The pipeline employs **zero-shot and few-shot in-context learning** with the foundation model **`Qwen/Qwen3-14B`**.
+> In accordance with the competition rules, **no model weight fine-tuning was performed** for this submission. The pipeline explicitly runs zero-shot offline inference on the official open-weight checkpoint **`Qwen/Qwen3-14B`** without extra fine-tuning or external API calls.
 >
 > High Penalized Accuracy (PA) is achieved through:
 > 1. Rich multi-file business schema parsing (`schema_parser.py`) including data types, row counts, and sample values.

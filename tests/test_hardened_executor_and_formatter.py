@@ -179,6 +179,22 @@ final_result = int(df["amount"].sum())
         self.assertTrue(res.success)
         self.assertEqual(res.return_value, 300)
 
+    def test_execute_subprocess_uppercase_final_result(self):
+        """FINAL_RESULT, RESULT, and final_answer variable names must be properly extracted."""
+        code_caps = """
+import pandas as pd
+df = pd.DataFrame({"rev": [100, 200, 300]})
+FINAL_RESULT = int(df["rev"].sum())
+"""
+        res = execute_subprocess(code_caps, data_dir=self.data_dir, timeout_seconds=10.0)
+        self.assertTrue(res.success)
+        self.assertEqual(res.return_value, 600)
+
+        # Local execution check as well
+        succ, local_val, err = execute_local(code_caps, data_dir=self.data_dir)
+        self.assertTrue(succ)
+        self.assertEqual(local_val, 600)
+
     def test_execute_subprocess_traceback_on_error(self):
         """Syntax, KeyError, and TypeError exceptions should capture exact traceback on stderr."""
         # KeyError
@@ -434,6 +450,19 @@ class TestHardenedFormatter(unittest.TestCase):
         self.assertEqual(parsed["id"], "q_103")
         self.assertEqual(parsed["type"], "boolean")
         self.assertIs(parsed["answer"], True)
+
+    def test_user_prompt_precomputed_intervals(self):
+        """PromptBuilder should inject pre-computed intervals when as_of_date is provided."""
+        pb = PromptBuilder()
+        prompt = pb.build_user_prompt(
+            question="Doanh thu tuần trước là bao nhiêu?",
+            schema_context="Table: orders.csv",
+            as_of_date="2024-06-19",
+        )
+        self.assertIn("PRE-COMPUTED TIME INTERVALS", prompt)
+        self.assertIn("Tuần trước / Tuần rồi", prompt)
+        self.assertIn("Tháng này (Month-to-Date", prompt)
+        self.assertIn("2024-06-19", prompt)
 
 
 if __name__ == "__main__":

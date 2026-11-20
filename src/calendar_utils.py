@@ -702,3 +702,84 @@ def resolve_vietnamese_relative_date(
         return date(next_y, 1, 1), date(next_y, 12, 31)
 
     return None
+
+
+def get_precomputed_intervals_summary(
+    as_of: Optional[Union[str, date, datetime]] = None,
+    calendar_path: Optional[Union[str, Path]] = None,
+) -> str:
+    """Pre-compute common Vietnamese relative date intervals anchored on as_of_date.
+
+    Generates explicit ISO date ranges for 'hôm nay', 'hôm qua', 'tuần này',
+    'tuần trước' (Mon-Sun), 'tháng này' (MTD & full month), 'tháng trước',
+    'cùng kỳ năm ngoái', 'năm nay' (YTD & full year), 'năm trước', 'quý này',
+    'quý trước', and 'Tết Nguyên Đán' window so the LLM never misinterprets
+    relative date boundaries.
+
+    Returns:
+        Formatted Markdown text block suitable for prompt injection.
+    """
+    ref_date = resolve_as_of_date(as_of)
+    yesterday = ref_date - timedelta(days=1)
+
+    # Week boundaries (Mon-Sun)
+    this_week_start, this_week_end = get_week_date_range(ref_date, week_start_monday=True)
+    last_week_start = this_week_start - timedelta(days=7)
+    last_week_end = this_week_start - timedelta(days=1)
+
+    # Month boundaries
+    cur_month_start = date(ref_date.year, ref_date.month, 1)
+    _, cur_month_last_day = calendar.monthrange(ref_date.year, ref_date.month)
+    cur_month_full_end = date(ref_date.year, ref_date.month, cur_month_last_day)
+    mtd_end = ref_date
+
+    # Last month
+    if ref_date.month == 1:
+        last_month_year, last_month_num = ref_date.year - 1, 12
+    else:
+        last_month_year, last_month_num = ref_date.year, ref_date.month - 1
+    last_month_start, last_month_end = get_month_date_range(last_month_year, last_month_num)
+
+    # Same period last year (cùng kỳ năm ngoái)
+    same_period_mtd_start, same_period_mtd_end = get_same_period_last_year(cur_month_start, mtd_end)
+    same_period_month_start, same_period_month_end = get_same_period_last_year(cur_month_start, cur_month_full_end)
+
+    # Quarter boundaries
+    q_num = get_quarter(ref_date)
+    this_q_start, this_q_full_end = get_quarter_date_range(ref_date.year, q_num)
+    if q_num == 1:
+        last_q_year, last_q_num = ref_date.year - 1, 4
+    else:
+        last_q_year, last_q_num = ref_date.year, q_num - 1
+    last_q_start, last_q_end = get_quarter_date_range(last_q_year, last_q_num)
+
+    # Year boundaries
+    ytd_start = date(ref_date.year, 1, 1)
+    ytd_end = ref_date
+    last_year_start = date(ref_date.year - 1, 1, 1)
+    last_year_end = date(ref_date.year - 1, 12, 31)
+
+    # Tet windows
+    try:
+        tet_start, tet_end = get_tet_window(ref_date.year, as_of=ref_date, calendar_path=calendar_path)
+        tet_str = f"từ `{tet_start.isoformat()}` đến `{tet_end.isoformat()}`"
+    except Exception:
+        tet_str = "Chưa xác định"
+
+    lines = [
+        "### KHOẢNG THỜI GIAN ĐÃ TÍNH TOÁN SẴN (PRE-COMPUTED TIME INTERVALS DỰA VÀO as_of_date):",
+        f"- Ngày tham chiếu / Hôm nay (Today / as_of_date): `{ref_date.isoformat()}`",
+        f"- Hôm qua (Yesterday): `{yesterday.isoformat()}`",
+        f"- Tuần này (This week, Thứ 2 - Chủ Nhật): từ `{this_week_start.isoformat()}` đến `{this_week_end.isoformat()}`",
+        f"- Tuần trước / Tuần rồi (Last week, Thứ 2 - Chủ Nhật): từ `{last_week_start.isoformat()}` đến `{last_week_end.isoformat()}`",
+        f"- Tháng này (Month-to-Date, từ đầu tháng đến as_of_date): từ `{cur_month_start.isoformat()}` đến `{mtd_end.isoformat()}`",
+        f"- Toàn bộ tháng này (Full current month): từ `{cur_month_start.isoformat()}` đến `{cur_month_full_end.isoformat()}`",
+        f"- Tháng trước / Tháng rồi (Last month): từ `{last_month_start.isoformat()}` đến `{last_month_end.isoformat()}`",
+        f"- Cùng kỳ tháng này năm ngoái (Same period last year MTD): từ `{same_period_mtd_start.isoformat()}` đến `{same_period_mtd_end.isoformat()}`",
+        f"- Quý này (This quarter Q{q_num}): từ `{this_q_start.isoformat()}` đến `{this_q_full_end.isoformat()}` (hoặc đến as_of_date `{ref_date.isoformat()}`)",
+        f"- Quý trước (Last quarter Q{last_q_num}/{last_q_year}): từ `{last_q_start.isoformat()}` đến `{last_q_end.isoformat()}`",
+        f"- Năm nay (Year-to-Date): từ `{ytd_start.isoformat()}` đến `{ytd_end.isoformat()}`",
+        f"- Năm ngoái / Năm trước (Last year): từ `{last_year_start.isoformat()}` đến `{last_year_end.isoformat()}`",
+        f"- Dịp Tết Nguyên Đán năm {ref_date.year} (Tet holiday window): {tet_str}",
+    ]
+    return "\n".join(lines)

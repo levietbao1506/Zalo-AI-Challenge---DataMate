@@ -323,6 +323,7 @@ def _build_local_namespace(
         "np": np if _HAS_NUMPY else None,
         "duckdb": duckdb if _HAS_DUCKDB else None,
         "sqlite3": sqlite3,
+        "openpyxl": openpyxl,
         "math": math,
         "re": re,
         "unicodedata": unicodedata,
@@ -351,6 +352,10 @@ def _build_local_namespace(
         "get_holiday_range": calendar_utils.get_holiday_range,
         "solar_to_lunar": calendar_utils.solar_to_lunar,
         "lunar_to_solar": calendar_utils.lunar_to_solar,
+        "result": None,
+        "final_result": None,
+        "RESULT": None,
+        "FINAL_RESULT": None,
     }
     if file_map:
         for fname, fpath in file_map.items():
@@ -600,6 +605,8 @@ exec_globals = {{
     "AS_OF_DATE": str(as_of_date),
     "result": None,
     "final_result": None,
+    "RESULT": None,
+    "FINAL_RESULT": None,
 }}
 
 # Inject direct aliases for business files (e.g. orders_csv = '/path/to/orders.csv')
@@ -614,7 +621,7 @@ try:
     exec(compiled, exec_globals, exec_locals)
 
     extracted_result = None
-    for var_name in ("final_result", "result"):
+    for var_name in ("FINAL_RESULT", "final_result", "RESULT", "result", "final_answer", "ans"):
         if var_name in exec_locals and exec_locals[var_name] is not None:
             extracted_result = exec_locals[var_name]
             break
@@ -753,7 +760,11 @@ def execute_local(
     def _run() -> tuple[bool, Any, str]:
         try:
             exec(code_str, namespace)
-            extracted = namespace["final_result"] if "final_result" in namespace else namespace.get("result")
+            extracted = None
+            for var_name in ("FINAL_RESULT", "final_result", "RESULT", "result", "final_answer", "ans"):
+                if var_name in namespace and namespace[var_name] is not None:
+                    extracted = namespace[var_name]
+                    break
             return (True, extracted, "")
         except Exception as e:
             tb = traceback.format_exc()
@@ -1059,6 +1070,8 @@ class SandboxedExecutor:
             # Default placeholder for result
             "result": None,
             "final_result": None,
+            "RESULT": None,
+            "FINAL_RESULT": None,
         }
 
         # Convenience aliases for file paths directly in globals (e.g. orders_csv = '/path/to/orders.csv')
@@ -1126,7 +1139,7 @@ class SandboxedExecutor:
 
                 # 3. Extract result: look for final_result first, then result
                 extracted_result = None
-                for var_name in ("final_result", "result"):
+                for var_name in ("FINAL_RESULT", "final_result", "RESULT", "result", "final_answer", "ans"):
                     if var_name in local_scope and local_scope[var_name] is not None:
                         extracted_result = local_scope[var_name]
                         break

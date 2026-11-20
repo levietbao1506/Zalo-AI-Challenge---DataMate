@@ -707,4 +707,10 @@ def append_submission_line(
     path = Path(output_file).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(safe_record, ensure_ascii=False, allow_nan=False) + "\n")
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.flush()
+        try:
+            import os
+            os.fsync(f.fileno())
+        except OSError:
+            pass

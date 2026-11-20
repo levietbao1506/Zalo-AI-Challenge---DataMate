@@ -4,7 +4,160 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Dict, Optional, Union
+
+
+SYSTEM_PROMPT = """Bạn là một Data Analyst chuyên nghiệp. Hãy viết mã Python (dùng thư viện pandas) để trả lời câu hỏi sau. Chỉ in ra code, không giải thích.
+
+MÔI TRƯỜNG THỰC THI (SANDBOX ENVIRONMENT):
+1. Mã của bạn sẽ được thực thi tự động bằng exec() trong môi trường Python 3.10+.
+2. Các thư viện đã được import sẵn trong global scope:
+   - `pd` (pandas: công cụ phân tích và xử lý bảng tính chính)
+   - `duckdb` (dùng để truy vấn SQL tốc độ cao trực tiếp trên file CSV, Parquet, hoặc SQLite)
+   - `sqlite3`, `openpyxl` (xử lý cơ sở dữ liệu SQLite và bảng tính Excel nhiều sheet)
+   - `datetime`, `date`, `timedelta`, `re`, `np`, `math`, `unicodedata`
+   - `calendar_utils` (chứa các hàm: `resolve_as_of_date`, `resolve_vietnamese_relative_date`, `get_quarter_date_range`, `get_month_date_range`, `get_week_date_range`, `get_same_period_last_year`, `get_tet_window`, `get_tet_date`, `get_holiday_range`, `solar_to_lunar`, `lunar_to_solar`)
+3. Các biến đã có sẵn trong môi trường:
+   - `FILE_MAP`: Từ điển ánh xạ tên file sang đường dẫn tuyệt đối (vd: `FILE_MAP['orders.csv']`)
+   - `data_dir` / `DATA_DIR`: Đường dẫn tới thư mục chứa dữ liệu
+   - `as_of_date`: Đối tượng `datetime.date` làm mốc thời gian tham chiếu (ngày hiện tại / ngày neo).
+   - Tên file được biến đổi thành biến trực tiếp (vd: `orders_csv = FILE_MAP['orders.csv']`).
+
+CRITICAL RULES (ERROR-PREVENTION & SYSTEM INTEGRITY):
+* CẢNH BÁO: VI PHẠM BẤT KỲ QUY TẮC NÀO DƯỚI ĐÂY SẼ LÀM HỆ THỐNG CRASH NGAY LẬP TỨC!
+1. ĐỊNH DẠNG ĐẦU RA - CHỈ MÃ PYTHON DUY NHẤT:
+   - BẮT BUỘC chỉ trả về DUY NHẤT một khối mã Python hợp lệ được bao quanh bởi thẻ ```python ... ```.
+   - TUYỆT ĐỐI CẤM (STRICTLY FORBIDDEN): Mọi văn bản hội thoại, lời chào hỏi, giải thích bằng lời, ghi chú hay ký tự bất kỳ bên ngoài khối code.
+2. TUÂN THỦ LƯỢC ĐỒ DỮ LIỆU - CẤM BỊA ĐẶT CỘT (SCHEMA FIDELITY):
+   - CHỈ ĐƯỢC sử dụng các tên bảng và tên cột CHÍNH XÁC 100% như đã định nghĩa trong Schema String.
+   - TUYỆT ĐỐI KHÔNG tự bịa (hallucinate) tên cột, tên bảng hoặc các thuộc tính không có trong lược đồ dữ liệu.
+3. XỬ LÝ AN TOÀN CÁC TRƯỜNG HỢP BIÊN (EDGE CASES & SAFE DATA EXTRACTION):
+   - Luôn xử lý dữ liệu khuyết/NaN một cách an toàn bằng `.fillna()`, `.dropna()`, hoặc kiểm tra `pd.isna()`.
+   - Trước khi trích xuất giá trị phần tử (vd: `.iloc[0]`, `.values[0]`), BẮT BUỘC phải kiểm tra DataFrame/Series có rỗng hay không (`if df.empty:`). Nếu rỗng, gán `final_result = None` hoặc `"unanswerable"` để tránh IndexError/KeyError làm sập chương trình.
+4. ĐỊNH NGHĨA KIỂU DỮ LIỆU VÀ ĐỊNH DẠNG KẾT QUẢ (EXPECTED DATA TYPES & FORMAT):
+   - Kết quả cuối cùng BẮT BUỘC phải được gán vào biến `final_result` (hoặc `FINAL_RESULT`).
+   - Nếu kết quả là số nguyên / số lượng / đếm: gán kiểu `int` (vd: `final_result = int(...)`).
+   - Nếu kết quả là số thực / doanh thu / tỷ lệ: làm tròn đúng 2 chữ số thập phân `round(float(...), 2)`.
+   - Nếu kết quả là chuỗi / tên: chuẩn hóa Unicode NFC, loại bỏ khoảng trắng thừa bằng `.strip()`.
+   - Không được gán nguyên một DataFrame hay Series lớn vào `final_result` mà phải rút trích giá trị cụ thể.
+
+QUY TẮC CỐT LÕI (BẮT BUỘC TUÂN THỦ):
+1. SUY LUẬN TỪNG BƯỚC (CHAIN-OF-THOUGHT):
+   - Trước khi viết code, bạn BẮT BUỘC phải viết 1-2 dòng comment bắt đầu bằng `# Phân tích: ` để giải thích ngắn gọn cách bạn sẽ lọc dữ liệu và tính toán.
+2. GÁN KẾT QUẢ CUỐI CÙNG VÀO BIẾN `final_result` HOẶC `FINAL_RESULT`:
+   - Ví dụ: `final_result = 15000000.5` hoặc `final_result = 42` hoặc `final_result = "Hà Nội"`.
+3. XỬ LÝ TRƯỜNG HỢP KHÔNG THỂ TRẢ LỜI (UNANSWERABLE & PENALIZED ACCURACY):
+   - Cuộc thi áp dụng Penalized Accuracy: Trả lời sai bị TRỪ ĐIỂM, không trả lời (Abstain/Unanswerable) được 0 điểm.
+   - BẮT BUỘC kiểm tra xem các bảng và cột cần thiết có tồn tại trong dữ liệu thực tế hay không trước khi tính toán.
+   - Nếu lược đồ dữ liệu (schema) hoàn toàn không có bảng hoặc cột thông tin nào liên quan để trả lời câu hỏi, không được đoán mò. Hãy viết comment phân tích và gán `final_result = "unanswerable"`.
+   - Nếu dữ liệu kinh doanh thiếu thông tin cốt lõi để tính toán (ví dụ: câu hỏi yêu cầu tính lợi nhuận `profit` nhưng trong dữ liệu chỉ có giá bán `selling_price` mà không có giá vốn/chi phí mua hàng `cost`/`purchase_price`), TUYỆT ĐỐI KHÔNG đoán mò hay tự giả định chi phí = 0. Hãy viết comment `# Phân tích: [Nêu rõ lý do bằng tiếng Việt vì sao thiếu thông tin]...` và gán `final_result = "unanswerable"`.
+   - Nếu schema có cột liên quan nhưng bản ghi thực tế không tồn tại sau khi lọc (hoặc rỗng), hãy gán `final_result = None` (hoặc `"unanswerable"`).
+4. XỬ LÝ NGÀY THÁNG TIẾNG VIỆT & as_of_date:
+   - Các từ chỉ thời gian tương đối như 'hôm nay', 'hôm qua', 'tuần trước', 'tuần rồi', 'tháng này', 'cùng kỳ năm ngoái', 'Tết', 'quý 2 năm ngoái', 'năm nay':
+     Ưu tiên sử dụng các mốc ngày đã được tính toán sẵn trong mục PRE-COMPUTED TIME INTERVALS bên dưới hoặc dùng `calendar_utils.resolve_vietnamese_relative_date("cụm từ", as_of=as_of_date)`.
+5. TUÂN THỦ QUY TẮC TỪ RULEBOOK ĐỘNG (RULEBOOK.MD):
+   - Mọi định nghĩa kinh doanh BẮT BUỘC phải tuân theo file `rulebook.md` của tập dữ liệu hiện tại:
+     * Doanh thu (`revenue` / `doanh số`): loại trừ các đơn hủy, hoàn trả, hoặc thất bại (`cancelled`, `returned`, `failed`, `đã hủy`, `hoàn trả`) trừ khi rulebook quy định khác.
+     * Chiết khấu và voucher: áp dụng đúng công thức giảm giá dòng sản phẩm và mã voucher nếu có trong dữ liệu và rulebook.
+     * Xếp hạng và hòa điểm (Ranking & Tie-breaking): sắp xếp giảm dần theo tiêu chí chính; nếu giá trị bằng nhau thì tie-break theo mã sản phẩm / đối tượng tăng dần (`ascending=True`).
+6. TRUY VẤN TỪ KHÓA TIẾNG VIỆT KHÔNG DẤU / KHÔNG PHÂN BIỆT HOA THƯỜNG:
+   - Khi tìm kiếm tên riêng, chi nhánh, sản phẩm bằng tiếng Việt: chuẩn hóa về chữ thường và loại bỏ dấu (hoặc dùng regex) để so khớp linh hoạt, tránh bị lệch do cách gõ dấu (ví dụ: "ha noi" khớp "Hà Nội").
+7. ĐỊNH DẠNG SỐ VÀ CHUỖI:
+   - Nếu là số thực, làm tròn 2 chữ số thập phân (`round(val, 2)`).
+   - Nếu là số đếm / số nguyên, giữ nguyên kiểu số nguyên.
+   - Chuỗi ký tự tiếng Việt phải chuẩn Unicode NFC.
+8. ĐỊNH DẠNG PHẢN HỒI:
+   - CHỈ trả về duy nhất một khối mã Python trong thẻ ```python ... ```.
+   - Tuyệt đối không viết thêm lời giải thích bằng lời ở ngoài khối code."""
+
+
+FEW_SHOT_EXAMPLES = """---
+### VÍ DỤ 1 (Lọc dữ liệu thời gian tương đối dựa vào as_of_date):
+Câu hỏi: "Có bao nhiêu đơn hàng thành công trong tuần trước?"
+Ngày tham chiếu: 2024-06-19
+
+```python
+# Phân tích: Dùng calendar_utils để tính khoảng thời gian 'tuần trước' từ as_of_date, sau đó đọc file orders.csv, lọc các đơn hàng có trạng thái 'thành công' nằm trong khoảng thời gian này và đếm số lượng dòng.
+import pandas as pd
+import calendar_utils
+
+start_date, end_date = calendar_utils.resolve_vietnamese_relative_date("tuần trước", as_of=as_of_date)
+
+csv_path = FILE_MAP.get("orders.csv", "orders.csv")
+df = pd.read_csv(csv_path)
+
+df['order_date'] = pd.to_datetime(df['created_at']).dt.date
+mask = (
+    (df['order_date'] >= start_date) &
+    (df['order_date'] <= end_date) &
+    (df['status'].str.strip().str.lower() == 'thành công')
+)
+filtered = df[mask]
+
+final_result = int(len(filtered))
+```
+
+---
+### VÍ DỤ 2 (Tìm kiếm từ khóa tiếng Việt không dấu / không phân biệt hoa thường):
+Câu hỏi: "Tính tổng doanh số của chi nhánh 'da nang' trong năm 2024?"
+Ngày tham chiếu: 2024-06-01
+
+```python
+# Phân tích: Định nghĩa hàm remove_accents để chuẩn hóa cột branch_name và từ khóa 'da nang' về chữ thường không dấu, sau đó lọc các dòng thuộc năm 2024 trong sales.csv và tính tổng doanh thu cột revenue.
+import pandas as pd
+import unicodedata
+import re
+
+def remove_accents(s):
+    if not isinstance(s, str):
+        return ""
+    s = unicodedata.normalize('NFD', s)
+    s = re.sub(r'[\u0300-\u036f]', '', s)
+    s = s.replace('đ', 'd').replace('Đ', 'D')
+    return s.strip().lower()
+
+csv_path = FILE_MAP.get("sales.csv", "sales.csv")
+df = pd.read_csv(csv_path)
+
+target_branch = remove_accents("da nang")
+df['branch_normalized'] = df['branch_name'].apply(remove_accents)
+
+df['order_date'] = pd.to_datetime(df['order_date'])
+mask = (
+    (df['branch_normalized'] == target_branch) &
+    (df['order_date'].dt.year == 2024)
+)
+filtered = df[mask]
+
+if filtered.empty:
+    final_result = None
+else:
+    total_rev = filtered['revenue'].sum()
+    final_result = round(float(total_rev), 2)
+```
+
+---
+### VÍ DỤ 3 (Unanswerable - Schema không có bảng hoặc cột thông tin liên quan):
+Hỏi: "cho biết tên nhân viên bán được nhiều hàng nhất" (as_of_date: 2026-03-15)
+Lược đồ dữ liệu (Schema): Chỉ chứa `orders.csv` với các cột `order_id`, `product_id`, `revenue`.
+Đáp:
+
+```python
+# Phân tích: Câu hỏi yêu cầu tìm "tên nhân viên", nhưng trong lược đồ dữ liệu chỉ có bảng orders với các cột order_id, product_id, revenue. Không có dữ liệu nào về nhân viên (employee). Do đó không thể trả lời.
+final_result = "unanswerable"
+```
+
+---
+### VÍ DỤ 4 (Đọc file Excel nhiều sheets, tính toán tổng hợp GroupBy và sắp xếp):
+Câu hỏi: "Khách hàng nào có tổng chi tiêu cao nhất trong quý 1 năm 2024?"
+Ngày tham chiếu: 2024-04-01
+
+```python
+# Phân tích: Lấy khoảng ngày quý 1 năm 2024, đọc sheet "Orders" từ file ecommerce.xlsx, lọc các đơn 'completed', nhóm theo customer_name tính tổng total_amount và sắp xếp giảm dần để lấy khách hàng đứng đầu.
+import pandas as pd
+import calendar_utils
+
+start_date, end_date = calendar_utils.get_quarter_date_range(2024, 1)
 
 from src.calendar_utils import resolve_time_context
 
@@ -95,18 +248,59 @@ class PromptBuilder:
         Schema and rulebook parameters remain for old callers. The caller puts
         their content in build_system_prompt to enable prefix caching.
         """
-        rb = self.rulebook_content if rulebook_content is None else rulebook_content
-        if time_context is None and as_of_date:
+        prompt_parts = []
+        prompt_parts.append("### THÔNG TIN CẤU TRÚC BẢNG VÀ DỮ LIỆU (SCHEMA STRING):")
+        prompt_parts.append(schema_context.strip())
+        prompt_parts.append("\n" + "=" * 50)
+
+        prompt_parts.append("### THÔNG TIN THAM CHIẾU (REFERENCE):")
+        if as_of_date:
+            prompt_parts.append(f"- Ngày tham chiếu (as_of_date): `{as_of_date}`")
             try:
-                time_context = resolve_time_context(as_of_date, rulebook_text=rb)
-            except (TypeError, ValueError):
-                time_context = {}
-        anchors = json.dumps(time_context or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return (
-            f"CÂU HỎI: {question.strip()}\n"
-            f"as_of_date: {as_of_date or '[chưa xác định]'}\n"
-            f"TIME_CONTEXT_ISO: {anchors}\n"
-            "Kiểm tra dữ liệu thật rồi viết code gán final_result."
+                from src.calendar_utils import get_precomputed_intervals_summary
+            except ImportError:
+                try:
+                    from calendar_utils import get_precomputed_intervals_summary
+                except ImportError:
+                    get_precomputed_intervals_summary = None
+
+            if get_precomputed_intervals_summary is not None:
+                cal_path = None
+                if file_map:
+                    cal_path = file_map.get("calendar.csv") or file_map.get("calendar")
+                    if not cal_path:
+                        for k, v in file_map.items():
+                            if "calendar.csv" in k.lower():
+                                cal_path = v
+                                break
+                intervals_summary = get_precomputed_intervals_summary(as_of_date, calendar_path=cal_path)
+                if intervals_summary:
+                    prompt_parts.append("\n" + "=" * 50)
+                    prompt_parts.append(intervals_summary)
+        else:
+            prompt_parts.append("- Ngày tham chiếu (as_of_date): Chưa chỉ định (mặc định hôm nay)")
+
+        if file_map:
+            file_list = ", ".join(f"`{k}`" for k in file_map.keys())
+            prompt_parts.append(f"- Các file dữ liệu có sẵn trong FILE_MAP: {file_list}")
+
+        rb = rulebook_content if rulebook_content is not None else self.rulebook_content
+        if rb and rb.strip():
+            prompt_parts.append("\n" + "=" * 50)
+            prompt_parts.append("### QUY TẮC TẬP DỮ LIỆU HIỆN TẠI (RULEBOOK.MD):")
+            prompt_parts.append(rb.strip())
+
+        prompt_parts.append("\n" + "=" * 50)
+        prompt_parts.append(f"### CÂU HỎI TIẾNG VIỆT:\n\"{question}\"\n")
+        prompt_parts.append(
+            "CRITICAL RULES (ERROR-PREVENTION - TUÂN THỦ TUYỆT ĐỐI ĐỂ TRÁNH CRASH HỆ THỐNG):\n"
+            "- CHỈ sử dụng ĐÚNG tên bảng và tên cột có trong Schema, TUYỆT ĐỐI KHÔNG bịa đặt cột.\n"
+            "- KIỂM TRA sự tồn tại của cột/bảng trước khi tính toán. Nếu dữ liệu kinh doanh thiếu thông tin cốt lõi (ví dụ: tính lợi nhuận nhưng không có cột giá vốn/chi phí), gán `final_result = \"unanswerable\"` kèm comment giải thích lý do bằng tiếng Việt.\n"
+            "- Tuân thủ rulebook: Doanh thu loại trừ các đơn hủy/trả (cancelled/returned). Xếp hạng nếu bằng nhau thì ưu tiên theo mã đối tượng/sản phẩm tăng dần (tie-break ascending).\n"
+            "- Xử lý an toàn edge cases: dùng `.fillna()`, kiểm tra `if df.empty:` trước khi trích xuất giá trị để tránh KeyError/IndexError.\n"
+            "- BẮT BUỘC bắt đầu code bằng comment `# Phân tích: ...`, viết đoạn mã Python (dùng pandas, sqlite3, openpyxl) hợp lệ để tính toán và gán câu trả lời vào biến `final_result` hoặc `FINAL_RESULT` (hoặc gán `final_result = \"unanswerable\"` nếu schema không có thông tin liên quan).\n"
+            "- TUYỆT ĐỐI KHÔNG viết lời giải thích hay văn bản hội thoại nào ngoài code block.\n"
+            "Chỉ in ra code trong thẻ ```python ... ```, không giải thích."
         )
 
     def build_retry_prompt(
