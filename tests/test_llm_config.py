@@ -3,7 +3,10 @@
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
+import tempfile
 import unittest
+from unittest.mock import patch
 
 from src.llm_config import (
     DEFAULT_MAX_MODEL_LEN,
@@ -16,6 +19,8 @@ from src.llm_config import (
     THINKING_TOP_P,
     Qwen3OfflineEngine,
     VLLMConfig,
+    detect_optimal_gpu_mode,
+    extract_reasoning_and_content,
     get_sampling_params,
 )
 
@@ -76,6 +81,49 @@ class TestLLMConfigAndManifest(unittest.TestCase):
         outputs = engine.generate(["Write code to count rows"])
         self.assertEqual(len(outputs), 1)
         self.assertIn("```python", outputs[0])
+
+    def test_gpu_mode_requires_quantization_and_under_22gb_for_dp(self):
+        fake_torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True, device_count=lambda: 2))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model_dir = Path(tmp_dir)
+            (model_dir / "config.json").write_text(
+                json.dumps({"quantization_config": {"quant_method": "awq"}}),
+                encoding="utf-8",
+            )
+            with patch("src.llm_config.torch", fake_torch), patch(
+                "src.llm_config._HAS_TORCH", True
+            ), patch("src.llm_config.estimate_model_weight_gb", return_value=18.0):
+                self.assertEqual(detect_optimal_gpu_mode(model_dir), ("DP", 1, 2))
+            with patch("src.llm_config.torch", fake_torch), patch(
+                "src.llm_config._HAS_TORCH", True
+            ), patch("src.llm_config.estimate_model_weight_gb", return_value=24.0):
+                self.assertEqual(detect_optimal_gpu_mode(model_dir), ("TP", 2, 1))
+            (model_dir / "config.json").write_text(
+                json.dumps({"torch_dtype": "bfloat16"}),
+                encoding="utf-8",
+            )
+            with patch("src.llm_config.torch", fake_torch), patch(
+                "src.llm_config._HAS_TORCH", True
+            ), patch("src.llm_config.estimate_model_weight_gb", return_value=18.0):
+                self.assertEqual(detect_optimal_gpu_mode(model_dir), ("TP", 2, 1))
+
+    def test_gpu_mode_falls_back_to_single_gpu(self):
+        fake_torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True, device_count=lambda: 1))
+        with patch("src.llm_config.torch", fake_torch), patch("src.llm_config._HAS_TORCH", True):
+            self.assertEqual(detect_optimal_gpu_mode("missing"), ("SINGLE_GPU", 1, 1))
+
+    def test_reasoning_content_is_preserved_without_truncation(self):
+        reasoning = "lập luận tiếng Việt " * 2000
+        output = SimpleNamespace(
+            outputs=[SimpleNamespace(text="```sql\nSELECT 1\n```", reasoning_content=reasoning)]
+        )
+        extracted, content = extract_reasoning_and_content(output)
+        self.assertEqual(extracted, reasoning)
+        self.assertEqual(content, "```sql\nSELECT 1\n```")
+        tagged = f"<think>{reasoning}</think>answer"
+        extracted_tagged, full = extract_reasoning_and_content(tagged)
+        self.assertEqual(extracted_tagged, reasoning)
+        self.assertEqual(full, tagged)
 
     def test_data_manifest_specification(self):
         """Verify training_code/data_manifest.json contains required Qwen3-14B metadata and checksums."""

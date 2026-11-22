@@ -1,200 +1,248 @@
-"""Compact, split-specific prompts for offline tabular question answering."""
+"""Prefix-stable prompts for Adaptive Hybrid tabular question answering."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, Optional, Union
-
-
-SYSTEM_PROMPT = """Bạn là một Data Analyst chuyên nghiệp. Hãy viết mã Python (dùng thư viện pandas) để trả lời câu hỏi sau. Chỉ in ra code, không giải thích.
-
-MÔI TRƯỜNG THỰC THI (SANDBOX ENVIRONMENT):
-1. Mã của bạn sẽ được thực thi tự động bằng exec() trong môi trường Python 3.10+.
-2. Các thư viện đã được import sẵn trong global scope:
-   - `pd` (pandas: công cụ phân tích và xử lý bảng tính chính)
-   - `duckdb` (dùng để truy vấn SQL tốc độ cao trực tiếp trên file CSV, Parquet, hoặc SQLite)
-   - `sqlite3`, `openpyxl` (xử lý cơ sở dữ liệu SQLite và bảng tính Excel nhiều sheet)
-   - `datetime`, `date`, `timedelta`, `re`, `np`, `math`, `unicodedata`
-   - `calendar_utils` (chứa các hàm: `resolve_as_of_date`, `resolve_vietnamese_relative_date`, `get_quarter_date_range`, `get_month_date_range`, `get_week_date_range`, `get_same_period_last_year`, `get_tet_window`, `get_tet_date`, `get_holiday_range`, `solar_to_lunar`, `lunar_to_solar`)
-3. Các biến đã có sẵn trong môi trường:
-   - `FILE_MAP`: Từ điển ánh xạ tên file sang đường dẫn tuyệt đối (vd: `FILE_MAP['orders.csv']`)
-   - `data_dir` / `DATA_DIR`: Đường dẫn tới thư mục chứa dữ liệu
-   - `as_of_date`: Đối tượng `datetime.date` làm mốc thời gian tham chiếu (ngày hiện tại / ngày neo).
-   - Tên file được biến đổi thành biến trực tiếp (vd: `orders_csv = FILE_MAP['orders.csv']`).
-
-CRITICAL RULES (ERROR-PREVENTION & SYSTEM INTEGRITY):
-* CẢNH BÁO: VI PHẠM BẤT KỲ QUY TẮC NÀO DƯỚI ĐÂY SẼ LÀM HỆ THỐNG CRASH NGAY LẬP TỨC!
-1. ĐỊNH DẠNG ĐẦU RA - CHỈ MÃ PYTHON DUY NHẤT:
-   - BẮT BUỘC chỉ trả về DUY NHẤT một khối mã Python hợp lệ được bao quanh bởi thẻ ```python ... ```.
-   - TUYỆT ĐỐI CẤM (STRICTLY FORBIDDEN): Mọi văn bản hội thoại, lời chào hỏi, giải thích bằng lời, ghi chú hay ký tự bất kỳ bên ngoài khối code.
-2. TUÂN THỦ LƯỢC ĐỒ DỮ LIỆU - CẤM BỊA ĐẶT CỘT (SCHEMA FIDELITY):
-   - CHỈ ĐƯỢC sử dụng các tên bảng và tên cột CHÍNH XÁC 100% như đã định nghĩa trong Schema String.
-   - TUYỆT ĐỐI KHÔNG tự bịa (hallucinate) tên cột, tên bảng hoặc các thuộc tính không có trong lược đồ dữ liệu.
-3. XỬ LÝ AN TOÀN CÁC TRƯỜNG HỢP BIÊN (EDGE CASES & SAFE DATA EXTRACTION):
-   - Luôn xử lý dữ liệu khuyết/NaN một cách an toàn bằng `.fillna()`, `.dropna()`, hoặc kiểm tra `pd.isna()`.
-   - Trước khi trích xuất giá trị phần tử (vd: `.iloc[0]`, `.values[0]`), BẮT BUỘC phải kiểm tra DataFrame/Series có rỗng hay không (`if df.empty:`). Nếu rỗng, gán `final_result = None` hoặc `"unanswerable"` để tránh IndexError/KeyError làm sập chương trình.
-4. ĐỊNH NGHĨA KIỂU DỮ LIỆU VÀ ĐỊNH DẠNG KẾT QUẢ (EXPECTED DATA TYPES & FORMAT):
-   - Kết quả cuối cùng BẮT BUỘC phải được gán vào biến `final_result` (hoặc `FINAL_RESULT`).
-   - Nếu kết quả là số nguyên / số lượng / đếm: gán kiểu `int` (vd: `final_result = int(...)`).
-   - Nếu kết quả là số thực / doanh thu / tỷ lệ: làm tròn đúng 2 chữ số thập phân `round(float(...), 2)`.
-   - Nếu kết quả là chuỗi / tên: chuẩn hóa Unicode NFC, loại bỏ khoảng trắng thừa bằng `.strip()`.
-   - Không được gán nguyên một DataFrame hay Series lớn vào `final_result` mà phải rút trích giá trị cụ thể.
-
-QUY TẮC CỐT LÕI (BẮT BUỘC TUÂN THỦ):
-1. SUY LUẬN TỪNG BƯỚC (CHAIN-OF-THOUGHT):
-   - Trước khi viết code, bạn BẮT BUỘC phải viết 1-2 dòng comment bắt đầu bằng `# Phân tích: ` để giải thích ngắn gọn cách bạn sẽ lọc dữ liệu và tính toán.
-2. GÁN KẾT QUẢ CUỐI CÙNG VÀO BIẾN `final_result` HOẶC `FINAL_RESULT`:
-   - Ví dụ: `final_result = 15000000.5` hoặc `final_result = 42` hoặc `final_result = "Hà Nội"`.
-3. XỬ LÝ TRƯỜNG HỢP KHÔNG THỂ TRẢ LỜI (UNANSWERABLE & PENALIZED ACCURACY):
-   - Cuộc thi áp dụng Penalized Accuracy: Trả lời sai bị TRỪ ĐIỂM, không trả lời (Abstain/Unanswerable) được 0 điểm.
-   - BẮT BUỘC kiểm tra xem các bảng và cột cần thiết có tồn tại trong dữ liệu thực tế hay không trước khi tính toán.
-   - Nếu lược đồ dữ liệu (schema) hoàn toàn không có bảng hoặc cột thông tin nào liên quan để trả lời câu hỏi, không được đoán mò. Hãy viết comment phân tích và gán `final_result = "unanswerable"`.
-   - Nếu dữ liệu kinh doanh thiếu thông tin cốt lõi để tính toán (ví dụ: câu hỏi yêu cầu tính lợi nhuận `profit` nhưng trong dữ liệu chỉ có giá bán `selling_price` mà không có giá vốn/chi phí mua hàng `cost`/`purchase_price`), TUYỆT ĐỐI KHÔNG đoán mò hay tự giả định chi phí = 0. Hãy viết comment `# Phân tích: [Nêu rõ lý do bằng tiếng Việt vì sao thiếu thông tin]...` và gán `final_result = "unanswerable"`.
-   - Nếu schema có cột liên quan nhưng bản ghi thực tế không tồn tại sau khi lọc (hoặc rỗng), hãy gán `final_result = None` (hoặc `"unanswerable"`).
-4. XỬ LÝ NGÀY THÁNG TIẾNG VIỆT & as_of_date:
-   - Các từ chỉ thời gian tương đối như 'hôm nay', 'hôm qua', 'tuần trước', 'tuần rồi', 'tháng này', 'cùng kỳ năm ngoái', 'Tết', 'quý 2 năm ngoái', 'năm nay':
-     Ưu tiên sử dụng các mốc ngày đã được tính toán sẵn trong mục PRE-COMPUTED TIME INTERVALS bên dưới hoặc dùng `calendar_utils.resolve_vietnamese_relative_date("cụm từ", as_of=as_of_date)`.
-5. TUÂN THỦ QUY TẮC TỪ RULEBOOK ĐỘNG (RULEBOOK.MD):
-   - Mọi định nghĩa kinh doanh BẮT BUỘC phải tuân theo file `rulebook.md` của tập dữ liệu hiện tại:
-     * Doanh thu (`revenue` / `doanh số`): loại trừ các đơn hủy, hoàn trả, hoặc thất bại (`cancelled`, `returned`, `failed`, `đã hủy`, `hoàn trả`) trừ khi rulebook quy định khác.
-     * Chiết khấu và voucher: áp dụng đúng công thức giảm giá dòng sản phẩm và mã voucher nếu có trong dữ liệu và rulebook.
-     * Xếp hạng và hòa điểm (Ranking & Tie-breaking): sắp xếp giảm dần theo tiêu chí chính; nếu giá trị bằng nhau thì tie-break theo mã sản phẩm / đối tượng tăng dần (`ascending=True`).
-6. TRUY VẤN TỪ KHÓA TIẾNG VIỆT KHÔNG DẤU / KHÔNG PHÂN BIỆT HOA THƯỜNG:
-   - Khi tìm kiếm tên riêng, chi nhánh, sản phẩm bằng tiếng Việt: chuẩn hóa về chữ thường và loại bỏ dấu (hoặc dùng regex) để so khớp linh hoạt, tránh bị lệch do cách gõ dấu (ví dụ: "ha noi" khớp "Hà Nội").
-7. ĐỊNH DẠNG SỐ VÀ CHUỖI:
-   - Nếu là số thực, làm tròn 2 chữ số thập phân (`round(val, 2)`).
-   - Nếu là số đếm / số nguyên, giữ nguyên kiểu số nguyên.
-   - Chuỗi ký tự tiếng Việt phải chuẩn Unicode NFC.
-8. ĐỊNH DẠNG PHẢN HỒI:
-   - CHỈ trả về duy nhất một khối mã Python trong thẻ ```python ... ```.
-   - Tuyệt đối không viết thêm lời giải thích bằng lời ở ngoài khối code."""
-
-
-FEW_SHOT_EXAMPLES = """---
-### VÍ DỤ 1 (Lọc dữ liệu thời gian tương đối dựa vào as_of_date):
-Câu hỏi: "Có bao nhiêu đơn hàng thành công trong tuần trước?"
-Ngày tham chiếu: 2024-06-19
-
-```python
-# Phân tích: Dùng calendar_utils để tính khoảng thời gian 'tuần trước' từ as_of_date, sau đó đọc file orders.csv, lọc các đơn hàng có trạng thái 'thành công' nằm trong khoảng thời gian này và đếm số lượng dòng.
-import pandas as pd
-import calendar_utils
-
-start_date, end_date = calendar_utils.resolve_vietnamese_relative_date("tuần trước", as_of=as_of_date)
-
-csv_path = FILE_MAP.get("orders.csv", "orders.csv")
-df = pd.read_csv(csv_path)
-
-df['order_date'] = pd.to_datetime(df['created_at']).dt.date
-mask = (
-    (df['order_date'] >= start_date) &
-    (df['order_date'] <= end_date) &
-    (df['status'].str.strip().str.lower() == 'thành công')
-)
-filtered = df[mask]
-
-final_result = int(len(filtered))
-```
-
----
-### VÍ DỤ 2 (Tìm kiếm từ khóa tiếng Việt không dấu / không phân biệt hoa thường):
-Câu hỏi: "Tính tổng doanh số của chi nhánh 'da nang' trong năm 2024?"
-Ngày tham chiếu: 2024-06-01
-
-```python
-# Phân tích: Định nghĩa hàm remove_accents để chuẩn hóa cột branch_name và từ khóa 'da nang' về chữ thường không dấu, sau đó lọc các dòng thuộc năm 2024 trong sales.csv và tính tổng doanh thu cột revenue.
-import pandas as pd
-import unicodedata
 import re
-
-def remove_accents(s):
-    if not isinstance(s, str):
-        return ""
-    s = unicodedata.normalize('NFD', s)
-    s = re.sub(r'[\u0300-\u036f]', '', s)
-    s = s.replace('đ', 'd').replace('Đ', 'D')
-    return s.strip().lower()
-
-csv_path = FILE_MAP.get("sales.csv", "sales.csv")
-df = pd.read_csv(csv_path)
-
-target_branch = remove_accents("da nang")
-df['branch_normalized'] = df['branch_name'].apply(remove_accents)
-
-df['order_date'] = pd.to_datetime(df['order_date'])
-mask = (
-    (df['branch_normalized'] == target_branch) &
-    (df['order_date'].dt.year == 2024)
-)
-filtered = df[mask]
-
-if filtered.empty:
-    final_result = None
-else:
-    total_rev = filtered['revenue'].sum()
-    final_result = round(float(total_rev), 2)
-```
-
----
-### VÍ DỤ 3 (Unanswerable - Schema không có bảng hoặc cột thông tin liên quan):
-Hỏi: "cho biết tên nhân viên bán được nhiều hàng nhất" (as_of_date: 2026-03-15)
-Lược đồ dữ liệu (Schema): Chỉ chứa `orders.csv` với các cột `order_id`, `product_id`, `revenue`.
-Đáp:
-
-```python
-# Phân tích: Câu hỏi yêu cầu tìm "tên nhân viên", nhưng trong lược đồ dữ liệu chỉ có bảng orders với các cột order_id, product_id, revenue. Không có dữ liệu nào về nhân viên (employee). Do đó không thể trả lời.
-final_result = "unanswerable"
-```
-
----
-### VÍ DỤ 4 (Đọc file Excel nhiều sheets, tính toán tổng hợp GroupBy và sắp xếp):
-Câu hỏi: "Khách hàng nào có tổng chi tiêu cao nhất trong quý 1 năm 2024?"
-Ngày tham chiếu: 2024-04-01
-
-```python
-# Phân tích: Lấy khoảng ngày quý 1 năm 2024, đọc sheet "Orders" từ file ecommerce.xlsx, lọc các đơn 'completed', nhóm theo customer_name tính tổng total_amount và sắp xếp giảm dần để lấy khách hàng đứng đầu.
-import pandas as pd
-import calendar_utils
-
-start_date, end_date = calendar_utils.get_quarter_date_range(2024, 1)
+from typing import Any, Dict, Optional, Tuple, Union
 
 from src.calendar_utils import resolve_time_context
 
 
-SYSTEM_PROMPT = """Bạn là Data Analyst viết Python để trả lời câu hỏi từ dữ liệu thật. Chỉ xuất một khối ```python ... ```; gán kết quả vào final_result. Không tính nhẩm, không bịa cột, bảng, bản ghi hay kết quả.
+ANSWER_TYPES = (
+    "number",
+    "percent",
+    "string",
+    "date",
+    "boolean",
+    "list",
+    "table",
+    "unanswerable",
+    "abstain",
+)
 
-QUY TẮC CỨNG — Penalized Accuracy: đúng +1, sai -1, abstain 0. Chỉ trả lời khi bằng chứng đủ mạnh (>60% khả năng đúng).
-1. Code-first: mọi đếm, lọc, tổng hợp, xếp hạng và tra cứu tên sản phẩm/khách hàng phải chạy bằng Python trên file thật trong FILE_MAP. pd, np, sqlite3, calendar_utils và as_of_date có sẵn.
-2. Rulebook fidelity: doanh thu, lợi nhuận, giá vốn, bán chạy, đơn hợp lệ, đơn hủy/trả, kỳ thời gian, ranking và tie-break theo mã tăng dần phải theo rulebook của split; điều kiện nêu rõ trong câu hỏi được ưu tiên. Không tự đặt công thức doanh thu.
-3. Pha Inspect: kiểm tra file/cột bắt buộc; xem giá trị unique và tần suất cột trạng thái/danh mục; đối chiếu tên gốc, tên không dấu và viết tắt; kiểm tra min/max ngày thực tế. Chỉ dùng các cột đã xác nhận.
-4. Pha Compute & Verify: áp đúng bộ lọc rulebook; chặn ngày sau as_of_date khi câu hỏi neo hiện tại; xét hủy/trả; xử lý rỗng/NaN; kiểm tra tie top-k và mã tăng dần; percent là số điểm phần trăm (-12.45, không phải -0.1245), đúng dấu tăng/giảm. Đếm số đơn khác tổng số lượng bán và khác doanh thu.
-5. unanswerable: chỉ sau khi code kiểm tra dữ liệu/README và chứng minh thiếu trường, thiếu khoảng thời gian hoặc không thể tính; ghi `reason = "..."` ngắn bằng tiếng Việt và `final_result = "unanswerable"`. Ví dụ lợi nhuận thiếu giá vốn. Dữ liệu rỗng sau lọc chưa tự chứng minh unanswerable.
-6. abstain: câu hỏi có thể trả lời nhưng còn mơ hồ nghiêm trọng, công thức xung đột, code lỗi hoặc xác suất đúng không vượt 60%; dùng `final_result = "abstain"`. Không dùng unanswerable để che lỗi code.
-7. Tiếng Việt: sp=sản phẩm, ko=không, dc=được, thg=tháng, sl=số lượng, dt=doanh thu, ln=lợi nhuận, kh=khách hàng. Tìm kiếm linh hoạt với tên không dấu nhưng trả string/list/table bằng tên gốc có dấu, NFC.
+SYSTEM_PROMPT = """Bạn là DataMate Adaptive Hybrid Analyst. Không bịa bảng, cột, bản ghi, công thức hoặc kết quả. Mọi kết luận phải dựa trên dữ liệu thật và RULEBOOK.MD của split hiện tại.
 
-OUTPUT CONTRACT: code chỉ gán final_result; bộ đóng gói xuất JSON {"id":"...","type":"...","answer":...}. type thuộc number, percent, string, date, boolean, list, table, unanswerable, abstain. number là số nguyên hoặc số làm tròn 2 chữ số; percent=-12.45; date="2024-06-19" hoặc "2024-06"; boolean=true/false; list=["A",2] đúng thứ tự; table={"columns":["Tên"],"rows":[["Hà Nội"]]}; unanswerable={"type":"unanswerable","answer":"unanswerable"} với reason trong code; abstain={"type":"abstain","answer":"abstain"}. Không in JSON thay cho code.
+QUY TẮC CỨNG — Penalized Accuracy: đúng +1, sai -1, abstain 0. Chỉ trả lời khi bằng chứng đủ mạnh; nếu chưa đủ căn cứ thì abstain an toàn.
 
-Trước khi truy cập `.iloc[0]`, kiểm tra rỗng. Nếu Excel có metadata trên header, dùng đúng dòng header từ schema. Trả đúng một khối Python, không có văn bản ngoài khối."""
+OUTPUT CONTRACT: type chỉ thuộc number, percent, string, date, boolean, list, table, unanswerable, abstain.
+- number: số nguyên hoặc số thực làm tròn tối đa 2 chữ số thập phân.
+- percent: số điểm phần trăm đã nhân 100 và làm tròn 2 chữ số, ví dụ -12.45, không phải -0.1245.
+- string: chuỗi NFC giữ nguyên dấu tiếng Việt từ dữ liệu gốc.
+- date: YYYY-MM-DD hoặc YYYY-MM khi câu hỏi yêu cầu tháng.
+- boolean: true hoặc false.
+- list: mảng JSON có thứ tự.
+- table: {"columns":["Tên"],"rows":[["Hà Nội"]]} với columns thẳng hàng rows.
+- unanswerable: chỉ khi đã chứng minh thiếu dữ liệu/cột/khoảng thời gian bắt buộc; phải có reason ngắn.
+- abstain: {"type":"abstain"} khi còn mơ hồ nghiêm trọng, xung đột hoặc không đủ độ tin cậy.
 
-FEW_SHOT_EXAMPLES = ""  # Avoid examples with invented columns or split-specific status labels.
+RANKING CONTRACT: top-k xếp metric DESC; đồng hạng xếp code ASC; nếu ít hơn k ứng viên hợp lệ thì lấy tất cả. Kiểm tra tie ở biên trước khi chốt.
+
+RULEBOOK CONTRACT: đọc toàn văn RULEBOOK.MD động bên dưới. Không thay thế bằng quy tắc hardcode. Điều kiện ghi rõ trong câu hỏi được ưu tiên, sau đó mới áp dụng rulebook. Phải kiểm tra đơn hợp lệ, hủy/hoàn trả, VAT, voucher, as_of_date, làm tròn, dấu tăng/giảm và tie-break theo đúng rulebook.
+
+Code-first: mọi phép lọc, đếm, tổng hợp và xếp hạng phải chạy trên dữ liệu thật.
+Rulebook fidelity: doanh thu, lợi nhuận, giá vốn, bán chạy, trạng thái đơn và kỳ thời gian phải theo rulebook.
+Pha Inspect: xác nhận bảng, cột, DISTINCT trạng thái, min/max ngày và tên gốc trước khi tính.
+Pha Compute & Verify: kiểm tra dữ liệu rỗng, NaN, dấu, đơn vị, percent, top-k và tie-break.
+Tiếng Việt: sp=sản phẩm, ko=không, dc=được, thg=tháng, sl=số lượng, dt=doanh thu, ln=lợi nhuận, kh=khách hàng. FILE_MAP và RAW_DATA_DIR chỉ được dùng ở nhánh Python.
+
+Tương thích pipeline Python cũ: nếu được yêu cầu, gán final_result = "unanswerable" kèm reason hoặc final_result = "abstain". Không dùng unanswerable để che lỗi code."""
+
+FEW_SHOT_EXAMPLES = ""
 
 
 def read_rulebook(data_dir: Union[str, Path] = "./data") -> str:
-    """Read the active split only, without falling back to another directory."""
+    """Read the active split rulebook without falling back to another directory."""
     path = Path(data_dir) / "rulebook.md"
     if not path.is_file():
         return ""
     for encoding in ("utf-8-sig", "utf-8", "cp1258", "latin1"):
         try:
-            return path.read_text(encoding=encoding).strip()
+            return path.read_text(encoding=encoding)
         except UnicodeError:
             continue
     return ""
 
 
+def build_business_prefix(rulebook_text: str, readme_text: str, sql_schema_card: str) -> str:
+    """Build the byte-stable shared prefix used by every question of one business."""
+    rulebook = rulebook_text if rulebook_text else "[Không có rulebook.md]"
+    readme = readme_text if readme_text else "[Không có README.md]"
+    schema = sql_schema_card if sql_schema_card else "[Không có SQL schema card]"
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"=== RULEBOOK.MD (ACTIVE SPLIT) ===\n{rulebook}\n\n"
+        f"=== BUSINESS README.MD ===\n{readme}\n\n"
+        f"=== BUSINESS SCHEMA PROFILE / SQL SCHEMA CARD ===\n{schema}"
+    )
+
+
+def build_sql_prompt(question: str, as_of_date: str, execution_mode: str = "SQL_FAST") -> str:
+    """Build the dynamic Mode A suffix for one DuckDB SQL generation request."""
+    return (
+        f"MODE: {execution_mode}\n"
+        "Viết đúng một truy vấn DuckDB SQL chỉ đọc trong một block ```sql```, sau đó đúng một block ```json``` metadata. "
+        "Không viết giải thích ngoài hai block. Chỉ dùng SELECT hoặc WITH ... SELECT và các bảng trong SQL schema card.\n"
+        "Dùng _calendar cho âm lịch, Tết và ngày lễ động. Dùng vn_unaccent hoặc vn_norm khi lọc tên sản phẩm, khách hàng hoặc thực thể tiếng Việt. "
+        "Áp dụng bộ lọc đơn hợp lệ từ RULEBOOK.MD dựa trên các giá trị DISTINCT trong schema card. "
+        "Ranking phải ORDER BY metric DESC, code ASC; nếu ít hơn k ứng viên thì trả hết. "
+        "Percent phải nhân 100 và làm tròn 2 chữ số. Chỉ đặt is_unanswerable=true khi chắc chắn thiếu cột hoặc dữ liệu bắt buộc.\n"
+        "Metadata bắt buộc đúng dạng:\n"
+        "```json\n"
+        '{"expected_type":"number","post_process":"none","is_unanswerable":false,"reason":null}\n'
+        "```\n"
+        "expected_type phải là một type trong OUTPUT CONTRACT.\n\n"
+        f"QUESTION: {question.strip()}\n"
+        f"as_of_date: {as_of_date or '[unknown]'}"
+    )
+
+
+def build_sql_repair_prompt(prev_sql: str, error_msg: str) -> str:
+    """Build a compact single-retry SQL repair suffix."""
+    error = error_msg.strip() or "DuckDB binder/syntax error"
+    return (
+        "MODE: SQL_REPAIR_ONCE\n"
+        "Sửa đúng nguyên nhân binder/syntax bằng SQL schema card trong system prefix. Không đổi ý nghĩa câu hỏi. "
+        "Chỉ trả một block ```sql``` và một block ```json``` metadata đúng contract Mode A.\n"
+        f"PREVIOUS_SQL:\n```sql\n{prev_sql.strip()}\n```\n"
+        f"DUCKDB_ERROR:\n{error[-1600:]}"
+    )
+
+
+def build_python_prompt(
+    question: str,
+    as_of_date: str,
+    business_id: str,
+    dual_path: bool = False,
+    execution_mode: str = "PYTHON_FIRST",
+) -> str:
+    """Build the dynamic Mode B suffix for sandboxed Python computation."""
+    independence = (
+        "Bạn đang kiểm chứng Dual-Path độc lập. Không được xem, suy đoán hoặc yêu cầu câu SQL hay đáp án của nhánh SQL. Tự tính lại từ dữ liệu và rulebook."
+        if dual_path
+        else "Tự tính từ dữ liệu thật và kiểm chứng kết quả trước khi trả lời."
+    )
+    return (
+        f"MODE: {execution_mode}\n"
+        f"{independence}\n"
+        "Chỉ trả đúng một block ```python``` chạy trong sandbox. Các biến đã có sẵn: DUCKDB_CONN là kết nối chỉ đọc, "
+        f'DUCKDB_PATH="/tmp/datamate_duckdb/{business_id}.duckdb", RAW_DATA_DIR là thư mục dữ liệu gốc read-only, cùng pd, np và sqlite3. '
+        "Ưu tiên DUCKDB_CONN; chỉ đọc lại CSV/XLSX/SQLite trong RAW_DATA_DIR khi cần kiểm tra ETL hoặc cấu trúc gốc.\n"
+        "Code phải kiểm tra assert cơ bản cho cột bắt buộc, số dòng sau lọc, NaN, khoảng ngày và điều kiện rulebook. "
+        "Không dùng mạng, không ghi file và không thay đổi dữ liệu.\n"
+        "Gán kết quả cuối cùng đúng một lần vào FINAL_ANSWER={\"type\":...,\"answer\":...}. "
+        "Nếu chứng minh thiếu dữ liệu, dùng FINAL_ANSWER={\"type\":\"unanswerable\",\"reason\":\"...\"}. "
+        "Nếu không đủ chắc chắn, dùng FINAL_ANSWER={\"type\":\"abstain\"}.\n\n"
+        f"QUESTION: {question.strip()}\n"
+        f"as_of_date: {as_of_date or '[unknown]'}\n"
+        f"business_id: {business_id}"
+    )
+
+
+def build_adjudicator_prompt(
+    question: str,
+    as_of_date: str,
+    sql_query: str,
+    sql_result: Any,
+    python_code: str,
+    python_stdout: str,
+    python_result: Any,
+) -> str:
+    """Build the dynamic Mode C suffix used only for normalized answer conflicts."""
+    return (
+        "MODE: ADJUDICATOR_CONFLICT_ONLY\n"
+        "Đối chiếu độc lập từng điều kiện trong RULEBOOK.MD: đơn hủy/hoàn trả, VAT, voucher, as_of_date, khoảng ngày, "
+        "làm tròn, dấu âm/dương, percent và tie-breaker. Chỉ rõ nhánh sai ở bước nào. Có thể thêm tối đa một block ```python``` ngắn để xác minh. "
+        "Kết thúc bằng đúng một block ```json``` có một trong ba kết luận: "
+        '{"decision":"verified_answer","type":"...","answer":...,"reason":"..."}, '
+        '{"decision":"unanswerable","type":"unanswerable","reason":"..."}, hoặc '
+        '{"decision":"abstain","type":"abstain","reason":"..."}. '
+        "Chỉ chọn verified_answer khi bằng chứng chắc chắn; nếu vẫn xung đột hoặc thiếu căn cứ thì abstain để tránh phạt -1.\n\n"
+        f"QUESTION: {question.strip()}\n"
+        f"as_of_date: {as_of_date or '[unknown]'}\n\n"
+        f"SQL_BRANCH_QUERY:\n```sql\n{sql_query.strip()}\n```\n"
+        f"SQL_BRANCH_RESULT:\n{_json_dump(sql_result)}\n\n"
+        f"PYTHON_BRANCH_CODE:\n```python\n{python_code.strip()}\n```\n"
+        f"PYTHON_BRANCH_STDOUT:\n{python_stdout.strip()}\n"
+        f"PYTHON_BRANCH_RESULT:\n{_json_dump(python_result)}"
+    )
+
+
+def parse_sql_response(response: str) -> Tuple[str, Dict[str, Any]]:
+    cleaned = _remove_think_blocks(response)
+    sql_blocks = re.findall(r"```sql\s*\n?(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if not sql_blocks:
+        sql_blocks = re.findall(r"```(?:duckdb)?\s*\n?(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if len(sql_blocks) != 1:
+        raise ValueError(f"Expected exactly one sql block, found {len(sql_blocks)}")
+    sql = sql_blocks[0].strip()
+    if not sql:
+        raise ValueError("The sql block is empty")
+
+    json_blocks = re.findall(r"```json\s*\n?(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if len(json_blocks) > 1:
+        raise ValueError(f"Expected exactly one json metadata block, found {len(json_blocks)}")
+    if not json_blocks:
+        metadata = {
+            "expected_type": "number",
+            "post_process": "scalar",
+            "is_unanswerable": False,
+            "reason": None,
+        }
+    else:
+        try:
+            metadata = json.loads(json_blocks[0].strip())
+        except Exception as exc:
+            raise ValueError("Invalid SQL metadata JSON") from exc
+    if not isinstance(metadata, dict):
+        raise ValueError("SQL metadata must be an object")
+    metadata.setdefault("expected_type", "number")
+    metadata.setdefault("post_process", "scalar")
+    metadata.setdefault("is_unanswerable", False)
+    metadata.setdefault("reason", None)
+    if metadata["expected_type"] not in ANSWER_TYPES:
+        raise ValueError("SQL metadata expected_type is invalid")
+    if metadata["is_unanswerable"] and not str(metadata.get("reason") or "").strip():
+        raise ValueError("Unanswerable SQL metadata requires reason")
+    return sql, metadata
+
+
+def parse_python_response(response: str) -> str:
+    cleaned = _remove_think_blocks(response)
+    blocks = re.findall(r"```python\s*\n?(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if not blocks:
+        blocks = re.findall(r"```\s*\n?(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if len(blocks) != 1:
+        raise ValueError(f"Expected exactly one python block, found {len(blocks)}")
+    if not blocks[0].strip():
+        raise ValueError("The python block is empty")
+    return blocks[0].strip()
+
+
+def parse_json_response(response: str) -> Dict[str, Any]:
+    cleaned = _remove_think_blocks(response)
+    blocks = re.findall(r"```json\s*\n?(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if not blocks:
+        return {}
+    if len(blocks) != 1:
+        raise ValueError(f"Expected exactly one json block, found {len(blocks)}")
+    try:
+        parsed = json.loads(blocks[0].strip())
+    except Exception as exc:
+        raise ValueError("Invalid adjudicator JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("Adjudicator JSON must be an object")
+    decision = parsed.get("decision")
+    if decision not in {"verified_answer", "unanswerable", "abstain"}:
+        raise ValueError("Adjudicator decision is invalid")
+    if decision == "unanswerable" and not str(parsed.get("reason") or "").strip():
+        raise ValueError("Unanswerable adjudicator output requires reason")
+    return parsed
+
+
 class PromptBuilder:
-    """Construct immutable per-business prefixes and compact query suffixes."""
+    """Construct cached business prefixes and per-question Adaptive Hybrid suffixes."""
 
     def __init__(
         self,
@@ -207,7 +255,7 @@ class PromptBuilder:
         self.few_shot_examples = few_shot_examples
         self.rulebook_content = rulebook_content or ""
         self.enable_verification = enable_verification
-        self._prefix_cache: Dict[tuple[str, str, str, str], str] = {}
+        self._prefix_cache: Dict[Tuple[str, str, str, str, str], str] = {}
 
     def build_system_prompt(
         self,
@@ -216,21 +264,21 @@ class PromptBuilder:
         schema_context: str = "",
         business_id: Optional[str] = None,
     ) -> str:
-        """Place stable data after instructions in the same order for every query."""
-        rb = self.rulebook_content if rulebook_content is None else rulebook_content
-        schema_profile = schema_context[:30000] + ("\n[Schema context budget reached]" if len(schema_context) > 30000 else "")
-        key = (business_id or "", rb, readme_content or "", schema_profile)
+        """Return the cached byte-stable prefix for a business."""
+        rulebook = self.rulebook_content if rulebook_content is None else rulebook_content
+        key = (business_id or "", self.system_prompt, rulebook, readme_content or "", schema_context or "")
         cached = self._prefix_cache.get(key)
         if cached is not None:
             return cached
-        sections = [
-            self.system_prompt.strip(),
-            self.few_shot_examples.strip(),
-            "=== RULEBOOK.MD (ACTIVE SPLIT) ===\n" + (rb.strip() or "[Không có rulebook]"),
-            "=== BUSINESS README.MD ===\n" + (readme_content.strip() or "[Không có README]"),
-            "=== BUSINESS SCHEMA PROFILE ===\n" + (schema_profile.strip() or "[Không có schema]"),
-        ]
-        prefix = "\n\n".join(section for section in sections if section)
+        if self.system_prompt == SYSTEM_PROMPT:
+            prefix = build_business_prefix(rulebook, readme_content, schema_context)
+        else:
+            prefix = (
+                f"{self.system_prompt}\n\n"
+                f"=== RULEBOOK.MD (ACTIVE SPLIT) ===\n{rulebook}\n\n"
+                f"=== BUSINESS README.MD ===\n{readme_content}\n\n"
+                f"=== BUSINESS SCHEMA PROFILE / SQL SCHEMA CARD ===\n{schema_context}"
+            )
         self._prefix_cache[key] = prefix
         return prefix
 
@@ -243,64 +291,67 @@ class PromptBuilder:
         rulebook_content: Optional[str] = None,
         time_context: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Keep only per-question values in the user suffix.
-
-        Schema and rulebook parameters remain for old callers. The caller puts
-        their content in build_system_prompt to enable prefix caching.
-        """
-        prompt_parts = []
-        prompt_parts.append("### THÔNG TIN CẤU TRÚC BẢNG VÀ DỮ LIỆU (SCHEMA STRING):")
-        prompt_parts.append(schema_context.strip())
-        prompt_parts.append("\n" + "=" * 50)
-
-        prompt_parts.append("### THÔNG TIN THAM CHIẾU (REFERENCE):")
-        if as_of_date:
-            prompt_parts.append(f"- Ngày tham chiếu (as_of_date): `{as_of_date}`")
+        """Keep the legacy Python pipeline suffix dynamic and prefix-safe."""
+        rulebook = self.rulebook_content if rulebook_content is None else rulebook_content
+        if time_context is None and as_of_date:
             try:
-                from src.calendar_utils import get_precomputed_intervals_summary
-            except ImportError:
-                try:
-                    from calendar_utils import get_precomputed_intervals_summary
-                except ImportError:
-                    get_precomputed_intervals_summary = None
+                time_context = resolve_time_context(as_of_date, rulebook_text=rulebook)
+            except (TypeError, ValueError):
+                time_context = {}
+        resolved_time_context = time_context or {}
+        anchors = json.dumps(resolved_time_context, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        interval_lines = []
+        if resolved_time_context:
+            last_week = resolved_time_context.get("last_week", {})
+            this_month = resolved_time_context.get("this_month", {})
+            interval_lines = [
+                "PRE-COMPUTED TIME INTERVALS:",
+                f"- Tuần trước / Tuần rồi: {last_week.get('start', '')}..{last_week.get('end', '')}",
+                f"- Tháng này (Month-to-Date): {this_month.get('start', '')}..{this_month.get('end', '')}",
+            ]
+        intervals = "\n".join(interval_lines)
+        return (
+            f"CÂU HỎI: {question.strip()}\n"
+            f"as_of_date: {as_of_date or '[chưa xác định]'}\n"
+            f"TIME_CONTEXT_ISO: {anchors}\n"
+            f"{intervals}\n"
+            "Kiểm tra dữ liệu thật rồi viết code gán final_result."
+        )
 
-            if get_precomputed_intervals_summary is not None:
-                cal_path = None
-                if file_map:
-                    cal_path = file_map.get("calendar.csv") or file_map.get("calendar")
-                    if not cal_path:
-                        for k, v in file_map.items():
-                            if "calendar.csv" in k.lower():
-                                cal_path = v
-                                break
-                intervals_summary = get_precomputed_intervals_summary(as_of_date, calendar_path=cal_path)
-                if intervals_summary:
-                    prompt_parts.append("\n" + "=" * 50)
-                    prompt_parts.append(intervals_summary)
-        else:
-            prompt_parts.append("- Ngày tham chiếu (as_of_date): Chưa chỉ định (mặc định hôm nay)")
+    def build_sql_prompt(self, question: str, as_of_date: str, execution_mode: str = "SQL_FAST") -> str:
+        return build_sql_prompt(question, as_of_date, execution_mode)
 
-        if file_map:
-            file_list = ", ".join(f"`{k}`" for k in file_map.keys())
-            prompt_parts.append(f"- Các file dữ liệu có sẵn trong FILE_MAP: {file_list}")
+    def build_sql_repair_prompt(self, prev_sql: str, error_msg: str) -> str:
+        return build_sql_repair_prompt(prev_sql, error_msg)
 
-        rb = rulebook_content if rulebook_content is not None else self.rulebook_content
-        if rb and rb.strip():
-            prompt_parts.append("\n" + "=" * 50)
-            prompt_parts.append("### QUY TẮC TẬP DỮ LIỆU HIỆN TẠI (RULEBOOK.MD):")
-            prompt_parts.append(rb.strip())
+    def build_python_prompt(
+        self,
+        question: str,
+        as_of_date: str,
+        business_id: str,
+        dual_path: bool = False,
+        execution_mode: str = "PYTHON_FIRST",
+    ) -> str:
+        return build_python_prompt(question, as_of_date, business_id, dual_path, execution_mode)
 
-        prompt_parts.append("\n" + "=" * 50)
-        prompt_parts.append(f"### CÂU HỎI TIẾNG VIỆT:\n\"{question}\"\n")
-        prompt_parts.append(
-            "CRITICAL RULES (ERROR-PREVENTION - TUÂN THỦ TUYỆT ĐỐI ĐỂ TRÁNH CRASH HỆ THỐNG):\n"
-            "- CHỈ sử dụng ĐÚNG tên bảng và tên cột có trong Schema, TUYỆT ĐỐI KHÔNG bịa đặt cột.\n"
-            "- KIỂM TRA sự tồn tại của cột/bảng trước khi tính toán. Nếu dữ liệu kinh doanh thiếu thông tin cốt lõi (ví dụ: tính lợi nhuận nhưng không có cột giá vốn/chi phí), gán `final_result = \"unanswerable\"` kèm comment giải thích lý do bằng tiếng Việt.\n"
-            "- Tuân thủ rulebook: Doanh thu loại trừ các đơn hủy/trả (cancelled/returned). Xếp hạng nếu bằng nhau thì ưu tiên theo mã đối tượng/sản phẩm tăng dần (tie-break ascending).\n"
-            "- Xử lý an toàn edge cases: dùng `.fillna()`, kiểm tra `if df.empty:` trước khi trích xuất giá trị để tránh KeyError/IndexError.\n"
-            "- BẮT BUỘC bắt đầu code bằng comment `# Phân tích: ...`, viết đoạn mã Python (dùng pandas, sqlite3, openpyxl) hợp lệ để tính toán và gán câu trả lời vào biến `final_result` hoặc `FINAL_RESULT` (hoặc gán `final_result = \"unanswerable\"` nếu schema không có thông tin liên quan).\n"
-            "- TUYỆT ĐỐI KHÔNG viết lời giải thích hay văn bản hội thoại nào ngoài code block.\n"
-            "Chỉ in ra code trong thẻ ```python ... ```, không giải thích."
+    def build_adjudicator_prompt(
+        self,
+        question: str,
+        as_of_date: str,
+        sql_query: str,
+        sql_result: Any,
+        python_code: str,
+        python_stdout: str,
+        python_result: Any,
+    ) -> str:
+        return build_adjudicator_prompt(
+            question,
+            as_of_date,
+            sql_query,
+            sql_result,
+            python_code,
+            python_stdout,
+            python_result,
         )
 
     def build_retry_prompt(
@@ -310,17 +361,16 @@ class PromptBuilder:
         error_traceback: str,
         previous_user_prompt: Optional[str] = None,
     ) -> str:
-        """Give concrete failure evidence and demand a changed repair strategy."""
+        """Build the legacy Python retry suffix without changing the shared prefix."""
         error = error_traceback.strip() or "Output rỗng/NaN hoặc không có final_result"
         base = previous_user_prompt or f"CÂU HỎI: {question.strip()}"
         return (
             f"{base}\nRETRY: Code trước lỗi hoặc trả rỗng/NaN.\n"
             f"FAILED CODE:\n```python\n{previous_code}\n```\n"
             f"EXACT ERROR/OUTPUT:\n{error[-1800:]}\n"
-            "Sửa nguyên nhân gốc: kiểm tra lại tên file/cột, dtype, giá trị trạng thái, định dạng ngày, bộ lọc và mẫu dữ liệu; không lặp lại cùng code. "
-            "Nếu cột/kỳ thật sự thiếu sau kiểm tra, đặt reason tiếng Việt và final_result = \"unanswerable\"; "
-            "nếu vẫn không chắc hoặc code tiếp tục lỗi, đặt final_result = None để abstain. "
-            "Chỉ trả một khối ```python ... ``` gán final_result."
+            "Sửa nguyên nhân gốc: kiểm tra lại tên file/cột, dtype, trạng thái, ngày, bộ lọc và mẫu dữ liệu; không lặp lại cùng code. "
+            "Nếu dữ liệu bắt buộc thật sự thiếu, gán reason và final_result = \"unanswerable\"; nếu vẫn không chắc, gán final_result = \"abstain\". "
+            "Chỉ trả một block ```python```."
         )
 
     def build_verification_prompt(
@@ -330,7 +380,7 @@ class PromptBuilder:
         as_of_date: Optional[str] = None,
         time_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
-        """Optional follow-up prompt; the caller decides whether to invoke a model."""
+        """Build the optional legacy verification suffix."""
         if not self.enable_verification:
             return None
         return (
@@ -338,7 +388,27 @@ class PromptBuilder:
             f"as_of_date: {as_of_date or '[chưa xác định]'}\n"
             f"TIME_CONTEXT_ISO: {json.dumps(time_context or {}, ensure_ascii=False, sort_keys=True)}\n"
             f"COMPUTED ANSWER: {json.dumps(computed_answer, ensure_ascii=False, default=str)}\n"
-            "Đối chiếu câu hỏi, dữ liệu, khoảng ngày và RULEBOOK.MD trong system message. "
-            "Kiểm tra type, đơn vị, dấu, lọc hủy/trả, tie-break. "
-            "Chỉ viết code kiểm chứng; nếu mâu thuẫn chưa giải được, final_result = \"abstain\"."
+            "Đối chiếu câu hỏi, dữ liệu và RULEBOOK.MD trong system message. Kiểm tra type, đơn vị, dấu, hủy/trả và tie-break. "
+            "Chỉ viết code kiểm chứng; nếu chưa giải được mâu thuẫn, final_result = \"abstain\"."
         )
+
+
+def _remove_think_blocks(response: str) -> str:
+    text = str(response or "")
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    return text.strip()
+
+
+def _extract_single_fenced_block(response: str, language: str) -> str:
+    pattern = rf"```{re.escape(language)}\s*\n?(.*?)```"
+    matches = re.findall(pattern, response, flags=re.IGNORECASE | re.DOTALL)
+    if len(matches) != 1:
+        raise ValueError(f"Expected exactly one {language} block, found {len(matches)}")
+    content = matches[0].strip()
+    if not content:
+        raise ValueError(f"The {language} block is empty")
+    return content
+
+
+def _json_dump(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str, sort_keys=True, separators=(",", ":"))

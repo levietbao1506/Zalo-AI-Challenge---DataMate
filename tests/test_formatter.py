@@ -11,6 +11,7 @@ import unittest
 from src.formatter import (
     DEFAULT_ABSTAIN_TOKEN,
     DEFAULT_ABSTAIN_VALUE,
+    answers_equivalent,
     append_submission_line,
     clean_string,
     format_boolean,
@@ -150,6 +151,22 @@ class TestFormatter(unittest.TestCase):
         self.assertEqual(format_percent(" 20 % "), 20)
         self.assertEqual(format_percent("33.333%"), 33.33)
         self.assertEqual(format_percent("-5.25%"), -5.25)
+        self.assertEqual(format_number("100.005"), 100)
+        self.assertEqual(format_number("100.015"), 100.02)
+
+    def test_answers_equivalent_requires_matching_declared_type(self):
+        self.assertFalse(
+            answers_equivalent(
+                {"type": "number", "answer": 1},
+                {"type": "percent", "answer": 1},
+            )
+        )
+        self.assertTrue(
+            answers_equivalent(
+                {"type": "number", "answer": 100.005},
+                {"type": "number", "answer": 100.0},
+            )
+        )
 
     def test_float_integer_simplification(self):
         """Float representations of integers should be simplified to int."""

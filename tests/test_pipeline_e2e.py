@@ -15,9 +15,13 @@ from src.main import (
     DEFAULT_DATA_DIR,
     DEFAULT_MODEL_PATH,
     DEFAULT_OUTPUT_FILE,
+    append_submission_line_with_lock,
+    calculate_time_guard,
+    group_questions_by_business,
     load_questions,
     main,
     parse_arguments,
+    partition_businesses_lpt,
     process_batch_chunk,
     process_single_question,
     sort_questions_by_business,
@@ -43,6 +47,40 @@ class TestPipelineE2E(unittest.TestCase):
         ]
         self.assertEqual([q["id"] for q in sort_questions_by_business(questions)], ["a1", "a2", "b1", "b2"])
         self.assertEqual([q["id"] for q in questions], ["b1", "a1", "b2", "a2"])
+
+    def test_grouping_and_lpt_keep_each_business_on_one_worker(self):
+        questions = []
+        for business_id, count in (("large", 5), ("medium", 4), ("small", 3)):
+            questions.extend(
+                {"id": f"{business_id}-{index}", "business_id": business_id}
+                for index in range(count)
+            )
+        groups = group_questions_by_business(questions)
+        partitions = partition_businesses_lpt(groups, num_workers=2)
+        assigned = [business_id for partition in partitions for business_id, _ in partition]
+        loads = [sum(len(records) for _, records in partition) for partition in partitions]
+        self.assertCountEqual(assigned, ["large", "medium", "small"])
+        self.assertEqual(len(assigned), len(set(assigned)))
+        self.assertEqual(sorted(loads), [5, 7])
+
+    def test_time_guard_uses_remaining_budget_and_average_speed(self):
+        normal = calculate_time_guard(0.0, 100.0, 2, 2, now=40.0)
+        pressured = calculate_time_guard(0.0, 100.0, 2, 3, now=50.0)
+        self.assertFalse(normal["time_pressure"])
+        self.assertEqual(normal["average_seconds_per_processed_question"], 20.0)
+        self.assertTrue(pressured["time_pressure"])
+        self.assertAlmostEqual(pressured["budget_per_question"], 50.0 / 3.0)
+
+    def test_locked_submission_append_is_immediately_visible(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output = Path(tmp_dir) / "submission.jsonl"
+            append_submission_line_with_lock(output, {"id": "q1", "type": "number", "answer": 1})
+            first = output.read_text(encoding="utf-8").splitlines()
+            append_submission_line_with_lock(output, {"id": "q2", "type": "abstain"})
+            second = output.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(first), 1)
+            self.assertEqual(len(second), 2)
+            self.assertEqual(json.loads(first[0])["id"], "q1")
 
     def test_soft_timeout_skips_retries(self):
         parser = SchemaParser(self.sample_data_dir)
@@ -316,7 +354,7 @@ class TestPipelineE2E(unittest.TestCase):
             required_fields = {"id", "answer", "elapsed_ms", "thinking", "code", "output"}
             for line in log_lines:
                 rec = json.loads(line)
-                self.assertEqual(set(rec.keys()), required_fields)
+                self.assertTrue(required_fields.issubset(set(rec.keys())))
                 self.assertIsInstance(rec["elapsed_ms"], int)
                 self.assertGreaterEqual(rec["elapsed_ms"], 0)
 

@@ -13,8 +13,10 @@ import math
 from pathlib import Path
 import re
 import sys
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
-from src.llm_config import DEFAULT_MAX_NUM_SEQS, DEFAULT_SEED
+from src.llm_config import DEFAULT_MAX_MODEL_LEN, DEFAULT_MAX_NUM_SEQS, DEFAULT_MAX_TOKENS, DEFAULT_SEED
+from src.sql_executor import SQLExecutionResult
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +66,9 @@ DEFAULT_STOP_TOKENS = ["<|im_end|>", "</s>", "<|endoftext|>"]
 def load_vllm_engine(
     model_path: str = DEFAULT_LOCAL_MODEL_PATH,
     temperature: float = DEFAULT_TEMPERATURE,
-    max_tokens: int = 1024,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     gpu_memory_utilization: float = 0.85,
-    max_model_len: int = 4096,
+    max_model_len: int = DEFAULT_MAX_MODEL_LEN,
     tensor_parallel_size: Optional[int] = None,
     trust_remote_code: bool = True,
 ) -> Tuple[Any, Any]:
@@ -75,9 +77,9 @@ def load_vllm_engine(
     Args:
         model_path: Path to model directory or HuggingFace repo ID (e.g. Qwen/Qwen3-14B).
         temperature: Decoding temperature (default: 0.0 for greedy, deterministic generation).
-        max_tokens: Maximum completion tokens (default: 1024).
+        max_tokens: Maximum completion tokens from the shared vLLM configuration.
         gpu_memory_utilization: Fraction of GPU VRAM allocated to vLLM (default: 0.85).
-        max_model_len: Maximum model sequence length (default: 4096).
+        max_model_len: Maximum model sequence length from the shared vLLM configuration.
         tensor_parallel_size: Tensor parallel degree (default: 1 for <15B models).
         trust_remote_code: Trust remote code flag (default: True).
 
@@ -139,7 +141,6 @@ def load_vllm_engine(
         seed=DEFAULT_SEED,
         max_tokens=max_tokens,
         stop=DEFAULT_STOP_TOKENS,
-        seed=42,
     )
 
     logger.info("vLLM engine successfully loaded with temperature=0.0.")
@@ -154,7 +155,7 @@ class CodeAgent:
         model_path: str = DEFAULT_LOCAL_MODEL_PATH,
         temperature: float = DEFAULT_TEMPERATURE,
         gpu_memory_utilization: float = 0.85,
-        max_model_len: int = 4096,
+        max_model_len: int = DEFAULT_MAX_MODEL_LEN,
         tensor_parallel_size: Optional[int] = None,
         trust_remote_code: bool = True,
         dry_run: bool = False,
@@ -166,7 +167,7 @@ class CodeAgent:
             model_path: Path to vLLM directory or .gguf file (default: Qwen/Qwen3-14B).
             temperature: Sampling temperature (default: 0.0 for deterministic greedy decoding).
             gpu_memory_utilization: Fraction of GPU memory allocated to vLLM (default: 0.85).
-            max_model_len: Context window limit (default: 4096).
+            max_model_len: Context window limit from the shared vLLM configuration.
             tensor_parallel_size: Tensor parallel degree (default: 2 or from TENSOR_PARALLEL_SIZE).
             trust_remote_code: Whether to pass ``trust_remote_code=True`` to vLLM (default: True).
             dry_run: If True, forces dry-run mock mode without calling a model backend.
@@ -323,6 +324,43 @@ class CodeAgent:
             raw_output = f"```python\n{raw_output}"
 
         return self.extract_python_code(raw_output)
+
+    def generate_response(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        if self.dry_run:
+            response = self._mock_generate_code(prompt)
+            self.last_thinking = extract_thinking(response)
+            return response
+
+        if self.backend == "llama_cpp":
+            messages = [
+                {"role": "system", "content": system_prompt or "You are DataMate."},
+                {"role": "user", "content": prompt},
+            ]
+            response = self.llm.create_chat_completion(
+                messages=messages,
+                max_tokens=8192,
+                temperature=0.0,
+            )
+            message = response["choices"][0]["message"]
+            content = message.get("content", "")
+            self.last_thinking = message.get("reasoning_content") or extract_thinking(content)
+            return content
+
+        if self.llm is None:
+            response = self._mock_generate_code(prompt)
+            self.last_thinking = extract_thinking(response)
+            return response
+
+        full_text = (
+            f"<|im_start|>system\n{system_prompt or 'You are DataMate.'}<|im_end|>\n"
+            f"<|im_start|>user\n{prompt}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        outputs = self.llm.generate([full_text], self.sampling_params)
+        output = outputs[0].outputs[0]
+        content = output.text
+        self.last_thinking = getattr(output, "reasoning_content", None) or extract_thinking(content)
+        return content
 
     def generate_code_batch(
         self,
@@ -880,6 +918,423 @@ def verification_gate(
 
 # Backwards-compatible alias
 VLLMAgent = CodeAgent
+
+
+def execute_adaptive_hybrid(
+    question_record: Dict[str, Any],
+    duckdb_store: Any,
+    sql_executor: Any,
+    schema_card: str,
+    schema_meta: Dict[str, Any],
+    rulebook_text: str,
+    time_pressure: bool = False,
+    agent: Optional[CodeAgent] = None,
+    prompt_builder: Optional[Any] = None,
+    business_prefix: Optional[str] = None,
+    timeout: float = 25.0,
+) -> Dict[str, Any]:
+    from src import executor, formatter, prompt_builder as pb_module
+    from src.router import RouteDecision, classify_question_route, should_escalate_sql_result
+
+    q_start = time.perf_counter()
+    q_id = str(question_record.get("id") or question_record.get("question_id") or "q_unknown")
+    question_text = str(question_record.get("question") or question_record.get("text") or "").strip()
+    as_of_date = str(question_record.get("as_of_date") or "").strip()
+    declared_type = question_record.get("type")
+
+    business_id = getattr(duckdb_store, "business_id", "business")
+    data_dir = str(getattr(duckdb_store, "business_dir", "."))
+    database_path_value = getattr(duckdb_store, "database_path", None)
+    duckdb_path = (
+        str(database_path_value)
+        if isinstance(database_path_value, (str, Path))
+        else f"/tmp/datamate_duckdb/{business_id}.duckdb"
+    )
+    python_file_map: Dict[str, str] = {}
+    business_path = Path(data_dir)
+    if business_path.is_dir():
+        for path in sorted(business_path.rglob("*")):
+            if path.is_file():
+                python_file_map[path.name] = str(path.resolve())
+    calendar_path = getattr(duckdb_store, "calendar_csv_path", None)
+    if isinstance(calendar_path, (str, Path)):
+        python_file_map["calendar.csv"] = str(calendar_path)
+
+    if agent is None:
+        agent = CodeAgent(dry_run=True)
+    if prompt_builder is None:
+        prompt_builder = pb_module.PromptBuilder(rulebook_content=rulebook_text)
+
+    system_prefix = business_prefix or prompt_builder.build_system_prompt(
+        rulebook_content=rulebook_text,
+        readme_content="",
+        schema_context=schema_card,
+        business_id=business_id,
+    )
+
+    thinking_trace: List[str] = []
+    code_trace: List[str] = []
+    output_trace: List[Any] = []
+    llm_call_count = 0
+
+    route_decision, route_reasons = classify_question_route(
+        question=question_text,
+        as_of_date=as_of_date,
+        schema_meta=schema_meta,
+        rulebook_text=rulebook_text,
+        time_pressure=time_pressure,
+    )
+
+    route_initial = route_decision.value
+    escalated = False
+    final_stage = route_decision.value
+    escalation_reasons: List[str] = []
+
+    def call_llm(prompt: str) -> str:
+        nonlocal llm_call_count
+        llm_call_count += 1
+        generator = getattr(type(agent), "generate_response", None)
+        if generator is not None:
+            generator = agent.generate_response
+        else:
+            generator = agent.generate_code
+        resp = generator(prompt, system_prompt=system_prefix)
+        th = getattr(agent, "last_thinking", None)
+        if th is None:
+            th = extract_thinking(resp)
+        thinking_trace.append(th if th is not None else "")
+        return resp
+
+    def run_sql_branch(exec_mode: str = "SQL_FAST") -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        sql_prompt = prompt_builder.build_sql_prompt(question_text, as_of_date, execution_mode=exec_mode)
+        resp = call_llm(sql_prompt)
+        try:
+            sql_text, meta = pb_module.parse_sql_response(resp)
+            code_trace.append(sql_text)
+            exec_res = sql_executor.execute(sql_text, timeout_seconds=timeout)
+        except Exception as exc:
+            sql_text, meta = "", {}
+            exec_res = SQLExecutionResult(
+                success=False,
+                sql="",
+                error=f"SQLResponseParseError: {type(exc).__name__}: {exc}",
+            )
+        output_trace.append(exec_res.rows if exec_res.success else exec_res.error)
+
+        if not exec_res.success and "TimeoutError" not in str(exec_res.error or ""):
+            repair_prompt = prompt_builder.build_sql_repair_prompt(sql_text, str(exec_res.error or ""))
+            repair_resp = call_llm(repair_prompt)
+            sql_text_repaired, meta_repaired = pb_module.parse_sql_response(repair_resp)
+            code_trace.append(sql_text_repaired)
+            exec_res = sql_executor.execute(sql_text_repaired, timeout_seconds=timeout)
+            output_trace.append(exec_res.rows if exec_res.success else exec_res.error)
+            sql_text = sql_text_repaired
+            meta = meta_repaired
+
+        cand: Optional[Dict[str, Any]] = None
+        if meta.get("is_unanswerable"):
+            cand = {"type": "unanswerable", "reason": str(meta.get("reason") or "Missing required data")}
+        elif exec_res.success and not exec_res.anomalies:
+            q_t = meta.get("expected_type") or declared_type
+            try:
+                if q_t == "table":
+                    tbl = {"columns": exec_res.columns, "rows": exec_res.rows}
+                    cand = {"type": "table", "answer": formatter.format_table(tbl)}
+                else:
+                    raw_val = None
+                    if exec_res.rows and len(exec_res.rows) > 0 and len(exec_res.rows[0]) > 0:
+                        raw_val = exec_res.rows[0][0]
+                    cand = {"type": q_t, "answer": raw_val}
+            except Exception:
+                cand = None
+
+        sql_outcome = {
+            "success": exec_res.success,
+            "sql": sql_text,
+            "columns": exec_res.columns,
+            "rows": exec_res.rows,
+            "anomalies": exec_res.anomalies,
+            "error": exec_res.error,
+            "is_unanswerable": meta.get("is_unanswerable", False),
+        }
+        return cand, sql_outcome
+
+    def run_py_branch(dual_path: bool = False, exec_mode: str = "PYTHON_VERIFY") -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        py_prompt = prompt_builder.build_python_prompt(
+            question=question_text,
+            as_of_date=as_of_date,
+            business_id=business_id,
+            dual_path=dual_path,
+            execution_mode=exec_mode,
+        )
+        resp = call_llm(py_prompt)
+        try:
+            py_code = pb_module.parse_python_response(resp)
+        except Exception:
+            py_code = "final_result = 'abstain'"
+        code_trace.append(py_code)
+
+        sub_res = executor.execute_subprocess(
+            code_str=py_code,
+            data_dir=data_dir,
+            file_map=python_file_map,
+            as_of_date=as_of_date,
+            duckdb_path=duckdb_path,
+            timeout_seconds=timeout,
+        )
+        output_trace.append(sub_res.return_value if sub_res.success else sub_res.stderr)
+
+        attempts_left = 2
+        while not sub_res.success and attempts_left > 0:
+            attempts_left -= 1
+            retry_prompt = prompt_builder.build_retry_prompt(
+                question=question_text,
+                previous_code=py_code,
+                error_traceback=sub_res.stderr or "Runtime error",
+            )
+            retry_resp = call_llm(retry_prompt)
+            py_code = pb_module.parse_python_response(retry_resp)
+            code_trace.append(py_code)
+            sub_res = executor.execute_subprocess(
+                code_str=py_code,
+                data_dir=data_dir,
+                file_map=python_file_map,
+                as_of_date=as_of_date,
+                duckdb_path=duckdb_path,
+                timeout_seconds=timeout,
+            )
+            output_trace.append(sub_res.return_value if sub_res.success else sub_res.stderr)
+
+        cand: Optional[Dict[str, Any]] = None
+        if sub_res.success:
+            ret = sub_res.return_value
+            if isinstance(ret, dict) and ret.get("type") == "unanswerable":
+                cand = {"type": "unanswerable", "reason": str(ret.get("reason") or "Missing required data")}
+            elif isinstance(ret, dict) and ret.get("type") == "abstain":
+                cand = {"type": "abstain"}
+            elif isinstance(ret, dict) and "type" in ret and "answer" in ret:
+                cand = {"type": ret["type"], "answer": ret["answer"]}
+            elif ret is not None and not executor.is_empty_result(ret):
+                cand = {"type": declared_type or "number", "answer": ret}
+
+        py_outcome = {
+            "success": sub_res.success,
+            "code": py_code,
+            "stdout": sub_res.stdout,
+            "stderr": sub_res.stderr,
+            "return_value": sub_res.return_value,
+        }
+        return cand, py_outcome
+
+    def run_adjudicator(
+        sql_q: str, sql_res: Any,
+        py_c: str, py_out: str, py_res: Any,
+    ) -> Dict[str, Any]:
+        adj_prompt = prompt_builder.build_adjudicator_prompt(
+            question=question_text,
+            as_of_date=as_of_date,
+            sql_query=sql_q,
+            sql_result=sql_res,
+            python_code=py_c,
+            python_stdout=py_out,
+            python_result=py_res,
+        )
+        resp = call_llm(adj_prompt)
+        parsed_adj = pb_module.parse_json_response(resp)
+        cleaned = pb_module._remove_think_blocks(resp)
+        code_blocks = re.findall(r"```python\s*\n?(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+        if code_blocks:
+            adj_code = code_blocks[0].strip()
+            code_trace.append(adj_code)
+            adj_res = executor.execute_subprocess(
+                code_str=adj_code,
+                data_dir=data_dir,
+                file_map=python_file_map,
+                as_of_date=as_of_date,
+                duckdb_path=duckdb_path,
+                timeout_seconds=timeout,
+            )
+            output_trace.append(adj_res.return_value if adj_res.success else adj_res.stderr)
+            if not adj_res.success:
+                return {"type": "abstain"}
+
+        if parsed_adj.get("decision"):
+            dec = parsed_adj.get("decision")
+            if dec == "verified_answer":
+                return {"type": parsed_adj.get("type"), "answer": parsed_adj.get("answer")}
+            elif dec == "unanswerable":
+                return {"type": "unanswerable", "reason": str(parsed_adj.get("reason") or "Missing required data")}
+            return {"type": "abstain"}
+        if py_res is not None:
+            return {"type": declared_type or "number", "answer": py_res}
+        if sql_res is not None and len(sql_res) > 0 and len(sql_res[0]) > 0:
+            return {"type": declared_type or "number", "answer": sql_res[0][0]}
+        return {"type": "abstain"}
+
+    try:
+        final_answer_dict: Dict[str, Any] = {"type": "abstain"}
+
+        if route_decision == RouteDecision.SQL_FAST:
+            cand_sql, sql_out = run_sql_branch(exec_mode="SQL_FAST")
+            should_esc, esc_reasons = should_escalate_sql_result(sql_out, question_text)
+            escalation_reasons.extend(esc_reasons)
+
+            if not should_esc and cand_sql is not None and cand_sql.get("type") != "abstain":
+                if cand_sql.get("type") == "unanswerable":
+                    final_answer_dict = {"type": "unanswerable", "reason": cand_sql.get("reason", "")}
+                else:
+                    final_answer_dict = {"type": cand_sql.get("type"), "answer": cand_sql.get("answer")}
+            else:
+                escalated = True
+                final_stage = "PYTHON_VERIFY"
+                cand_py, py_out = run_py_branch(dual_path=True, exec_mode="PYTHON_VERIFY")
+
+                if cand_sql is not None and cand_py is not None:
+                    if formatter.answers_equivalent(cand_sql, cand_py):
+                        final_answer_dict = cand_sql
+                    else:
+                        final_stage = "ADJUDICATOR"
+                        final_answer_dict = run_adjudicator(
+                            sql_q=sql_out.get("sql", ""),
+                            sql_res=sql_out.get("rows"),
+                            py_c=py_out.get("code", ""),
+                            py_out=py_out.get("stdout", ""),
+                            py_res=py_out.get("return_value"),
+                        )
+                elif cand_py is not None and cand_py.get("type") != "abstain":
+                    final_answer_dict = cand_py
+                elif cand_sql is not None and cand_sql.get("type") != "abstain":
+                    final_stage = "ADJUDICATOR"
+                    final_answer_dict = run_adjudicator(
+                        sql_q=sql_out.get("sql", ""),
+                        sql_res=sql_out.get("rows"),
+                        py_c=py_out.get("code", ""),
+                        py_out=py_out.get("stdout", ""),
+                        py_res=py_out.get("return_value"),
+                    )
+                else:
+                    final_answer_dict = {"type": "abstain"}
+
+        elif route_decision == RouteDecision.HYBRID_DUAL:
+            cand_sql, sql_out = run_sql_branch(exec_mode="SQL_FAST")
+            cand_py, py_out = run_py_branch(dual_path=True, exec_mode="PYTHON_VERIFY")
+
+            if cand_sql is not None and cand_py is not None:
+                if formatter.answers_equivalent(cand_sql, cand_py):
+                    final_answer_dict = cand_sql if cand_sql.get("type") != "abstain" else cand_py
+                else:
+                    final_stage = "ADJUDICATOR"
+                    final_answer_dict = run_adjudicator(
+                        sql_q=sql_out.get("sql", ""),
+                        sql_res=sql_out.get("rows"),
+                        py_c=py_out.get("code", ""),
+                        py_out=py_out.get("stdout", ""),
+                        py_res=py_out.get("return_value"),
+                    )
+            elif cand_py is not None and cand_py.get("type") != "abstain":
+                final_stage = "ADJUDICATOR"
+                final_answer_dict = run_adjudicator(
+                    sql_q=sql_out.get("sql", ""),
+                    sql_res=sql_out.get("rows"),
+                    py_c=py_out.get("code", ""),
+                    py_out=py_out.get("stdout", ""),
+                    py_res=py_out.get("return_value"),
+                )
+            elif cand_sql is not None and cand_sql.get("type") != "abstain":
+                final_stage = "ADJUDICATOR"
+                final_answer_dict = run_adjudicator(
+                    sql_q=sql_out.get("sql", ""),
+                    sql_res=sql_out.get("rows"),
+                    py_c=py_out.get("code", ""),
+                    py_out=py_out.get("stdout", ""),
+                    py_res=py_out.get("return_value"),
+                )
+            else:
+                final_answer_dict = {"type": "abstain"}
+
+        elif route_decision == RouteDecision.PYTHON_FIRST:
+            cand_py, py_out = run_py_branch(dual_path=False, exec_mode="PYTHON_FIRST")
+            risky_types = {"number", "percent", "list", "table", "unanswerable"}
+            needs_check = (not time_pressure) and (
+                cand_py is not None and cand_py.get("type") in risky_types
+            )
+
+            if needs_check:
+                final_stage = "PYTHON_VERIFY"
+                cand_sql, sql_out = run_sql_branch(exec_mode="SQL_FAST")
+                if cand_sql is not None and cand_py is not None:
+                    if formatter.answers_equivalent(cand_sql, cand_py):
+                        final_answer_dict = cand_py
+                    else:
+                        final_stage = "ADJUDICATOR"
+                        final_answer_dict = run_adjudicator(
+                            sql_q=sql_out.get("sql", ""),
+                            sql_res=sql_out.get("rows"),
+                            py_c=py_out.get("code", ""),
+                            py_out=py_out.get("stdout", ""),
+                            py_res=py_out.get("return_value"),
+                        )
+                elif cand_py is not None:
+                    final_answer_dict = cand_py
+                else:
+                    final_answer_dict = {"type": "abstain"}
+            else:
+                final_answer_dict = cand_py if cand_py is not None else {"type": "abstain"}
+
+    except Exception:
+        final_answer_dict = {"type": "abstain"}
+
+    is_month = "tháng nào" in question_text.lower() or "tháng mấy" in question_text.lower()
+    submission_record = formatter.format_submission_record(
+        q_id=q_id,
+        answer=final_answer_dict.get("answer"),
+        q_type=final_answer_dict.get("type"),
+        abstain_token="abstain",
+        reason=final_answer_dict.get("reason"),
+        as_month=is_month,
+    )
+
+    elapsed_ms = max(0, int((time.perf_counter() - q_start) * 1000))
+
+    final_type = submission_record.get("type")
+    log_answer: Dict[str, Any] = {"type": final_type, "answer": submission_record.get("answer")}
+    if final_type == "unanswerable":
+        log_answer["reason"] = submission_record.get("reason")
+        log_answer.pop("answer", None)
+    elif final_type == "abstain":
+        log_answer["answer"] = None
+
+    thinking_val = thinking_trace if any(thinking_trace) else None
+    code_val = "\n\n".join(f"# RUN {idx}\n{c}" for idx, c in enumerate(code_trace, 1)) if code_trace else None
+    output_val = output_trace if output_trace else None
+
+    route_trace = {
+        "route_initial": route_initial,
+        "escalated": escalated,
+        "final_stage": final_stage,
+        "llm_calls": llm_call_count,
+        "reasons": route_reasons,
+        "escalation_reasons": escalation_reasons,
+    }
+
+    log_record = {
+        "id": q_id,
+        "answer": log_answer,
+        "elapsed_ms": elapsed_ms,
+        "thinking": thinking_val,
+        "code": code_val,
+        "output": output_val,
+        "route_trace": route_trace,
+    }
+
+    return {
+        "submission_record": submission_record,
+        "log_record": log_record,
+        "thinking_trace": thinking_trace,
+        "code_trace": code_trace,
+        "output_trace": output_trace,
+        "route_trace": route_trace,
+    }
 
 
 def main() -> None:

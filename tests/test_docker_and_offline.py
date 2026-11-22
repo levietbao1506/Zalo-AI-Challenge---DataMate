@@ -1,12 +1,15 @@
 """Unit tests for Bước 7: Đóng gói Docker, Cấu hình run_inference.sh & Offline Testing."""
 
+import io
 import json
 from pathlib import Path
 import socket
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
+from scripts.verify_submission_runs import main as verify_runs_main
 from src.main import main
 
 
@@ -52,6 +55,7 @@ class TestDockerAndOffline(unittest.TestCase):
 
         # 5. NCCL pin and permissions
         self.assertIn("nvidia-nccl-cu12==2.27.7", content)
+        self.assertIn("--no-deps nvidia-nccl-cu12==2.27.7", content)
         self.assertIn("chmod +x /code/predict.sh", content)
 
         # 6. Default execution CMD
@@ -100,6 +104,7 @@ class TestDockerAndOffline(unittest.TestCase):
         ]
         for pkg in required_pkgs:
             self.assertIn(pkg, reqs, f"Package '{pkg}' missing from requirements.txt")
+        self.assertIn("vllm==0.10.1.1", reqs)
 
     def test_offline_network_none_simulation(self):
         """Simulate strict --network none by intercepting sockets, ensuring pipeline runs offline."""
@@ -167,10 +172,106 @@ class TestDockerAndOffline(unittest.TestCase):
         self.assertIn("export TMPDIR=/tmp", content)
         self.assertIn("export VLLM_SEED=42", content)
         self.assertIn("--soft_timeout", content)
+        self.assertIn("load_model_ms", content)
+        self.assertIn("total_ms", content)
+
+        dockerignore = (self.root_dir / ".dockerignore").read_text(encoding="utf-8")
+        self.assertIn("public_test.zip", dockerignore)
+        self.assertIn(".git/", dockerignore)
+        self.assertIn("__pycache__/", dockerignore)
+        self.assertIn(".pytest_cache", dockerignore)
+        self.assertIn("!training_code/", dockerignore)
+        self.assertNotIn("\ntraining_code/", dockerignore)
+
+    def test_pre_submit_check_script_contract(self):
+        script_path = self.root_dir / "scripts" / "pre_submit_check.sh"
+        verifier_path = self.root_dir / "scripts" / "verify_submission_runs.py"
+        benchmark_path = self.root_dir / "scripts" / "benchmark_hybrid.py"
+        self.assertTrue(script_path.is_file())
+        self.assertTrue(verifier_path.is_file())
+        self.assertTrue(benchmark_path.is_file())
+        content = script_path.read_text(encoding="utf-8")
+        self.assertIn("--platform linux/amd64", content)
+        self.assertIn("--gpus '\"device=0,1\"'", content)
+        self.assertIn("--network none", content)
+        self.assertIn("--shm-size=16g", content)
+        self.assertIn("--entrypoint bash", content)
+        self.assertIn(":/data:ro", content)
+        self.assertEqual(content.count("docker run --rm"), 2)
+        self.assertIn("--max-pa-delta 0.03", content)
+        self.assertIn("100 * 1024 * 1024 * 1024", content)
+        self.assertIn("docker save", content)
+        self.assertIn("pigz -p 8", content)
+        self.assertIn("pigz -dc", content)
+        self.assertIn("md5sum", content)
 
         # Check that run_inference.sh delegates to predict.sh
         runner_content = self.runner_path.read_text(encoding="utf-8")
         self.assertIn("predict.sh", runner_content)
+
+    def test_pre_submit_verifier_filters_answers_to_question_ids(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            questions = root / "questions.jsonl"
+            answers = root / "answers.jsonl"
+            question_records = [
+                {"id": "q1", "type": "number", "question": "one"},
+                {"id": "q2", "type": "number", "question": "two"},
+            ]
+            answer_records = [
+                {"id": "q1", "type": "number", "answer": 1},
+                {"id": "q2", "type": "number", "answer": 2},
+                {"id": "extra", "type": "number", "answer": 3},
+            ]
+            questions.write_text(
+                "".join(json.dumps(item) + "\n" for item in question_records),
+                encoding="utf-8",
+            )
+            answers.write_text(
+                "".join(json.dumps(item) + "\n" for item in answer_records),
+                encoding="utf-8",
+            )
+            for run_name in ("run1", "run2"):
+                run_dir = root / run_name
+                logs_dir = run_dir / "logs"
+                logs_dir.mkdir(parents=True)
+                submissions = [
+                    {"id": "q1", "type": "number", "answer": 1},
+                    {"id": "q2", "type": "number", "answer": 2},
+                ]
+                (run_dir / "submission.jsonl").write_text(
+                    "".join(json.dumps(item) + "\n" for item in submissions),
+                    encoding="utf-8",
+                )
+                logs = [
+                    {
+                        "id": item["id"],
+                        "answer": item,
+                        "elapsed_ms": 1,
+                        "thinking": None,
+                        "code": None,
+                        "output": None,
+                    }
+                    for item in submissions
+                ]
+                (logs_dir / "predictions.jsonl").write_text(
+                    "".join(json.dumps(item) + "\n" for item in logs),
+                    encoding="utf-8",
+                )
+            stdout = io.StringIO()
+            argv = [
+                "verify_submission_runs.py",
+                "--questions", str(questions),
+                "--answers", str(answers),
+                "--run1", str(root / "run1"),
+                "--run2", str(root / "run2"),
+            ]
+            with patch("sys.argv", argv), patch("sys.stdout", stdout):
+                verify_runs_main()
+            result = json.loads(stdout.getvalue())
+            self.assertEqual(result["questions"], 2)
+            self.assertEqual(result["pa_1"], 1.0)
+            self.assertEqual(result["pa_2"], 1.0)
 
     def test_strict_directory_rules_and_alias_omission(self):
         """Ensure /data is treated read-only, logs directory is created, alias is omitted, and --limit works."""

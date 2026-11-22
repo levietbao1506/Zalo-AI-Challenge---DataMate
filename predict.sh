@@ -1,26 +1,17 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# Zalo AI Challenge 2026 - DataMate Track
-# predict.sh: Container entrypoint for offline evaluation
-# Supports invocation with NO required arguments: bash /code/predict.sh
-# Optional flags: --data-dir (default /data), --output-dir (default /result), --limit
-# ==============================================================================
-
 set -euo pipefail
 
-# 1. Default paths per DataMate Docker specification
 DATA_DIR="${DATA_DIR:-/data}"
 OUTPUT_DIR="${OUTPUT_DIR:-/result}"
 LIMIT="${LIMIT:-}"
 MODEL_PATH="${MODEL_PATH:-/code/models/Qwen3-14B}"
 TIMEOUT="${TIMEOUT:-15}"
 SOFT_TIMEOUT="${SOFT_TIMEOUT:-100}"
-TIME_BUDGET_SECONDS="${TIME_BUDGET_SECONDS:-21600}"
+TIME_BUDGET_SECONDS="${TIME_BUDGET_SECONDS:-20700}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 EXTRA_ARGS=()
 
-# Local environment fallback if running outside container where /data doesn't exist
 if [[ ! -d "${DATA_DIR}" ]] && [[ -d "./data/sample_dataset" ]]; then
   DATA_DIR="./data/sample_dataset"
 elif [[ ! -d "${DATA_DIR}" ]] && [[ -d "./data" ]]; then
@@ -31,7 +22,6 @@ if [[ ! -d "${MODEL_PATH}" ]] && [[ -d "./models/Qwen3-14B" ]]; then
   MODEL_PATH="./models/Qwen3-14B"
 fi
 
-# 2. Parse command line arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --data-dir|--data_dir|-d)
@@ -93,10 +83,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# 3. Create /result and /result/logs if missing
 mkdir -p "${OUTPUT_DIR}" "${OUTPUT_DIR}/logs" 2>/dev/null || true
 
-# 4. Strict offline environment variables
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -109,12 +97,12 @@ export NCCL_P2P_DISABLE=1
 export PYTHONHASHSEED=42
 export VLLM_SEED=42
 export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-8}"
-export TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-2}"
 export TMPDIR=/tmp
 export TEMP=/tmp
 export TMP=/tmp
 mkdir -p /tmp
 
+START_TIME=$(date +%s)
 echo "======================================================================"
 echo " Zalo AI Challenge 2026 - DataMate Prediction Entrypoint"
 echo " Time:        $(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date)"
@@ -124,7 +112,6 @@ echo " Model Path:  ${MODEL_PATH}"
 echo " Limit:       ${LIMIT:-None (process all)}"
 echo "======================================================================"
 
-# 5. Build Python execution command
 CMD=(python -m src.main
   --data_dir "${DATA_DIR}"
   --output_dir "${OUTPUT_DIR}"
@@ -144,4 +131,42 @@ if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
   CMD+=("${EXTRA_ARGS[@]}")
 fi
 
-exec "${CMD[@]}"
+"${CMD[@]}"
+
+END_TIME=$(date +%s)
+TOTAL_SEC=$((END_TIME - START_TIME))
+TOTAL_MS=$((TOTAL_SEC * 1000))
+
+echo "======================================================================"
+echo " Inference Summary"
+echo " Total Elapsed: ${TOTAL_SEC}s (${TOTAL_MS} ms)"
+if [[ -f "${OUTPUT_DIR}/logs/runtime_metrics.json" ]]; then
+  python -c '
+import json
+with open("'"${OUTPUT_DIR}"'/logs/runtime_metrics.json", "r", encoding="utf-8") as f:
+    metrics = json.load(f)
+print(f" load_model_ms={metrics.get('"'"'load_model_ms'"'"', 0)}")
+print(f" total_ms={metrics.get('"'"'total_ms'"'"', 0)}")
+'
+fi
+if [[ -f "${OUTPUT_DIR}/logs/predictions.jsonl" ]]; then
+  echo " Route Breakdown:"
+  python -c '
+import json, sys
+from collections import Counter
+counts = Counter()
+try:
+    with open("'"${OUTPUT_DIR}"'/logs/predictions.jsonl", "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip(): continue
+            rec = json.loads(line)
+            rt = rec.get("route_trace") or {}
+            init = rt.get("route_initial", "UNKNOWN")
+            counts[init] += 1
+    for k, v in counts.items():
+        print(f"   - {k}: {v} questions")
+except Exception as e:
+    pass
+'
+fi
+echo "======================================================================"
