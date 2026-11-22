@@ -16,11 +16,15 @@ result/
 *.duckdb
 *.duckdb.wal
 submission*.jsonl
-public_test.zip
+*.zip
+export/
 
 # Local test datasets and output directories
+public_test/
+public_test.zip
 local_data/
 local_out/
+data/sample_dataset/
 
 # Explicitly ensure models/ and training_code/ are NOT excluded for offline evaluation container
 !models/

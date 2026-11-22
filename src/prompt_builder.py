@@ -298,11 +298,23 @@ class PromptBuilder:
                 time_context = resolve_time_context(as_of_date, rulebook_text=rulebook)
             except (TypeError, ValueError):
                 time_context = {}
-        anchors = json.dumps(time_context or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        resolved_time_context = time_context or {}
+        anchors = json.dumps(resolved_time_context, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        interval_lines = []
+        if resolved_time_context:
+            last_week = resolved_time_context.get("last_week", {})
+            this_month = resolved_time_context.get("this_month", {})
+            interval_lines = [
+                "PRE-COMPUTED TIME INTERVALS:",
+                f"- Tuần trước / Tuần rồi: {last_week.get('start', '')}..{last_week.get('end', '')}",
+                f"- Tháng này (Month-to-Date): {this_month.get('start', '')}..{this_month.get('end', '')}",
+            ]
+        intervals = "\n".join(interval_lines)
         return (
             f"CÂU HỎI: {question.strip()}\n"
             f"as_of_date: {as_of_date or '[chưa xác định]'}\n"
             f"TIME_CONTEXT_ISO: {anchors}\n"
+            f"{intervals}\n"
             "Kiểm tra dữ liệu thật rồi viết code gán final_result."
         )
 

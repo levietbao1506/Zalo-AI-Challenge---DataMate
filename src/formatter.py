@@ -709,6 +709,12 @@ def append_submission_line(
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(safe_record, ensure_ascii=False, allow_nan=False) + "\n")
+        f.flush()
+        try:
+            import os
+            os.fsync(f.fileno())
+        except OSError:
+            pass
 
 
 def answers_equivalent(ans_a: Any, ans_b: Any) -> bool:
