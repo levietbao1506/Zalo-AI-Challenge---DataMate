@@ -72,11 +72,136 @@ def get_calendar_csv_path() -> Optional[Path]:
     return None
 
 
-def load_calendar(calendar_path: Optional[Union[str, Path]] = None) -> Optional[Any]:
-    """Dynamically load and parse calendar.csv at runtime.
+def load_normalized_calendar_df(calendar_csv_path: Optional[Union[str, Path]] = None) -> pd.DataFrame:
+    """Read calendar CSV, normalize date columns, and return a clean DataFrame."""
+    if not _HAS_PANDAS:
+        return pd.DataFrame()
 
-    Standardizes solar dates, lunar dates, and holiday indicators.
-    """
+    target_path = Path(calendar_csv_path).resolve() if calendar_csv_path else get_calendar_csv_path()
+    empty_cols = [
+        "solar_date", "solar_year", "solar_month", "solar_day",
+        "iso_weekday", "weekday_vi", "lunar_year", "lunar_month", "lunar_day", "is_leap_month"
+    ]
+    if not target_path or not target_path.is_file():
+        return pd.DataFrame(columns=empty_cols)
+
+    df = None
+    for enc in ("utf-8-sig", "utf-8", "cp1258", "latin1"):
+        try:
+            with target_path.open("r", encoding=enc) as handle:
+                first_line = handle.readline()
+            delimiter = max((",", ";", "\t"), key=first_line.count)
+            df = pd.read_csv(target_path, encoding=enc, sep=delimiter)
+            break
+        except Exception:
+            continue
+
+    if df is None or df.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    solar_col = None
+    for col in df.columns:
+        c_low = str(col).strip().lower()
+        if c_low in ("solar_date", "date", "ngay", "ngay_duong", "duong_lich", "solar", "full_date", "day", "solar_date_iso"):
+            solar_col = col
+            break
+    if not solar_col:
+        for col in df.columns:
+            c_low = str(col).strip().lower()
+            if ("date" in c_low or "ngay" in c_low) and "am" not in c_low and "lunar" not in c_low:
+                solar_col = col
+                break
+    if not solar_col:
+        solar_col = df.columns[0]
+
+    day_first = df[solar_col].astype(str).str.match(r"^\d{1,2}/\d{1,2}/\d{4}").mean() > 0.5
+    parsed_dates = pd.to_datetime(df[solar_col], errors="coerce", dayfirst=day_first).dt.date
+    valid_mask = parsed_dates.notna()
+    df = df[valid_mask].copy()
+    parsed_dates = parsed_dates[valid_mask]
+
+    vi_weekday_map = {
+        1: "Thứ 2",
+        2: "Thứ 3",
+        3: "Thứ 4",
+        4: "Thứ 5",
+        5: "Thứ 6",
+        6: "Thứ 7",
+        7: "Chủ nhật",
+    }
+
+    df["solar_date"] = parsed_dates
+    df["solar_year"] = parsed_dates.map(lambda d: d.year).astype(int)
+    df["solar_month"] = parsed_dates.map(lambda d: d.month).astype(int)
+    df["solar_day"] = parsed_dates.map(lambda d: d.day).astype(int)
+    df["iso_weekday"] = parsed_dates.map(lambda d: d.isoweekday()).astype(int)
+    df["weekday_vi"] = df["iso_weekday"].map(vi_weekday_map)
+
+    lunar_date_col = None
+    for col in df.columns:
+        c_low = str(col).strip().lower()
+        if c_low in ("lunar_date", "ngay_am", "ngay_am_lich", "lunar", "am_lich"):
+            lunar_date_col = col
+            break
+
+    l_year_col = next((c for c in df.columns if str(c).strip().lower() in ("lunar_year", "nam_am", "am_nam")), None)
+    l_month_col = next((c for c in df.columns if str(c).strip().lower() in ("lunar_month", "thang_am", "am_thang")), None)
+    l_day_col = next((c for c in df.columns if str(c).strip().lower() in ("lunar_day", "ngay_am_so", "am_ngay")), None)
+
+    if l_year_col and l_month_col and l_day_col:
+        df["lunar_year"] = pd.to_numeric(df[l_year_col], errors="coerce")
+        df["lunar_month"] = pd.to_numeric(df[l_month_col], errors="coerce")
+        df["lunar_day"] = pd.to_numeric(df[l_day_col], errors="coerce")
+    elif lunar_date_col:
+        def _parse_lunar_parts(val: Any) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+            if pd.isna(val):
+                return None, None, None
+            s = str(val).strip()
+            m_iso = re.match(r"^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$", s)
+            if m_iso:
+                return int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
+            m_slash = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$", s)
+            if m_slash:
+                return int(m_slash.group(3)), int(m_slash.group(2)), int(m_slash.group(1))
+            return None, None, None
+
+        parsed_lunar = df[lunar_date_col].map(_parse_lunar_parts)
+        df["lunar_year"] = pd.to_numeric(parsed_lunar.map(lambda p: p[0]), errors="coerce").astype("Int64")
+        df["lunar_month"] = pd.to_numeric(parsed_lunar.map(lambda p: p[1]), errors="coerce").astype("Int64")
+        df["lunar_day"] = pd.to_numeric(parsed_lunar.map(lambda p: p[2]), errors="coerce").astype("Int64")
+    else:
+        df["lunar_year"] = pd.Series([pd.NA] * len(df), index=df.index, dtype="Int64")
+        df["lunar_month"] = pd.Series([pd.NA] * len(df), index=df.index, dtype="Int64")
+        df["lunar_day"] = pd.Series([pd.NA] * len(df), index=df.index, dtype="Int64")
+
+    leap_col = next(
+        (c for c in df.columns if str(c).strip().lower() in ("is_leap_month", "is_leap", "nhuan", "thang_nhuan", "leap_month")),
+        None,
+    )
+    if leap_col:
+        df["is_leap_month"] = df[leap_col].astype(str).str.strip().str.lower().isin(("true", "1", "yes", "co", "có", "t"))
+    else:
+        df["is_leap_month"] = False
+
+    df["_solar_date"] = df["solar_date"]
+    df["_lunar_day"] = df["lunar_day"]
+    df["_lunar_month"] = df["lunar_month"]
+    df["_lunar_year"] = df["lunar_year"]
+
+    event_col = next(
+        (c for c in df.columns if str(c).strip().lower() in ("holiday", "holiday_name", "event", "su_kien", "ten_le", "type", "ghi_chu", "note", "is_holiday")),
+        None,
+    )
+    if event_col:
+        df["_event"] = df[event_col].astype(str).str.strip().str.lower()
+    else:
+        df["_event"] = ""
+
+    return df
+
+
+def load_calendar(calendar_path: Optional[Union[str, Path]] = None) -> Optional[Any]:
+    """Dynamically load and parse calendar.csv at runtime."""
     global _GLOBAL_CALENDAR_CACHE, _GLOBAL_CALENDAR_MTIME, _GLOBAL_CALENDAR_LOADED_PATH
     if not _HAS_PANDAS:
         return None
@@ -91,88 +216,9 @@ def load_calendar(calendar_path: Optional[Union[str, Path]] = None) -> Optional[
                 and _GLOBAL_CALENDAR_LOADED_PATH == str(target_path)):
             return _GLOBAL_CALENDAR_CACHE
 
-        for enc in ("utf-8-sig", "utf-8", "cp1258", "latin1"):
-            try:
-                with target_path.open("r", encoding=enc) as handle:
-                    first_line = handle.readline()
-                delimiter = max((",", ";", "\t"), key=first_line.count)
-                df = pd.read_csv(target_path, encoding=enc, sep=delimiter)
-                break
-            except Exception:
-                continue
-        else:
+        df = load_normalized_calendar_df(target_path)
+        if df is None or df.empty:
             return None
-
-        # Identify solar date column
-        solar_col = None
-        for col in df.columns:
-            c_low = str(col).strip().lower()
-            if c_low in ("date", "solar_date", "ngay", "ngay_duong", "solar", "full_date", "day"):
-                solar_col = col
-                break
-        if not solar_col:
-            for col in df.columns:
-                if "date" in str(col).lower() or "ngay" in str(col).lower():
-                    solar_col = col
-                    break
-
-        if not solar_col:
-            return None
-
-        day_first = df[solar_col].astype(str).str.match(r"^\d{1,2}/\d{1,2}/\d{4}").mean() > 0.5
-        df["_solar_date"] = pd.to_datetime(df[solar_col], errors="coerce", dayfirst=day_first).dt.date
-        df = df.dropna(subset=["_solar_date"]).copy()
-
-        # Identify lunar date column
-        lunar_col = None
-        for col in df.columns:
-            c_low = str(col).strip().lower()
-            if c_low in ("lunar_date", "ngay_am", "ngay_am_lich", "lunar"):
-                lunar_col = col
-                break
-
-        if lunar_col:
-            # Parse lunar date strings if present
-            def _parse_lunar_str(v: Any) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-                if pd.isna(v):
-                    return None, None, None
-                s = str(v).strip()
-                # Patterns: YYYY-MM-DD or DD/MM/YYYY
-                m_iso = re.match(r"^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$", s)
-                if m_iso:
-                    return int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
-                m_slash = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$", s)
-                if m_slash:
-                    return int(m_slash.group(3)), int(m_slash.group(2)), int(m_slash.group(1))
-                return None, None, None
-
-            parsed_lunar = df[lunar_col].apply(_parse_lunar_str)
-            df["_lunar_year"] = parsed_lunar.apply(lambda x: x[0])
-            df["_lunar_month"] = parsed_lunar.apply(lambda x: x[1])
-            df["_lunar_day"] = parsed_lunar.apply(lambda x: x[2])
-        else:
-            # Check for separate lunar_day, lunar_month, lunar_year
-            for col in df.columns:
-                c_low = str(col).lower()
-                if "lunar_day" in c_low or "ngay_am" in c_low:
-                    df["_lunar_day"] = pd.to_numeric(df[col], errors="coerce")
-                elif "lunar_month" in c_low or "thang_am" in c_low:
-                    df["_lunar_month"] = pd.to_numeric(df[col], errors="coerce")
-                elif "lunar_year" in c_low or "nam_am" in c_low:
-                    df["_lunar_year"] = pd.to_numeric(df[col], errors="coerce")
-
-        # Identify holiday or event column
-        event_col = None
-        for col in df.columns:
-            c_low = str(col).strip().lower()
-            if c_low in ("holiday", "holiday_name", "event", "su_kien", "ten_le", "type", "ghi_chu", "note", "is_holiday"):
-                event_col = col
-                break
-
-        if event_col:
-            df["_event"] = df[event_col].astype(str).str.strip().str.lower()
-        else:
-            df["_event"] = ""
 
         _GLOBAL_CALENDAR_CACHE = df
         _GLOBAL_CALENDAR_MTIME = mtime
@@ -484,6 +530,176 @@ def load_rulebook(data_dir: Optional[Union[str, Path]] = None) -> str:
 def _plain(text: str) -> str:
     text = unicodedata.normalize("NFD", text.lower().replace("đ", "d"))
     return "".join(ch for ch in text if not unicodedata.combining(ch))
+
+
+def parse_time_rules_from_rulebook(rulebook_text: str = "") -> Dict[str, Any]:
+    text = rulebook_text or ""
+    plain = _plain(text)
+
+    sunday_start = bool(re.search(
+        r"(?:tuan|week).{0,100}(?:chu nhat|sunday).{0,35}(?:thu bay|saturday)|"
+        r"(?:chu nhat|sunday).{0,35}(?:thu bay|saturday).{0,100}(?:tuan|week)|"
+        r"(?:tuan|week).{0,40}(?:bat dau|start).{0,20}(?:chu nhat|sunday)",
+        plain, re.DOTALL,
+    ))
+    week_start = "sunday" if sunday_start else "monday"
+
+    full_month = bool(re.search(
+        r"(?:thang nay|trong thang nay).{0,60}(?:toan bo|ca thang|full month|ngay cuoi thang|het thang)",
+        plain, re.DOTALL,
+    ))
+    this_month_definition = "full_month" if full_month else "mtd"
+
+    tet_start_lunar = None
+    tet_end_lunar = None
+
+    m_tet_start = re.search(
+        r"(?:tu|bat dau tu)\s+(\d{1,2})\s*(?:thang chap|am|am lich|tet)?\s*(?:den|het|-)",
+        plain,
+    )
+    if not m_tet_start:
+        m_tet_start = re.search(r"(\d{1,2})\s*(?:thang chap|tet)\s*(?:den|het|-)", plain)
+
+    m_tet_end = re.search(
+        r"(?:den|het|-)\s*(?:ngay\s*)?(?:mung\s*)?(\d{1,2})\s*(?:thang gieng|tet|am lich)?",
+        plain,
+    )
+    if "mung" in plain:
+        m_mung = re.search(r"mung\s*(\d{1,2})", plain)
+        if m_mung:
+            tet_end_lunar = (1, int(m_mung.group(1)))
+
+    if m_tet_start:
+        start_day = int(m_tet_start.group(1))
+        if 20 <= start_day <= 30:
+            tet_start_lunar = (12, start_day)
+        elif 1 <= start_day <= 10:
+            tet_start_lunar = (1, start_day)
+
+    if m_tet_end and not tet_end_lunar:
+        end_day = int(m_tet_end.group(1))
+        if 1 <= end_day <= 15:
+            tet_end_lunar = (1, end_day)
+
+    return {
+        "week_start": week_start,
+        "this_month_definition": this_month_definition,
+        "as_of_date_inclusive": True,
+        "tet_lunar_start": tet_start_lunar,
+        "tet_lunar_end": tet_end_lunar,
+        "raw_rulebook_length": len(text),
+    }
+
+
+def resolve_relative_period(
+    period_key: str,
+    as_of_date: Union[str, date, datetime],
+    calendar_df: Optional[pd.DataFrame] = None,
+    time_rules: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
+    ref_date = resolve_as_of_date(as_of_date)
+    df = calendar_df if (calendar_df is not None and not calendar_df.empty) else load_calendar()
+    if time_rules is None:
+        time_rules = parse_time_rules_from_rulebook(load_rulebook())
+
+    key = _plain(str(period_key or "")).strip().replace(" ", "_")
+    sunday_start = (time_rules.get("week_start") == "sunday")
+    this_month_def = time_rules.get("this_month_definition", "mtd")
+
+    if key in ("this_month", "thang_nay", "thang_hien_tai", "trong_thang_nay"):
+        start_m = date(ref_date.year, ref_date.month, 1)
+        if this_month_def == "full_month":
+            _, last_day = calendar.monthrange(ref_date.year, ref_date.month)
+            end_m = date(ref_date.year, ref_date.month, last_day)
+        else:
+            end_m = ref_date
+        return start_m.isoformat(), end_m.isoformat()
+
+    if key in ("last_month", "thang_truoc", "thang_roi", "thang_vua_roi", "thang_qua"):
+        if ref_date.month == 1:
+            y, m = ref_date.year - 1, 12
+        else:
+            y, m = ref_date.year, ref_date.month - 1
+        start_lm = date(y, m, 1)
+        _, last_day = calendar.monthrange(y, m)
+        end_lm = date(y, m, last_day)
+        return start_lm.isoformat(), end_lm.isoformat()
+
+    if key in ("this_week", "tuan_nay", "trong_tuan_nay", "tuan_hien_tai"):
+        offset = (ref_date.weekday() + 1) % 7 if sunday_start else ref_date.weekday()
+        start_w = ref_date - timedelta(days=offset)
+        end_w = start_w + timedelta(days=6)
+        return start_w.isoformat(), end_w.isoformat()
+
+    if key in ("last_week", "tuan_truoc", "tuan_roi", "tuan_vua_roi", "tuan_qua"):
+        offset = (ref_date.weekday() + 1) % 7 if sunday_start else ref_date.weekday()
+        this_w_start = ref_date - timedelta(days=offset)
+        start_lw = this_w_start - timedelta(days=7)
+        end_lw = start_lw + timedelta(days=6)
+        return start_lw.isoformat(), end_lw.isoformat()
+
+    if key in ("same_period_last_year", "cung_ky_nam_ngoai", "cung_ky_nam_truoc", "so_voi_cung_ky_nam_ngoai"):
+        target_year = ref_date.year - 1
+        month = ref_date.month
+        start_sp = date(target_year, month, 1)
+        if this_month_def == "full_month":
+            _, last_day = calendar.monthrange(target_year, month)
+            end_sp = date(target_year, month, last_day)
+        else:
+            _, max_day = calendar.monthrange(target_year, month)
+            end_sp = date(target_year, month, min(ref_date.day, max_day))
+        return start_sp.isoformat(), end_sp.isoformat()
+
+    if key in ("tet_current_year", "tet_last_year", "tet", "dip_tet", "tet_nguyen_dan", "mua_tet", "vu_tet", "nghi_tet", "tet_nam_ngoai"):
+        target_year = ref_date.year - 1 if "last" in key or "ngoai" in key else ref_date.year
+        l_start = time_rules.get("tet_lunar_start")
+        l_end = time_rules.get("tet_lunar_end")
+        if df is not None and not df.empty and l_start and l_end and "lunar_year" in df.columns:
+            date_col = "solar_date" if "solar_date" in df.columns else "_solar_date"
+            if date_col in df.columns:
+                m_s = (df["lunar_year"] == target_year - 1) & (df["lunar_month"] == l_start[0]) & (df["lunar_day"] == l_start[1])
+                m_e = (df["lunar_year"] == target_year) & (df["lunar_month"] == l_end[0]) & (df["lunar_day"] == l_end[1])
+                r_s = df[m_s]
+                r_e = df[m_e]
+                if not r_s.empty and not r_e.empty:
+                    val_s = r_s[date_col].iloc[0]
+                    val_e = r_e[date_col].iloc[0]
+                    return str(val_s)[:10], str(val_e)[:10]
+
+        if df is not None and not df.empty and ("_event" in df.columns or "holiday" in df.columns):
+            event_series = df["_event"] if "_event" in df.columns else df.get("holiday", pd.Series(dtype=object))
+            event_clean = event_series.fillna("").astype(str).str.lower()
+            date_col = "solar_date" if "solar_date" in df.columns else "_solar_date"
+            if date_col in df.columns:
+                m_tet = (
+                    df[date_col].map(lambda d: hasattr(d, "year") and d.year == target_year and hasattr(d, "month") and d.month in (1, 2))
+                    & event_clean.str.contains(r"\bt[eế]t\b|nguy[eê]n\s*đ[aá]n", regex=True)
+                )
+                matched = df[m_tet]
+                if not matched.empty:
+                    return str(matched[date_col].min())[:10], str(matched[date_col].max())[:10]
+
+        win = get_tet_window(year=target_year, as_of=ref_date)
+        if win:
+            return win[0].isoformat(), win[1].isoformat()
+
+        mung_1 = get_tet_date(target_year)
+        if mung_1:
+            return (mung_1 - timedelta(days=2)).isoformat(), (mung_1 + timedelta(days=4)).isoformat()
+
+        return f"{target_year}-02-01", f"{target_year}-02-15"
+
+    if key in ("ytd", "nam_nay", "trong_nam_nay"):
+        return date(ref_date.year, 1, 1).isoformat(), ref_date.isoformat()
+
+    if key in ("last_year", "nam_ngoai", "nam_truoc", "nam_vua_roi"):
+        return date(ref_date.year - 1, 1, 1).isoformat(), date(ref_date.year - 1, 12, 31).isoformat()
+
+    pair = resolve_vietnamese_relative_date(period_key, as_of=ref_date)
+    if pair:
+        return pair[0].isoformat(), pair[1].isoformat()
+
+    return ref_date.isoformat(), ref_date.isoformat()
 
 
 def resolve_time_context(

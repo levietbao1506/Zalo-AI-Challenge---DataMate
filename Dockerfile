@@ -25,7 +25,18 @@ ENV HF_HUB_OFFLINE=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TOKENIZERS_PARALLELISM=false \
     VLLM_WORKER_MULTIPROC_METHOD=spawn \
-    OMP_NUM_THREADS=4
+    OMP_NUM_THREADS=4 \
+    TMPDIR=/tmp \
+    TEMP=/tmp \
+    TMP=/tmp \
+    XDG_CACHE_HOME=/tmp/.cache \
+    VLLM_CACHE_ROOT=/tmp/vllm_cache \
+    TRITON_CACHE_DIR=/tmp/triton_cache \
+    TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_cache \
+    HF_HOME=/tmp/hf_cache
+
+RUN mkdir -p /tmp/vllm_cache /tmp/triton_cache /tmp/torchinductor_cache /tmp/.cache /tmp/datamate_duckdb /tmp/hf_cache && \
+    chmod -R 777 /tmp
 
 WORKDIR /code
 

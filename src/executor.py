@@ -405,6 +405,11 @@ def _build_local_namespace(
         "dt": dt,
         "timedelta": timedelta,
         "calendar_utils": calendar_utils,
+        "CALENDAR_DF": calendar_utils.load_normalized_calendar_df(calendar_path) if calendar_path else None,
+        "load_normalized_calendar_df": calendar_utils.load_normalized_calendar_df,
+        "resolve_relative_period": calendar_utils.resolve_relative_period,
+        "parse_time_rules_from_rulebook": calendar_utils.parse_time_rules_from_rulebook,
+        "TIME_RULES": calendar_utils.parse_time_rules_from_rulebook(calendar_utils.load_rulebook(data_dir)),
         "read_csv_safe": read_csv_safe,
         "read_excel_safe": read_excel_safe,
         "read_sqlite_safe": read_sqlite_safe,
@@ -611,6 +616,7 @@ sys.stdout = captured_output
 data_root = Path(data_dir).resolve()
 scratch_root = Path(result_pkl_path).resolve().parent
 python_path = Path(sys.prefix).resolve()
+python_base_path = Path(sys.base_prefix).resolve()
 calendar_root = Path(file_map["calendar.csv"]).resolve().parent if "calendar.csv" in file_map else data_root
 def within(path, root):
     return path == root or root in path.parents
@@ -622,7 +628,7 @@ def audit_generated_code(event, args):
         writing = any(ch in mode for ch in "wax+") or bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
         if writing and not within(path, scratch_root):
             raise PermissionError("Sandbox permits writes only in /tmp scratch")
-        if not writing and not any(within(path, root) for root in (data_root, calendar_root, scratch_root, python_path)):
+        if not writing and not any(within(path, root) for root in (data_root, calendar_root, scratch_root, python_path, python_base_path)):
             raise PermissionError("Sandbox permits data reads only from the active split")
     if event == "sqlite3.connect" and args:
         target = str(args[0])
@@ -675,6 +681,11 @@ exec_globals = {{
     "dt": dt,
     "timedelta": timedelta,
     "calendar_utils": calendar_utils,
+    "CALENDAR_DF": calendar_utils.load_normalized_calendar_df(calendar_path) if calendar_path else None,
+    "load_normalized_calendar_df": calendar_utils.load_normalized_calendar_df,
+    "resolve_relative_period": calendar_utils.resolve_relative_period,
+    "parse_time_rules_from_rulebook": calendar_utils.parse_time_rules_from_rulebook,
+    "TIME_RULES": calendar_utils.parse_time_rules_from_rulebook(calendar_utils.load_rulebook(data_dir)),
     "read_csv_safe": packaged_helpers.read_csv_safe,
     "read_excel_safe": packaged_helpers.read_excel_safe,
     "read_sqlite_safe": packaged_helpers.read_sqlite_safe,
@@ -1212,6 +1223,11 @@ class SandboxedExecutor:
             "get_holiday_range": calendar_utils.get_holiday_range,
             "solar_to_lunar": calendar_utils.solar_to_lunar,
             "lunar_to_solar": calendar_utils.lunar_to_solar,
+            "CALENDAR_DF": calendar_utils.load_normalized_calendar_df(calendar_path) if calendar_path else None,
+            "load_normalized_calendar_df": calendar_utils.load_normalized_calendar_df,
+            "resolve_relative_period": calendar_utils.resolve_relative_period,
+            "parse_time_rules_from_rulebook": calendar_utils.parse_time_rules_from_rulebook,
+            "TIME_RULES": calendar_utils.parse_time_rules_from_rulebook(calendar_utils.load_rulebook(data_dir)),
             # Data context
             "DATA_DIR": data_dir,
             "data_dir": data_dir,

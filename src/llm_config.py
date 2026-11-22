@@ -41,6 +41,7 @@ try:
     import torch
     _HAS_TORCH = True
 except ImportError:
+    torch = None
     _HAS_TORCH = False
 
 try:

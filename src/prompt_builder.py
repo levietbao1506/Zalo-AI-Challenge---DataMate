@@ -34,8 +34,18 @@ OUTPUT CONTRACT: type chỉ thuộc number, percent, string, date, boolean, list
 - boolean: true hoặc false.
 - list: mảng JSON có thứ tự.
 - table: {"columns":["Tên"],"rows":[["Hà Nội"]]} với columns thẳng hàng rows.
-- unanswerable: chỉ khi đã chứng minh thiếu dữ liệu/cột/khoảng thời gian bắt buộc; phải có reason ngắn.
+- unanswerable: chỉ khi thuộc 1 trong 4 nhóm trường hợp dưới đây; bắt buộc có reason tiếng Việt ngắn gọn nêu rõ thiếu gì.
 - abstain: {"type":"abstain"} khi còn mơ hồ nghiêm trọng, xung đột hoặc không đủ độ tin cậy.
+
+DANH MỤC 4 TRƯỜNG HỢP ĐƯỢC PHÉP KẾT LUẬN UNANSWERABLE:
+1) Thiếu cột/chỉ tiêu cốt lõi: hỏi lợi nhuận, lãi gộp, biên lợi nhuận nhưng toàn bộ bảng và README không có giá vốn/giá nhập; hoặc hỏi theo nhân viên/chi nhánh nhưng không có cột tương ứng.
+2) Khoảng thời gian hỏi nằm hoàn toàn ngoài phạm vi dữ liệu: hỏi doanh thu năm trước hoặc tháng không tồn tại bất kỳ bản ghi nào do vượt ngoài dải min_date..max_date của doanh nghiệp.
+3) Thiếu độ chi tiết (granularity) hoặc không có khóa nối bảng: cần ghép 2 bảng để trả lời nhưng hai bảng không có cột khóa chung, hoặc dữ liệu chỉ tổng hợp theo tháng trong khi câu hỏi hỏi chính xác một ngày cụ thể.
+4) Không đủ căn cứ lọc bắt buộc theo rulebook.md: rulebook hoặc câu hỏi yêu cầu lọc theo một điều kiện nghiệp vụ cụ thể nhưng dữ liệu không lưu thuộc tính phân biệt tương ứng.
+
+NGUYÊN TẮC PHÂN BIỆT RẠCH RÒI:
+- KHÔNG trả unanswerable nếu câu hỏi đơn giản chỉ trả về kết quả 0 hoặc danh sách rỗng trong khoảng thời gian HỢP LỆ (nằm trong dải dữ liệu min..max của doanh nghiệp) — khi đó câu trả lời là 0 hoặc cần kiểm chứng lại bằng Python.
+- KHÔNG cố chế công thức giả định khi thiếu dữ liệu; nếu thiếu bằng chứng chắc chắn (do mơ hồ ngữ nghĩa hoặc lỗi thực thi), trả abstain (0 điểm) thay vì đoán bừa (-1 điểm).
 
 RANKING CONTRACT: top-k xếp metric DESC; đồng hạng xếp code ASC; nếu ít hơn k ứng viên hợp lệ thì lấy tất cả. Kiểm tra tie ở biên trước khi chốt.
 
@@ -78,8 +88,28 @@ def build_business_prefix(rulebook_text: str, readme_text: str, sql_schema_card:
     )
 
 
-def build_sql_prompt(question: str, as_of_date: str, execution_mode: str = "SQL_FAST") -> str:
+def format_entity_hints(entity_hints: Optional[List[Dict[str, Any]]]) -> str:
+    if not entity_hints:
+        return ""
+    lines = ["Matched Entity Hints (exact values found in tables):"]
+    for hint in entity_hints:
+        tbl = hint.get("table", "")
+        col = hint.get("column", "")
+        val = hint.get("value", "")
+        code = hint.get("code")
+        code_part = f" [code={code}]" if code else ""
+        lines.append(f"- {tbl}.{col}: {json.dumps(val, ensure_ascii=False)}{code_part}")
+    return "\n\n" + "\n".join(lines)
+
+
+def build_sql_prompt(
+    question: str,
+    as_of_date: str,
+    execution_mode: str = "SQL_FAST",
+    entity_hints: Optional[List[Dict[str, Any]]] = None,
+) -> str:
     """Build the dynamic Mode A suffix for one DuckDB SQL generation request."""
+    hints_text = format_entity_hints(entity_hints)
     return (
         f"MODE: {execution_mode}\n"
         "Viết đúng một truy vấn DuckDB SQL chỉ đọc trong một block ```sql```, sau đó đúng một block ```json``` metadata. "
@@ -90,11 +120,13 @@ def build_sql_prompt(question: str, as_of_date: str, execution_mode: str = "SQL_
         "Percent phải nhân 100 và làm tròn 2 chữ số. Chỉ đặt is_unanswerable=true khi chắc chắn thiếu cột hoặc dữ liệu bắt buộc.\n"
         "Metadata bắt buộc đúng dạng:\n"
         "```json\n"
-        '{"expected_type":"number","post_process":"none","is_unanswerable":false,"reason":null}\n'
+        '{"expected_type":"number","post_process":"none","answer_source":"sql","direct_answer":null,"is_unanswerable":false,"reason":null}\n'
         "```\n"
-        "expected_type phải là một type trong OUTPUT CONTRACT.\n\n"
+        "expected_type phải là một type trong OUTPUT CONTRACT. "
+        "CHỈ chọn answer_source=\"readme\" và điền direct_answer khi câu hỏi hỏi thuần thông tin mô tả doanh nghiệp nằm tường minh trong README.md (ví dụ: giờ mở cửa, địa chỉ, tên cửa hàng, chính sách mô tả bằng chữ) và KHÔNG đòi hỏi đếm/tổng hợp/lọc/xếp hạng trên các file dữ liệu bảng. Mọi câu hỏi liên quan đến con số, bảng, ngày tháng giao dịch, tồn kho, công nợ đều BẮT BUỘC phải viết SQL.\n\n"
         f"QUESTION: {question.strip()}\n"
         f"as_of_date: {as_of_date or '[unknown]'}"
+        f"{hints_text}"
     )
 
 
@@ -116,6 +148,7 @@ def build_python_prompt(
     business_id: str,
     dual_path: bool = False,
     execution_mode: str = "PYTHON_FIRST",
+    entity_hints: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Build the dynamic Mode B suffix for sandboxed Python computation."""
     independence = (
@@ -123,12 +156,14 @@ def build_python_prompt(
         if dual_path
         else "Tự tính từ dữ liệu thật và kiểm chứng kết quả trước khi trả lời."
     )
+    hints_text = format_entity_hints(entity_hints)
     return (
         f"MODE: {execution_mode}\n"
         f"{independence}\n"
         "Chỉ trả đúng một block ```python``` chạy trong sandbox. Các biến đã có sẵn: DUCKDB_CONN là kết nối chỉ đọc, "
         f'DUCKDB_PATH="/tmp/datamate_duckdb/{business_id}.duckdb", RAW_DATA_DIR là thư mục dữ liệu gốc read-only, cùng pd, np và sqlite3. '
-        "Ưu tiên DUCKDB_CONN; chỉ đọc lại CSV/XLSX/SQLite trong RAW_DATA_DIR khi cần kiểm tra ETL hoặc cấu trúc gốc.\n"
+        "Ưu tiên DUCKDB_CONN; chỉ đọc lại CSV/XLSX/SQLite trong RAW_DATA_DIR khi cần kiểm tra ETL hoặc cấu trúc gốc. "
+        "Dùng bảng _calendar trong DuckDB hoặc hàm resolve_relative_period(period_key, as_of_date, CALENDAR_DF, TIME_RULES) để xác định mốc thời gian đồng nhất với SQL.\n"
         "Code phải kiểm tra assert cơ bản cho cột bắt buộc, số dòng sau lọc, NaN, khoảng ngày và điều kiện rulebook. "
         "Không dùng mạng, không ghi file và không thay đổi dữ liệu.\n"
         "Gán kết quả cuối cùng đúng một lần vào FINAL_ANSWER={\"type\":...,\"answer\":...}. "
@@ -137,6 +172,7 @@ def build_python_prompt(
         f"QUESTION: {question.strip()}\n"
         f"as_of_date: {as_of_date or '[unknown]'}\n"
         f"business_id: {business_id}"
+        f"{hints_text}"
     )
 
 
@@ -171,15 +207,6 @@ def build_adjudicator_prompt(
 
 def parse_sql_response(response: str) -> Tuple[str, Dict[str, Any]]:
     cleaned = _remove_think_blocks(response)
-    sql_blocks = re.findall(r"```sql\s*\n?(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
-    if not sql_blocks:
-        sql_blocks = re.findall(r"```(?:duckdb)?\s*\n?(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
-    if len(sql_blocks) != 1:
-        raise ValueError(f"Expected exactly one sql block, found {len(sql_blocks)}")
-    sql = sql_blocks[0].strip()
-    if not sql:
-        raise ValueError("The sql block is empty")
-
     json_blocks = re.findall(r"```json\s*\n?(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
     if len(json_blocks) > 1:
         raise ValueError(f"Expected exactly one json metadata block, found {len(json_blocks)}")
@@ -187,6 +214,8 @@ def parse_sql_response(response: str) -> Tuple[str, Dict[str, Any]]:
         metadata = {
             "expected_type": "number",
             "post_process": "scalar",
+            "answer_source": "sql",
+            "direct_answer": None,
             "is_unanswerable": False,
             "reason": None,
         }
@@ -199,12 +228,34 @@ def parse_sql_response(response: str) -> Tuple[str, Dict[str, Any]]:
         raise ValueError("SQL metadata must be an object")
     metadata.setdefault("expected_type", "number")
     metadata.setdefault("post_process", "scalar")
+    metadata.setdefault("answer_source", "sql")
+    metadata.setdefault("direct_answer", None)
     metadata.setdefault("is_unanswerable", False)
     metadata.setdefault("reason", None)
     if metadata["expected_type"] not in ANSWER_TYPES:
         raise ValueError("SQL metadata expected_type is invalid")
     if metadata["is_unanswerable"] and not str(metadata.get("reason") or "").strip():
         raise ValueError("Unanswerable SQL metadata requires reason")
+
+    sql_blocks = re.findall(r"```sql\s*\n?(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if not sql_blocks:
+        sql_blocks = re.findall(r"```duckdb\s*\n?(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+
+    if metadata.get("answer_source") == "readme" and not sql_blocks:
+        return "", metadata
+
+    if not sql_blocks and json_blocks:
+        candidate_blocks = re.findall(r"```(?:[a-zA-Z0-9_-]+)?\s*\n?(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+        sql_blocks = [b for b in candidate_blocks if b.strip() != json_blocks[0].strip()]
+
+    if metadata.get("answer_source") == "readme" and not sql_blocks:
+        return "", metadata
+
+    if len(sql_blocks) != 1:
+        raise ValueError(f"Expected exactly one sql block, found {len(sql_blocks)}")
+    sql = sql_blocks[0].strip()
+    if not sql and metadata.get("answer_source") != "readme":
+        raise ValueError("The sql block is empty")
     return sql, metadata
 
 
@@ -318,8 +369,14 @@ class PromptBuilder:
             "Kiểm tra dữ liệu thật rồi viết code gán final_result."
         )
 
-    def build_sql_prompt(self, question: str, as_of_date: str, execution_mode: str = "SQL_FAST") -> str:
-        return build_sql_prompt(question, as_of_date, execution_mode)
+    def build_sql_prompt(
+        self,
+        question: str,
+        as_of_date: str,
+        execution_mode: str = "SQL_FAST",
+        entity_hints: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        return build_sql_prompt(question, as_of_date, execution_mode, entity_hints=entity_hints)
 
     def build_sql_repair_prompt(self, prev_sql: str, error_msg: str) -> str:
         return build_sql_repair_prompt(prev_sql, error_msg)
@@ -331,8 +388,11 @@ class PromptBuilder:
         business_id: str,
         dual_path: bool = False,
         execution_mode: str = "PYTHON_FIRST",
+        entity_hints: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
-        return build_python_prompt(question, as_of_date, business_id, dual_path, execution_mode)
+        return build_python_prompt(
+            question, as_of_date, business_id, dual_path, execution_mode, entity_hints=entity_hints
+        )
 
     def build_adjudicator_prompt(
         self,

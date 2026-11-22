@@ -1114,6 +1114,53 @@ def build_sql_schema_card(store: "BusinessDuckDBStore", readme_text: str) -> str
                 lines.append(f"ROW {json_value(row)}")
         if metadata.etl_warnings:
             lines.append(f"WARNINGS {json_value(sorted(metadata.etl_warnings))}")
+    lines.append("## Key & Join Hints")
+    join_hints = getattr(store, "join_hints", None)
+    if join_hints is None and hasattr(store, "profile_keys_and_joins"):
+        join_hints = store.profile_keys_and_joins()
+
+    candidate_keys = getattr(store, "candidate_unique_keys", {})
+    if not candidate_keys and isinstance(join_hints, dict):
+        candidate_keys = join_hints.get("candidate_unique_keys", {})
+    elif not candidate_keys and hasattr(join_hints, "candidate_unique_keys"):
+        candidate_keys = join_hints.candidate_unique_keys
+
+    unique_lines = []
+    for tbl in sorted(candidate_keys):
+        cols = candidate_keys[tbl]
+        if cols:
+            unique_lines.append(f"- {tbl}: {', '.join(sorted(cols))}")
+
+    if unique_lines:
+        lines.append("Unique Keys:")
+        lines.extend(unique_lines)
+    else:
+        lines.append("Unique Keys: None")
+
+    joins_list = (
+        join_hints
+        if isinstance(join_hints, list)
+        else (join_hints.get("joins", []) if isinstance(join_hints, dict) else [])
+    )
+    if joins_list:
+        lines.append("Joins:")
+        for hint in sorted(
+            joins_list,
+            key=lambda item: (
+                item["left_table"],
+                item["left_col"],
+                item["right_table"],
+                item["right_col"],
+            ),
+        ):
+            left = f"{hint['left_table']}.{hint['left_col']}"
+            right = f"{hint['right_table']}.{hint['right_col']}"
+            rel = hint["relationship_type"]
+            overlap = hint["overlap_ratio"]
+            warn = " [WARN: many-to-many, aggregate before join]" if rel == "many_to_many" else ""
+            lines.append(f"- {left} -> {right} (overlap: {overlap}, {rel}){warn}")
+    else:
+        lines.append("Joins: None")
     return "\n".join(lines)
 
 

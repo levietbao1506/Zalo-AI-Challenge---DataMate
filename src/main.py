@@ -383,10 +383,14 @@ def build_store_schema_meta(store: BusinessDuckDBStore) -> Dict[str, Any]:
             "source_table": metadata.source_table,
             "etl_warnings": list(metadata.etl_warnings),
         }
-    return {
+    meta = {
         "tables": tables,
         "etl_warnings": sorted({warning for table in store.tables.values() for warning in table.etl_warnings}),
     }
+    if hasattr(store, "join_hints"):
+        meta["join_hints"] = store.join_hints
+    store.schema_meta.update(meta)
+    return meta
 
 
 def make_json_serializable(val: Any) -> Any:
@@ -440,7 +444,10 @@ def process_business_questions(
     timeout: float = 12.0,
     soft_timeout: float = 100.0,
     pipeline_start_perf: Optional[float] = None,
+    entity_index: Optional[Any] = None,
+    batch_entered_at: Optional[float] = None,
 ) -> Tuple[int, int, int]:
+    biz_entered_at = batch_entered_at if batch_entered_at is not None else time.perf_counter()
     biz_dir = data_dir / business_id if (data_dir / business_id).is_dir() else data_dir
     duckdb_cache_root = get_scratch_dir() / "datamate_duckdb"
     duckdb_cache_root.mkdir(parents=True, exist_ok=True)
@@ -456,6 +463,13 @@ def process_business_questions(
     schema_card = build_sql_schema_card(store, readme_text)
     business_prefix = build_business_prefix(rulebook_text, readme_text, schema_card)
     schema_meta = build_store_schema_meta(store)
+
+    if entity_index is None:
+        try:
+            from src.entity_probe import BusinessEntityIndex
+            entity_index = BusinessEntityIndex(store)
+        except Exception:
+            entity_index = None
 
     answered_count = 0
     abstained_count = 0
@@ -476,11 +490,12 @@ def process_business_questions(
             time_pressure = time_guard["time_pressure"]
 
             if rem_budget <= 0.0:
+                q_elapsed = max(0, int(round((time.perf_counter() - biz_entered_at) * 1000)))
                 sub_rec = format_submission_record(q_id, None, q_type="abstain")
                 log_rec = {
                     "id": q_id,
                     "answer": {"type": "abstain", "answer": None},
-                    "elapsed_ms": 0,
+                    "elapsed_ms": q_elapsed,
                     "thinking": None,
                     "code": None,
                     "output": None,
@@ -506,6 +521,9 @@ def process_business_questions(
                 prompt_builder=prompt_builder,
                 business_prefix=business_prefix,
                 timeout=min(timeout, max(2.0, budget_per_q)),
+                entity_index=entity_index,
+                readme_text=readme_text,
+                batch_entered_at=biz_entered_at,
             )
 
             sub_record = hybrid_result["submission_record"]
@@ -561,6 +579,7 @@ def run_worker_partition(
 
     remaining_holder = [total_q_count]
     for b_id, b_questions in business_partition:
+        b_entered_at = time.perf_counter()
         process_business_questions(
             business_id=b_id,
             business_questions=b_questions,
@@ -576,6 +595,7 @@ def run_worker_partition(
             timeout=timeout,
             soft_timeout=soft_timeout,
             pipeline_start_perf=load_started,
+            batch_entered_at=b_entered_at,
         )
 
 
@@ -709,6 +729,7 @@ def main() -> None:
         prompt_builder = PromptBuilder(rulebook_content=rulebook_content)
         rem_counter = [total_q]
         for b_id, b_questions in biz_groups.items():
+            b_entered_at = time.perf_counter()
             process_business_questions(
                 business_id=b_id,
                 business_questions=b_questions,
@@ -724,6 +745,7 @@ def main() -> None:
                 timeout=args.timeout,
                 soft_timeout=args.soft_timeout,
                 pipeline_start_perf=perf_start,
+                batch_entered_at=b_entered_at,
             )
 
     elapsed = time.time() - start_time
@@ -758,6 +780,7 @@ def process_single_question(
     parser: Optional[SchemaParser] = None,
     scratch_dir: Optional[Path] = None,
     calendar_csv_path: Optional[str] = None,
+    batch_entered_at: Optional[float] = None,
 ) -> Any:
     q_text = q_data.get("question") or q_data.get("text") or ""
     q_as_of = q_data.get("as_of_date") or dataset_context.as_of_date
@@ -804,7 +827,9 @@ def process_batch_chunk(
     calendar_csv_path: Optional[str] = None,
     on_log: Optional[Callable[[Dict[str, Any]], None]] = None,
     soft_timeout: float = 100.0,
+    batch_entered_at: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
+    chunk_entered_at = batch_entered_at if batch_entered_at is not None else time.perf_counter()
     batch_prompts = []
     meta_list = []
     for q in chunk:
@@ -850,11 +875,12 @@ def process_batch_chunk(
             q_type=m["type"] if formatted != "abstain" else "abstain",
         )
         records.append(sub_rec)
+        elapsed_q = max(0, int(round((time.perf_counter() - chunk_entered_at) * 1000)))
         if on_log:
             on_log({
                 "id": m["id"],
                 "answer": sub_rec,
-                "elapsed_ms": 0,
+                "elapsed_ms": elapsed_q,
                 "thinking": None,
                 "code": exec_res.executed_code,
                 "output": make_json_serializable(raw_val),

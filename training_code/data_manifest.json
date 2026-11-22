@@ -12,7 +12,32 @@
   "context_length_max": 131072,
   "fine_tuning": false,
   "external_api_calls": false,
+  "training_performed": false,
+  "data_generation_performed": true,
+  "statement": "State explicitly if no training or data generation was performed: No model weight fine-tuning was performed. Inference is conducted zero-shot using the official open-weight Qwen/Qwen3-14B foundation model. Synthetic validation QA pairs were generated for offline schema verification and unit testing only, without using any test data.",
   "inference_mode": "Offline inference runs on the official open-weight checkpoint Qwen/Qwen3-14B without extra fine-tuning or external API calls",
+  "models": [
+    {
+      "name": "Qwen/Qwen3-14B",
+      "role": "inference",
+      "public_url": "https://huggingface.co/Qwen/Qwen3-14B",
+      "fixed_revision": "40c069824f4251a91eefaf281ebe4c544efd3e18",
+      "original_release_date": "2025-05-15",
+      "license": "Apache-2.0",
+      "parameter_count": 14770000000,
+      "local_path": "/code/models/Qwen3-14B",
+      "files_sha256": {
+        "model-00001-of-00008.safetensors": "e942bdbdf08857d16a8fef7d1dae9fceabeb4e84def6043485fe2f6f085dab0e",
+        "model-00002-of-00008.safetensors": "f7c9c6eee628f5ad831d2d1d292e120505e5fcadeb38f88b4d3c4cb86306ccf9",
+        "model-00003-of-00008.safetensors": "dfb8c5df9404b41ad6ae74e8b6b367135f017b4467b884cf71b17c71954f18a9",
+        "model-00004-of-00008.safetensors": "eab286fec759e3e59ab228621aefa0fef14ed56039e06f959e67257d5af7604d",
+        "model-00005-of-00008.safetensors": "97f0dc2992e59da95c466eff6f4fd0c8335843bbc36ed5c913a6f5150748c0e6",
+        "model-00006-of-00008.safetensors": "9e8e76a013cd5e253865b792991e0b410f869b136b3c500079b531b09198e99e",
+        "model-00007-of-00008.safetensors": "0aee70ee6e91dc00d818804fb47f124d13ee4ad5b4a64553e09dbf9391cd5750",
+        "model-00008-of-00008.safetensors": "0d6b92296e326d39bbbaeb32c3ec454ac606da843d4c8ffa8edf010b62b8c9e0"
+      }
+    }
+  ],
   "safetensors_files": {
     "model-00001-of-00008.safetensors": {
       "size_bytes": 3841788544,
@@ -47,5 +72,87 @@
       "sha256": "0d6b92296e326d39bbbaeb32c3ec454ac606da843d4c8ffa8edf010b62b8c9e0"
     }
   },
-  "total_weights_size_bytes": 29536614400
+  "total_weights_size_bytes": 29536665640,
+  "local_files": [
+    {
+      "local_path": "training_code/checkpoints/README.md",
+      "category": "checkpoint",
+      "size_bytes": 549,
+      "sha256": "ad8a9e3aa90530a8a47620b3db1c565672b7206730100558fee2e6afbd295230"
+    },
+    {
+      "local_path": "training_code/configs/model_config.json",
+      "category": "config",
+      "size_bytes": 739,
+      "sha256": "cef97ca6453022ffe744c5d06c8d509dd69a1ea73d611b823e1202d3aa7887cd"
+    },
+    {
+      "local_path": "training_code/configs/training_config.yaml",
+      "category": "config",
+      "size_bytes": 692,
+      "sha256": "59aa364dc8fedfbf5dfa8db726cc2e8c55cf595ed66f6ca3464f0ec0e1e08e35"
+    },
+    {
+      "local_path": "training_code/data/synthetic_qa.jsonl",
+      "category": "data",
+      "size_bytes": 772,
+      "sha256": "217fde20833c539c16eaf7f6505ba004851e05fe797b4c5973f31e881f472c8c",
+      "record_count": 4,
+      "split": "synthetic"
+    },
+    {
+      "local_path": "training_code/data_generation/__init__.py",
+      "category": "script",
+      "size_bytes": 95,
+      "sha256": "9683f0376a266fcb8d47a6cbb9ad4f4028dc1d13bc6d5294596c6d88126328a5"
+    },
+    {
+      "local_path": "training_code/data_generation/generate_qa_pairs.py",
+      "category": "script",
+      "size_bytes": 2402,
+      "sha256": "599c23202e2914f5232b88314ed8b6d4f2259fff95bc2cb0fdbc1f54cacb7895"
+    },
+    {
+      "local_path": "training_code/README.md",
+      "category": "config",
+      "size_bytes": 4237,
+      "sha256": "c4890b3ad00d68e6088bf03bdc0f52d442416ac83e3b74de7e4c01157a96d863"
+    },
+    {
+      "local_path": "training_code/requirements.txt",
+      "category": "config",
+      "size_bytes": 306,
+      "sha256": "4865d1b0628df56b8cccb6421e97e43b96a5d883f7e152f3f65e0dea6f41acd8"
+    },
+    {
+      "local_path": "training_code/src/__init__.py",
+      "category": "script",
+      "size_bytes": 91,
+      "sha256": "34166e259cae70bdb2c46771090ae7a86ecec4ea68a4eec31a2cf2863e3930e2"
+    },
+    {
+      "local_path": "training_code/src/generate_manifest.py",
+      "category": "script",
+      "size_bytes": 9891,
+      "sha256": "8556f06ee029d51f173a3e78c0f20ee0d170328f4f35fc014508c7bab895370e"
+    },
+    {
+      "local_path": "training_code/src/inspect_dataset.py",
+      "category": "script",
+      "size_bytes": 2459,
+      "sha256": "e102f3091b8e493471b3195d6c69bedc831af7526365c78a66bc204b4926cbd0"
+    },
+    {
+      "local_path": "training_code/src/validate_data.py",
+      "category": "script",
+      "size_bytes": 4122,
+      "sha256": "f860f1e66a46fa05300f1298717f8ca62a66a5c79e94a6b1ce4c66943d5bb133"
+    },
+    {
+      "local_path": "training_code/train.sh",
+      "category": "script",
+      "size_bytes": 1683,
+      "sha256": "350092474bbd4b0bb0b88b9890c403bd4452d4d18d62dc56a328cfd9ea6c59c8"
+    }
+  ]
 }
