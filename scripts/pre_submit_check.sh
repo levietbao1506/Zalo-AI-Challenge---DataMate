@@ -3,6 +3,7 @@ set -euo pipefail
 
 IMAGE="${IMAGE:-datamate:latest}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python3 "${SCRIPT_DIR}/audit_submission_compliance.py"
 DATA_DIR="${DATA_DIR:-${1:-$(pwd)/data/sample_dataset}}"
 WORK_ROOT="${WORK_ROOT:-$(mktemp -d)}"
 RUN1="${WORK_ROOT}/run1"

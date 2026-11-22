@@ -203,11 +203,106 @@ def format_date(val: Any, as_month: bool = False) -> str:
         if re.fullmatch(r"\d{4}-\d{2}", raw):
             date.fromisoformat(raw + "-01")
             return raw
+        if as_month:
+            m_my = re.fullmatch(r"(\d{1,2})[/-](\d{4})", raw)
+            if m_my:
+                m_val, y_val = int(m_my.group(1)), int(m_my.group(2))
+                if 1 <= m_val <= 12:
+                    return f"{y_val:04d}-{m_val:02d}"
+            m_ym = re.fullmatch(r"(\d{4})[/-](\d{1,2})", raw)
+            if m_ym:
+                y_val, m_val = int(m_ym.group(1)), int(m_ym.group(2))
+                if 1 <= m_val <= 12:
+                    return f"{y_val:04d}-{m_val:02d}"
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}(?: 00:00:00)?", raw):
             parsed = date.fromisoformat(raw[:10])
         else:
             raise ValueError(f"Invalid ISO date: {val!r}")
     return parsed.strftime("%Y-%m") if as_month else parsed.isoformat()
+
+
+def normalize_weekday_answer(value: Any, rulebook_text: str = "") -> str:
+    if value is None:
+        raise ValueError("Weekday value cannot be None")
+
+    rulebook_lower = (rulebook_text or "").lower()
+    use_word_format = "thứ hai" in rulebook_lower or "thứ ba" in rulebook_lower
+    capital_cn = "chủ nhật" in (rulebook_text or "") or "Chủ Nhật" in (rulebook_text or "")
+
+    sunday_name = "Chủ Nhật" if capital_cn else "Chủ nhật"
+
+    if use_word_format:
+        day_map = {
+            0: sunday_name,
+            1: "Thứ Hai",
+            2: "Thứ Ba",
+            3: "Thứ Tư",
+            4: "Thứ Năm",
+            5: "Thứ Sáu",
+            6: "Thứ Bảy",
+            7: sunday_name,
+        }
+    else:
+        day_map = {
+            0: sunday_name,
+            1: "Thứ 2",
+            2: "Thứ 3",
+            3: "Thứ 4",
+            4: "Thứ 5",
+            5: "Thứ 6",
+            6: "Thứ 7",
+            7: sunday_name,
+        }
+
+    if isinstance(value, (datetime, date)):
+        dow = (value.weekday() + 1)
+        return day_map[dow if dow <= 6 else 0]
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        int_val = int(value)
+        if int_val in day_map:
+            return day_map[int_val]
+        raise ValueError(f"Invalid weekday integer: {value}")
+
+    text = str(value).strip()
+    if not text:
+        raise ValueError("Empty weekday value")
+
+    if text.isdigit():
+        int_val = int(text)
+        if int_val in day_map:
+            return day_map[int_val]
+
+    lower = text.lower()
+    from src.sql_executor import vn_unaccent
+    unaccent = (vn_unaccent(lower) or "").strip()
+
+    en_map = {
+        "monday": 1, "mon": 1,
+        "tuesday": 2, "tue": 2,
+        "wednesday": 3, "wed": 3,
+        "thursday": 4, "thu": 4,
+        "friday": 5, "fri": 5,
+        "saturday": 6, "sat": 6,
+        "sunday": 0, "sun": 0,
+    }
+    if unaccent in en_map:
+        return day_map[en_map[unaccent]]
+
+    vn_map = {
+        "thu 2": 1, "thu hai": 1, "t2": 1,
+        "thu 3": 2, "thu ba": 2, "t3": 2,
+        "thu 4": 3, "thu tu": 3, "thu bon": 3, "t4": 3,
+        "thu 5": 4, "thu nam": 4, "t5": 4,
+        "thu 6": 5, "thu sau": 5, "t6": 5,
+        "thu 7": 6, "thu bay": 6, "t7": 6,
+        "chu nhat": 0, "cn": 0,
+    }
+    for k, idx in vn_map.items():
+        if unaccent == k or unaccent.startswith(k):
+            return day_map[idx]
+
+    return text
 
 
 def format_boolean(val: Any) -> bool:
@@ -615,10 +710,33 @@ def format_submission_record(
     abstain_token: str = DEFAULT_ABSTAIN_TOKEN,
     reason: Optional[str] = None,
     as_month: bool = False,
+    rulebook_text: str = "",
+    question: str = "",
 ) -> Dict[str, Any]:
     """Return a valid typed record, or ``{id, type: abstain}`` on invalid input."""
     record_id = str(q_id)
     abstain = {"id": record_id, "type": "abstain"}
+
+    if question:
+        q_lower = question.lower()
+        if "tháng nào" in q_lower or "tháng mấy" in q_lower:
+            as_month = True
+        if re.search(r"thứ\s*(mấy|nào)|ngày\s*thứ\s*mấy", q_lower) and answer is not None:
+            try:
+                norm_wd = normalize_weekday_answer(answer, rulebook_text)
+                if norm_wd:
+                    answer = norm_wd
+                    q_type = "string"
+            except Exception:
+                pass
+
+    if as_month and answer is not None and q_type in (None, "string", "date"):
+        try:
+            answer = format_date(answer, as_month=True)
+            q_type = "date"
+        except Exception:
+            pass
+
     if isinstance(answer, dict) and answer.get("type") == "unanswerable":
         reason = answer.get("reason", reason)
         answer = None
@@ -682,6 +800,9 @@ def format_submission_json(
     q_type: Optional[str] = None,
     abstain_token: str = DEFAULT_ABSTAIN_TOKEN,
     reason: Optional[str] = None,
+    as_month: bool = False,
+    rulebook_text: str = "",
+    question: str = "",
 ) -> str:
     """Format final dictionary into a single JSON line string."""
     record = format_submission_record(
@@ -690,6 +811,9 @@ def format_submission_json(
         q_type=q_type,
         abstain_token=abstain_token,
         reason=reason,
+        as_month=as_month,
+        rulebook_text=rulebook_text,
+        question=question,
     )
     return json.dumps(record, ensure_ascii=False, allow_nan=False)
 

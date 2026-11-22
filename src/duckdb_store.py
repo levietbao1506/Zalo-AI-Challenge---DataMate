@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 import csv
+import difflib
 import math
 from pathlib import Path
 import re
@@ -49,6 +50,9 @@ class BusinessDuckDBStore:
         self.table_name_map: Dict[str, str] = {}
         self.column_name_maps: Dict[str, Dict[str, str]] = {}
         self._used_table_names: set[str] = set()
+        self.candidate_unique_keys: Dict[str, List[str]] = {}
+        self.join_hints: Any = []
+        self.schema_meta: Dict[str, Any] = {}
         if not self.business_dir.is_dir():
             raise FileNotFoundError(f"Business directory does not exist: {self.business_dir}")
         if self.database_path.exists():
@@ -62,9 +66,168 @@ class BusinessDuckDBStore:
             self._load_calendar()
             self.connection.close()
             self.connection = duckdb.connect(str(self.database_path), read_only=True)
+            self.profile_keys_and_joins()
         except Exception:
             self.close_and_cleanup()
             raise
+
+    def profile_keys_and_joins(self) -> Any:
+        connection = getattr(self, "connection", None)
+        if connection is None:
+            return self.join_hints
+
+        table_names = sorted(tbl for tbl in self.table_metadata if tbl != "_calendar")
+        candidate_unique_keys: Dict[str, List[str]] = {}
+        candidate_cols_by_table: Dict[str, List[str]] = {}
+        col_types_by_table: Dict[str, Dict[str, str]] = {}
+        key_tokens = ("id", "ma", "code", "so_hd", "sku", "khach", "sp")
+
+        for tbl in table_names:
+            candidate_unique_keys[tbl] = []
+            candidate_cols_by_table[tbl] = []
+            col_types_by_table[tbl] = {}
+            try:
+                described = connection.execute(f"DESCRIBE SELECT * FROM {self._quote(tbl)}").fetchall()
+            except Exception:
+                continue
+            col_types = {str(row[0]): str(row[1]).upper() for row in described}
+            col_types_by_table[tbl] = col_types
+            try:
+                total_rows = connection.execute(f"SELECT COUNT(*) FROM {self._quote(tbl)}").fetchone()[0]
+            except Exception:
+                total_rows = 0
+            if total_rows == 0:
+                continue
+
+            unique_keys: List[str] = []
+            cand_cols: List[str] = []
+            for col, dtype in sorted(col_types.items()):
+                col_lower = col.lower()
+                matches_kw = any(token in col_lower for token in key_tokens)
+                try:
+                    non_null = connection.execute(
+                        f"SELECT COUNT({self._quote(col)}) FROM {self._quote(tbl)}"
+                    ).fetchone()[0]
+                except Exception:
+                    non_null = 0
+                non_null_ratio = non_null / total_rows if total_rows > 0 else 0.0
+                if matches_kw or non_null_ratio >= 0.95:
+                    cand_cols.append(col)
+                    try:
+                        distinct_count = connection.execute(
+                            f"SELECT COUNT(DISTINCT {self._quote(col)}) FROM {self._quote(tbl)}"
+                        ).fetchone()[0]
+                    except Exception:
+                        distinct_count = 0
+                    uniqueness_ratio = distinct_count / non_null if non_null > 0 else 0.0
+                    if uniqueness_ratio >= 0.995:
+                        unique_keys.append(col)
+
+            candidate_unique_keys[tbl] = sorted(unique_keys)
+            candidate_cols_by_table[tbl] = sorted(cand_cols)
+
+        def is_type_compatible(t1: str, t2: str) -> bool:
+            int_types = ("INT", "BIGINT", "SMALLINT", "TINYINT", "INTEGER", "HUGEINT", "UBIGINT", "UINTEGER")
+            str_types = ("VARCHAR", "CHAR", "TEXT", "STRING")
+            t1_is_int = any(k in t1 for k in int_types)
+            t2_is_int = any(k in t2 for k in int_types)
+            t1_is_str = any(k in t1 for k in str_types)
+            t2_is_str = any(k in t2 for k in str_types)
+            return (t1_is_int and t2_is_int) or (t1_is_str and t2_is_str)
+
+        def are_names_similar(c1: str, c2: str) -> bool:
+            n1 = re.sub(r"^(c_|col_|column_)", "", c1.lower()).replace("_", "")
+            n2 = re.sub(r"^(c_|col_|column_)", "", c2.lower()).replace("_", "")
+            if n1 == n2 or n1 in n2 or n2 in n1:
+                return True
+            return difflib.SequenceMatcher(None, n1, n2).ratio() >= 0.7
+
+        joins: List[Dict[str, Any]] = []
+
+        for left_table in table_names:
+            for right_table in table_names:
+                if left_table == right_table:
+                    continue
+                for left_col in candidate_cols_by_table[left_table]:
+                    for right_col in candidate_cols_by_table[right_table]:
+                        t1 = col_types_by_table[left_table].get(left_col, "")
+                        t2 = col_types_by_table[right_table].get(right_col, "")
+                        if not is_type_compatible(t1, t2):
+                            continue
+
+                        query = (
+                            f"WITH src_sample AS ("
+                            f"SELECT {self._quote(left_col)} AS val FROM {self._quote(left_table)} "
+                            f"WHERE {self._quote(left_col)} IS NOT NULL LIMIT 2000"
+                            f") "
+                            f"SELECT COUNT(DISTINCT val) AS sample_distinct, "
+                            f"COUNT(DISTINCT CASE WHEN tgt.{self._quote(right_col)} IS NOT NULL THEN val END) AS matched_distinct "
+                            f"FROM src_sample src "
+                            f"LEFT JOIN ("
+                            f"SELECT DISTINCT {self._quote(right_col)} FROM {self._quote(right_table)} "
+                            f"WHERE {self._quote(right_col)} IS NOT NULL"
+                            f") tgt ON src.val = tgt.{self._quote(right_col)}"
+                        )
+                        try:
+                            res = connection.execute(query).fetchone()
+                            sample_distinct = res[0] or 0
+                            matched_distinct = res[1] or 0
+                        except Exception:
+                            continue
+
+                        if sample_distinct == 0:
+                            continue
+
+                        overlap_ratio = matched_distinct / sample_distinct
+                        threshold = 0.3 if are_names_similar(left_col, right_col) else 0.5
+                        if overlap_ratio >= threshold:
+                            left_is_unique = left_col in candidate_unique_keys[left_table]
+                            right_is_unique = right_col in candidate_unique_keys[right_table]
+                            if right_is_unique:
+                                relationship_type = "one_to_one" if left_is_unique else "many_to_one"
+                            elif not left_is_unique:
+                                relationship_type = "many_to_many"
+                            else:
+                                continue
+
+                            joins.append({
+                                "left_table": left_table,
+                                "left_col": left_col,
+                                "right_table": right_table,
+                                "right_col": right_col,
+                                "overlap_ratio": round(float(overlap_ratio), 4),
+                                "relationship_type": relationship_type,
+                            })
+
+        joins.sort(key=lambda item: (item["left_table"], item["left_col"], item["right_table"], item["right_col"]))
+
+        class JoinHints(list):
+            def __init__(self, items: List[Dict[str, Any]], unique_keys: Dict[str, List[str]]):
+                super().__init__(items)
+                self.candidate_unique_keys = unique_keys
+                self.joins = items
+
+            def __getitem__(self, item: Any) -> Any:
+                if isinstance(item, str):
+                    if item == "joins":
+                        return self.joins
+                    if item in ("candidate_unique_keys", "unique_keys"):
+                        return self.candidate_unique_keys
+                    raise KeyError(item)
+                return super().__getitem__(item)
+
+            def get(self, key: str, default: Any = None) -> Any:
+                if key == "joins":
+                    return self.joins
+                if key in ("candidate_unique_keys", "unique_keys"):
+                    return self.candidate_unique_keys
+                return default
+
+        hints_obj = JoinHints(joins, candidate_unique_keys)
+        self.candidate_unique_keys = candidate_unique_keys
+        self.join_hints = hints_obj
+        self.schema_meta["join_hints"] = hints_obj
+        return self.join_hints
 
     @property
     def tables(self) -> Dict[str, TableMetadata]:
@@ -109,14 +272,17 @@ class BusinessDuckDBStore:
     def _load_calendar(self) -> None:
         if not self.calendar_csv_path or not self.calendar_csv_path.is_file():
             return
-        frame, warnings = self._read_csv_frame(self.calendar_csv_path)
-        if frame.empty and not len(frame.columns):
+        from src.calendar_utils import load_normalized_calendar_df
+        norm_frame = load_normalized_calendar_df(self.calendar_csv_path)
+        if norm_frame is None or (norm_frame.empty and not len(norm_frame.columns)):
             return
+        db_cols = [c for c in norm_frame.columns if not str(c).startswith("_")]
+        db_frame = norm_frame[db_cols].copy()
         self._store_frame(
-            frame,
+            db_frame,
             "_calendar",
             self.calendar_csv_path.name,
-            warnings=warnings,
+            warnings=[],
             fixed_name=True,
         )
 

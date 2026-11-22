@@ -85,8 +85,19 @@ done
 
 mkdir -p "${OUTPUT_DIR}" "${OUTPUT_DIR}/logs" 2>/dev/null || true
 
-export PYTHONUNBUFFERED=1
+mkdir -p /tmp/vllm_cache /tmp/triton_cache /tmp/torchinductor_cache /tmp/.cache /tmp/datamate_duckdb /tmp/hf_cache 2>/dev/null || true
+chmod 777 /tmp/vllm_cache /tmp/triton_cache /tmp/torchinductor_cache /tmp/.cache /tmp/datamate_duckdb /tmp/hf_cache 2>/dev/null || true
+
+export TMPDIR=/tmp
+export TEMP=/tmp
+export TMP=/tmp
+export XDG_CACHE_HOME=/tmp/.cache
+export VLLM_CACHE_ROOT=/tmp/vllm_cache
+export TRITON_CACHE_DIR=/tmp/triton_cache
+export TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_cache
+export HF_HOME=/tmp/hf_cache
 export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export OMP_NUM_THREADS=4
 export PYTHONDONTWRITEBYTECODE=1
@@ -97,10 +108,15 @@ export NCCL_P2P_DISABLE=1
 export PYTHONHASHSEED=42
 export VLLM_SEED=42
 export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-8}"
-export TMPDIR=/tmp
-export TEMP=/tmp
-export TMP=/tmp
-mkdir -p /tmp
+
+if [[ -d "/dev/shm" ]]; then
+  echo "--- Checking /dev/shm status ---"
+  df -k /dev/shm 2>/dev/null || true
+  SHM_AVAIL_KB=$(df -k /dev/shm 2>/dev/null | awk 'NR==2 {print $4}')
+  if [[ -n "${SHM_AVAIL_KB}" ]] && [[ "${SHM_AVAIL_KB}" =~ ^[0-9]+$ ]] && [[ "${SHM_AVAIL_KB}" -lt 1048576 ]]; then
+    echo "WARNING: /dev/shm has less than 1GB available (${SHM_AVAIL_KB} KB). Running TP=2 may fail with shared memory exhaustion! Please test Docker with --shm-size=16g." >&2
+  fi
+fi
 
 START_TIME=$(date +%s)
 echo "======================================================================"

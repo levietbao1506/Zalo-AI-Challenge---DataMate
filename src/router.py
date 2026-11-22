@@ -183,6 +183,19 @@ def should_escalate_sql_result(
     if _percent_scale_suspected(sql_outcome, question):
         reasons.append("percent_scale_suspected")
     reasons.extend(_ranking_escalation_reasons(sql_outcome, question))
+    is_time_question = bool(
+        re.search(
+            r"thang|tuan|nam|ngay|ky|giai doan|khoang thoi gian|hom nay|hom qua|thoi gian",
+            _normalize(question),
+        )
+    )
+    is_unans = bool(
+        _outcome_value(sql_outcome, "is_unanswerable", False)
+        or _contains_abstain_signal(sql_outcome)
+    )
+    is_empty = "empty_result" in anomalies or not _outcome_value(sql_outcome, "rows", [])
+    if is_time_question and (is_unans or is_empty):
+        reasons.append("check_date_coverage_in_python")
     reasons = _unique(reasons)
     return bool(reasons), reasons
 

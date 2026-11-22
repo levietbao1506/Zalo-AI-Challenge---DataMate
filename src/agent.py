@@ -916,7 +916,37 @@ def verification_gate(
     }
 
 
-# Backwards-compatible alias
+def _is_safe_readme_direct(question: str, expected_type: str, readme_text: str) -> bool:
+    if not isinstance(readme_text, str) or len(readme_text.strip()) < 20:
+        return False
+    from src.sql_executor import vn_unaccent
+    q_norm = (vn_unaccent(question.lower()) or "").strip()
+    forbidden_keywords = (
+        "bao nhieu",
+        "tong",
+        "doanh thu",
+        "loi nhuan",
+        "ban chay",
+        "top",
+        "nhieu nhat",
+        "it nhat",
+        "tang truong",
+        "trung binh",
+        "ton kho",
+        "cong no",
+        "hoa don",
+        "thang nay",
+        "tuan roi",
+        "cung ky",
+    )
+    for kw in forbidden_keywords:
+        if kw in q_norm:
+            return False
+    if expected_type in ("table", "list"):
+        return False
+    return True
+
+
 VLLMAgent = CodeAgent
 
 
@@ -932,6 +962,9 @@ def execute_adaptive_hybrid(
     prompt_builder: Optional[Any] = None,
     business_prefix: Optional[str] = None,
     timeout: float = 25.0,
+    entity_index: Optional[Any] = None,
+    readme_text: str = "",
+    batch_entered_at: Optional[float] = None,
 ) -> Dict[str, Any]:
     from src import executor, formatter, prompt_builder as pb_module
     from src.router import RouteDecision, classify_question_route, should_escalate_sql_result
@@ -941,6 +974,16 @@ def execute_adaptive_hybrid(
     question_text = str(question_record.get("question") or question_record.get("text") or "").strip()
     as_of_date = str(question_record.get("as_of_date") or "").strip()
     declared_type = question_record.get("type")
+
+    entity_hints = None
+    entity_hints_count = 0
+    if entity_index is not None:
+        try:
+            entity_hints = entity_index.probe(question_text)
+            entity_hints_count = len(entity_hints) if entity_hints else 0
+        except Exception:
+            entity_hints = None
+            entity_hints_count = 0
 
     business_id = getattr(duckdb_store, "business_id", "business")
     data_dir = str(getattr(duckdb_store, "business_dir", "."))
@@ -952,6 +995,15 @@ def execute_adaptive_hybrid(
     )
     python_file_map: Dict[str, str] = {}
     business_path = Path(data_dir)
+    if not readme_text and business_path.is_dir():
+        for name in ("README.md", "readme.md", "README.txt", "readme.txt"):
+            r_path = business_path / name
+            if r_path.is_file():
+                try:
+                    readme_text = r_path.read_text(encoding="utf-8")
+                    break
+                except Exception:
+                    pass
     if business_path.is_dir():
         for path in sorted(business_path.rglob("*")):
             if path.is_file():
@@ -1006,12 +1058,51 @@ def execute_adaptive_hybrid(
         return resp
 
     def run_sql_branch(exec_mode: str = "SQL_FAST") -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-        sql_prompt = prompt_builder.build_sql_prompt(question_text, as_of_date, execution_mode=exec_mode)
+        sql_prompt = prompt_builder.build_sql_prompt(
+            question_text, as_of_date, execution_mode=exec_mode, entity_hints=entity_hints
+        )
         resp = call_llm(sql_prompt)
         try:
             sql_text, meta = pb_module.parse_sql_response(resp)
-            code_trace.append(sql_text)
-            exec_res = sql_executor.execute(sql_text, timeout_seconds=timeout)
+            if meta.get("answer_source") == "readme":
+                exp_type = meta.get("expected_type") or declared_type or "string"
+                raw_direct = meta.get("direct_answer")
+                if _is_safe_readme_direct(question_text, exp_type, readme_text) and raw_direct is not None:
+                    try:
+                        norm_record = formatter.format_submission_record(
+                            q_id=q_id,
+                            answer=raw_direct,
+                            q_type=exp_type,
+                            rulebook_text=rulebook_text,
+                            question=question_text,
+                        )
+                        if norm_record.get("type") != "abstain":
+                            cand = {"type": norm_record.get("type"), "answer": norm_record.get("answer")}
+                            sql_outcome = {
+                                "success": True,
+                                "sql": "",
+                                "columns": [],
+                                "rows": [[norm_record.get("answer")]],
+                                "anomalies": [],
+                                "error": None,
+                                "is_unanswerable": False,
+                                "is_readme_direct": True,
+                            }
+                            return cand, sql_outcome
+                    except Exception:
+                        pass
+                escalation_reasons.append("unsafe_readme_direct_rejected")
+
+            if sql_text:
+                code_trace.append(sql_text)
+                exec_res = sql_executor.execute(sql_text, timeout_seconds=timeout)
+            else:
+                exec_res = SQLExecutionResult(
+                    success=False,
+                    sql="",
+                    error="Empty SQL statement",
+                    anomalies=["empty_result"],
+                )
         except Exception as exc:
             sql_text, meta = "", {}
             exec_res = SQLExecutionResult(
@@ -1024,12 +1115,15 @@ def execute_adaptive_hybrid(
         if not exec_res.success and "TimeoutError" not in str(exec_res.error or ""):
             repair_prompt = prompt_builder.build_sql_repair_prompt(sql_text, str(exec_res.error or ""))
             repair_resp = call_llm(repair_prompt)
-            sql_text_repaired, meta_repaired = pb_module.parse_sql_response(repair_resp)
-            code_trace.append(sql_text_repaired)
-            exec_res = sql_executor.execute(sql_text_repaired, timeout_seconds=timeout)
-            output_trace.append(exec_res.rows if exec_res.success else exec_res.error)
-            sql_text = sql_text_repaired
-            meta = meta_repaired
+            try:
+                sql_text_repaired, meta_repaired = pb_module.parse_sql_response(repair_resp)
+                code_trace.append(sql_text_repaired)
+                exec_res = sql_executor.execute(sql_text_repaired, timeout_seconds=timeout)
+                output_trace.append(exec_res.rows if exec_res.success else exec_res.error)
+                sql_text = sql_text_repaired
+                meta = meta_repaired
+            except Exception:
+                pass
 
         cand: Optional[Dict[str, Any]] = None
         if meta.get("is_unanswerable"):
@@ -1066,6 +1160,7 @@ def execute_adaptive_hybrid(
             business_id=business_id,
             dual_path=dual_path,
             execution_mode=exec_mode,
+            entity_hints=entity_hints,
         )
         resp = call_llm(py_prompt)
         try:
@@ -1176,22 +1271,60 @@ def execute_adaptive_hybrid(
 
         if route_decision == RouteDecision.SQL_FAST:
             cand_sql, sql_out = run_sql_branch(exec_mode="SQL_FAST")
-            should_esc, esc_reasons = should_escalate_sql_result(sql_out, question_text)
-            escalation_reasons.extend(esc_reasons)
-
-            if not should_esc and cand_sql is not None and cand_sql.get("type") != "abstain":
-                if cand_sql.get("type") == "unanswerable":
-                    final_answer_dict = {"type": "unanswerable", "reason": cand_sql.get("reason", "")}
-                else:
-                    final_answer_dict = {"type": cand_sql.get("type"), "answer": cand_sql.get("answer")}
+            if sql_out.get("is_readme_direct"):
+                final_stage = "readme_direct"
+                final_answer_dict = cand_sql
             else:
-                escalated = True
-                final_stage = "PYTHON_VERIFY"
+                should_esc, esc_reasons = should_escalate_sql_result(sql_out, question_text)
+                escalation_reasons.extend(esc_reasons)
+
+                if not should_esc and cand_sql is not None and cand_sql.get("type") != "abstain":
+                    if cand_sql.get("type") == "unanswerable":
+                        final_answer_dict = {"type": "unanswerable", "reason": cand_sql.get("reason", "")}
+                    else:
+                        final_answer_dict = {"type": cand_sql.get("type"), "answer": cand_sql.get("answer")}
+                else:
+                    escalated = True
+                    final_stage = "PYTHON_VERIFY"
+                    cand_py, py_out = run_py_branch(dual_path=True, exec_mode="PYTHON_VERIFY")
+
+                    if cand_sql is not None and cand_py is not None:
+                        if formatter.answers_equivalent(cand_sql, cand_py):
+                            final_answer_dict = cand_sql
+                        else:
+                            final_stage = "ADJUDICATOR"
+                            final_answer_dict = run_adjudicator(
+                                sql_q=sql_out.get("sql", ""),
+                                sql_res=sql_out.get("rows"),
+                                py_c=py_out.get("code", ""),
+                                py_out=py_out.get("stdout", ""),
+                                py_res=py_out.get("return_value"),
+                            )
+                    elif cand_py is not None and cand_py.get("type") != "abstain":
+                        final_answer_dict = cand_py
+                    elif cand_sql is not None and cand_sql.get("type") != "abstain":
+                        final_stage = "ADJUDICATOR"
+                        final_answer_dict = run_adjudicator(
+                            sql_q=sql_out.get("sql", ""),
+                            sql_res=sql_out.get("rows"),
+                            py_c=py_out.get("code", ""),
+                            py_out=py_out.get("stdout", ""),
+                            py_res=py_out.get("return_value"),
+                        )
+                    else:
+                        final_answer_dict = {"type": "abstain"}
+
+        elif route_decision == RouteDecision.HYBRID_DUAL:
+            cand_sql, sql_out = run_sql_branch(exec_mode="SQL_FAST")
+            if sql_out.get("is_readme_direct"):
+                final_stage = "readme_direct"
+                final_answer_dict = cand_sql
+            else:
                 cand_py, py_out = run_py_branch(dual_path=True, exec_mode="PYTHON_VERIFY")
 
                 if cand_sql is not None and cand_py is not None:
                     if formatter.answers_equivalent(cand_sql, cand_py):
-                        final_answer_dict = cand_sql
+                        final_answer_dict = cand_sql if cand_sql.get("type") != "abstain" else cand_py
                     else:
                         final_stage = "ADJUDICATOR"
                         final_answer_dict = run_adjudicator(
@@ -1202,7 +1335,14 @@ def execute_adaptive_hybrid(
                             py_res=py_out.get("return_value"),
                         )
                 elif cand_py is not None and cand_py.get("type") != "abstain":
-                    final_answer_dict = cand_py
+                    final_stage = "ADJUDICATOR"
+                    final_answer_dict = run_adjudicator(
+                        sql_q=sql_out.get("sql", ""),
+                        sql_res=sql_out.get("rows"),
+                        py_c=py_out.get("code", ""),
+                        py_out=py_out.get("stdout", ""),
+                        py_res=py_out.get("return_value"),
+                    )
                 elif cand_sql is not None and cand_sql.get("type") != "abstain":
                     final_stage = "ADJUDICATOR"
                     final_answer_dict = run_adjudicator(
@@ -1214,43 +1354,6 @@ def execute_adaptive_hybrid(
                     )
                 else:
                     final_answer_dict = {"type": "abstain"}
-
-        elif route_decision == RouteDecision.HYBRID_DUAL:
-            cand_sql, sql_out = run_sql_branch(exec_mode="SQL_FAST")
-            cand_py, py_out = run_py_branch(dual_path=True, exec_mode="PYTHON_VERIFY")
-
-            if cand_sql is not None and cand_py is not None:
-                if formatter.answers_equivalent(cand_sql, cand_py):
-                    final_answer_dict = cand_sql if cand_sql.get("type") != "abstain" else cand_py
-                else:
-                    final_stage = "ADJUDICATOR"
-                    final_answer_dict = run_adjudicator(
-                        sql_q=sql_out.get("sql", ""),
-                        sql_res=sql_out.get("rows"),
-                        py_c=py_out.get("code", ""),
-                        py_out=py_out.get("stdout", ""),
-                        py_res=py_out.get("return_value"),
-                    )
-            elif cand_py is not None and cand_py.get("type") != "abstain":
-                final_stage = "ADJUDICATOR"
-                final_answer_dict = run_adjudicator(
-                    sql_q=sql_out.get("sql", ""),
-                    sql_res=sql_out.get("rows"),
-                    py_c=py_out.get("code", ""),
-                    py_out=py_out.get("stdout", ""),
-                    py_res=py_out.get("return_value"),
-                )
-            elif cand_sql is not None and cand_sql.get("type") != "abstain":
-                final_stage = "ADJUDICATOR"
-                final_answer_dict = run_adjudicator(
-                    sql_q=sql_out.get("sql", ""),
-                    sql_res=sql_out.get("rows"),
-                    py_c=py_out.get("code", ""),
-                    py_out=py_out.get("stdout", ""),
-                    py_res=py_out.get("return_value"),
-                )
-            else:
-                final_answer_dict = {"type": "abstain"}
 
         elif route_decision == RouteDecision.PYTHON_FIRST:
             cand_py, py_out = run_py_branch(dual_path=False, exec_mode="PYTHON_FIRST")
@@ -1292,9 +1395,14 @@ def execute_adaptive_hybrid(
         abstain_token="abstain",
         reason=final_answer_dict.get("reason"),
         as_month=is_month,
+        rulebook_text=rulebook_text,
+        question=question_text,
     )
 
-    elapsed_ms = max(0, int((time.perf_counter() - q_start) * 1000))
+    if batch_entered_at is not None:
+        elapsed_ms = max(0, int(round((time.perf_counter() - batch_entered_at) * 1000)))
+    else:
+        elapsed_ms = max(0, int((time.perf_counter() - q_start) * 1000))
 
     final_type = submission_record.get("type")
     log_answer: Dict[str, Any] = {"type": final_type, "answer": submission_record.get("answer")}
@@ -1305,8 +1413,12 @@ def execute_adaptive_hybrid(
         log_answer["answer"] = None
 
     thinking_val = thinking_trace if any(thinking_trace) else None
-    code_val = "\n\n".join(f"# RUN {idx}\n{c}" for idx, c in enumerate(code_trace, 1)) if code_trace else None
-    output_val = output_trace if output_trace else None
+    if final_stage == "readme_direct":
+        code_val = None
+        output_val = None
+    else:
+        code_val = "\n\n".join(f"# RUN {idx}\n{c}" for idx, c in enumerate(code_trace, 1)) if code_trace else None
+        output_val = output_trace if output_trace else None
 
     route_trace = {
         "route_initial": route_initial,
@@ -1315,6 +1427,7 @@ def execute_adaptive_hybrid(
         "llm_calls": llm_call_count,
         "reasons": route_reasons,
         "escalation_reasons": escalation_reasons,
+        "entity_hints_count": entity_hints_count,
     }
 
     log_record = {
