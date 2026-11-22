@@ -1,6 +1,8 @@
-.git
+.git/
 .venv
 .pytest_cache
+.mypy_cache/
+.ruff_cache/
 __pycache__/
 *.py[oc]
 build/
@@ -9,7 +11,12 @@ wheels/
 *.egg-info
 result/
 *.log
+*.tmp
+*.temp
+*.duckdb
+*.duckdb.wal
 submission*.jsonl
+public_test.zip
 
 # Local test datasets and output directories
 local_data/

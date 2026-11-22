@@ -16,9 +16,10 @@ from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 import json
 import logging
+import math
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from src.formatter import normalize_for_comparison
 
@@ -120,7 +121,7 @@ def _table_match(pred: Any, expected: Any) -> bool:
     p_rows, e_rows = pred.get("rows"), expected.get("rows")
     if not all(isinstance(v, (list, tuple)) for v in (p_cols, e_cols, p_rows, e_rows)):
         return False
-    if len(p_cols) != len(e_cols) or len(p_rows) != len(e_rows):
+    if len(p_cols) != len(e_cols):
         return False
     p_names = [normalize_for_comparison(c) for c in p_cols]
     e_names = [normalize_for_comparison(c) for c in e_cols]
@@ -129,9 +130,26 @@ def _table_match(pred: Any, expected: Any) -> bool:
     elif len(set(p_names)) == len(p_names) and set(p_names) == set(e_names):
         order = [p_names.index(name) for name in e_names]
     else:
-        order = list(range(len(e_cols)))  # Official positional fallback.
-    unused = list(p_rows)
-    for e_row in e_rows:
+        return False
+
+    def unique_rows(rows: Iterable[Any], column_count: int) -> Optional[List[Any]]:
+        unique: List[Any] = []
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) != column_count:
+                return None
+            if not any(
+                all(is_answer_match(left, right) for left, right in zip(row, existing))
+                for existing in unique
+            ):
+                unique.append(row)
+        return unique
+
+    unique_predicted = unique_rows(p_rows, len(p_cols))
+    unique_expected = unique_rows(e_rows, len(e_cols))
+    if unique_predicted is None or unique_expected is None or len(unique_predicted) != len(unique_expected):
+        return False
+    unused = list(unique_predicted)
+    for e_row in unique_expected:
         if not isinstance(e_row, (list, tuple)) or len(e_row) != len(e_cols):
             return False
         match_index = next((i for i, p_row in enumerate(unused)
@@ -244,6 +262,8 @@ def evaluate_submission(
         expected_ans = gt_item.get("expected_answer")
         if expected_ans is None:
             expected_ans = gt_item.get("answer")
+        if exp_type == "unanswerable" and expected_ans is None:
+            expected_ans = "unanswerable"
 
         # Collect reference candidates: primary answer + any aliases
         candidates: List[Any] = []
@@ -267,9 +287,10 @@ def evaluate_submission(
         else:
             predicted_type = sub_item.get("type")
             predicted_ans = sub_item.get("answer")
-            # Submission records must declare one of the nine answer types.
+            if predicted_type == "unanswerable" and predicted_ans is None:
+                predicted_ans = "unanswerable"
 
-        is_abstain = predicted_type == "abstain" or _is_abstain_value(predicted_ans)
+        is_abstain = sub_item is None or predicted_type == "abstain"
 
         # Check candidate value match
         value_matched = False
@@ -408,6 +429,216 @@ def evaluate_submission(
     }
 
     return summary
+
+
+def _read_jsonl_map(path: Path) -> Dict[str, Dict[str, Any]]:
+    records: Dict[str, Dict[str, Any]] = {}
+    with open(path, "r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if not isinstance(item, dict):
+                raise ValueError(f"JSONL record at {path}:{line_number} must be an object")
+            record_id = item.get("id") or item.get("question_id")
+            if record_id is None:
+                raise ValueError(f"JSONL record at {path}:{line_number} has no id")
+            records[str(record_id)] = item
+    return records
+
+
+def _load_execution_logs(logs_path: Path) -> Dict[str, Dict[str, Any]]:
+    if logs_path.is_file():
+        return _read_jsonl_map(logs_path)
+    if not logs_path.is_dir():
+        return {}
+    for name in ("predictions.jsonl", "logs.jsonl"):
+        candidate = logs_path / name
+        if candidate.is_file():
+            return _read_jsonl_map(candidate)
+    records: Dict[str, Dict[str, Any]] = {}
+    for path in sorted(logs_path.glob("*.json")):
+        if path.name == "runtime_metrics.json":
+            continue
+        try:
+            item = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if isinstance(item, dict) and item.get("id") is not None:
+            records[str(item["id"])] = item
+    return records
+
+
+def _route_bucket(log_record: Optional[Dict[str, Any]]) -> str:
+    trace = (log_record or {}).get("route_trace") or {}
+    initial = str(trace.get("route_initial") or "UNKNOWN")
+    final_stage = str(trace.get("final_stage") or initial)
+    escalated = bool(trace.get("escalated"))
+    if initial == "SQL_FAST":
+        return "SQL_FAST_ESCALATED" if escalated else "SQL_FAST_CLEAN"
+    if initial == "HYBRID_DUAL":
+        return "HYBRID_DUAL_ADJUDICATOR" if final_stage == "ADJUDICATOR" else "HYBRID_DUAL_MATCHED"
+    if initial == "PYTHON_FIRST":
+        return "PYTHON_FIRST"
+    return "UNKNOWN"
+
+
+def _percentile_95(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
+
+
+def _status_metrics(details: List[Dict[str, Any]], elapsed_values: List[float]) -> Dict[str, Any]:
+    total = len(details)
+    correct = sum(item["status"] == "CORRECT" for item in details)
+    wrong = sum(item["status"] == "WRONG" for item in details)
+    abstain = sum(item["status"] == "ABSTAIN" for item in details)
+    return {
+        "count": total,
+        "correct": correct,
+        "wrong": wrong,
+        "abstain": abstain,
+        "correct_rate": round(correct / total, 4) if total else 0.0,
+        "wrong_rate": round(wrong / total, 4) if total else 0.0,
+        "abstain_rate": round(abstain / total, 4) if total else 0.0,
+        "penalized_accuracy": round((correct - wrong) / total, 4) if total else 0.0,
+        "avg_elapsed_ms": round(sum(elapsed_values) / len(elapsed_values), 3) if elapsed_values else 0.0,
+    }
+
+
+def analyze_hybrid_results(
+    submission_file: Union[str, Path],
+    answers_file: Union[str, Path],
+    logs_path: Union[str, Path],
+    selected_ids: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    submission_path = Path(submission_file).resolve()
+    answers_path = Path(answers_file).resolve()
+    logs_root = Path(logs_path).resolve()
+    selected: Optional[Set[str]] = {str(value) for value in selected_ids} if selected_ids is not None else None
+
+    if selected is None:
+        evaluation = evaluate_submission(submission_path, answers_path)
+    else:
+        answers = _read_jsonl_map(answers_path)
+        submissions = _read_jsonl_map(submission_path)
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            filtered_answers = temp_root / "answers.jsonl"
+            filtered_submission = temp_root / "submission.jsonl"
+            with open(filtered_answers, "w", encoding="utf-8") as handle:
+                for record_id, record in answers.items():
+                    if record_id in selected:
+                        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            with open(filtered_submission, "w", encoding="utf-8") as handle:
+                for record_id, record in submissions.items():
+                    if record_id in selected:
+                        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            evaluation = evaluate_submission(filtered_submission, filtered_answers)
+
+    logs = _load_execution_logs(logs_root)
+    details = evaluation["details"]
+    detail_by_id = {str(item["id"]): item for item in details}
+    elapsed_by_id: Dict[str, float] = {}
+    for record_id, record in logs.items():
+        if record_id not in detail_by_id:
+            continue
+        elapsed = record.get("elapsed_ms")
+        if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) and elapsed >= 0:
+            elapsed_by_id[record_id] = float(elapsed)
+
+    elapsed_values = list(elapsed_by_id.values())
+    average_elapsed_ms = sum(elapsed_values) / len(elapsed_values) if elapsed_values else 0.0
+    route_groups: Dict[str, List[Dict[str, Any]]] = {
+        "SQL_FAST_CLEAN": [],
+        "SQL_FAST_ESCALATED": [],
+        "HYBRID_DUAL_MATCHED": [],
+        "HYBRID_DUAL_ADJUDICATOR": [],
+        "PYTHON_FIRST": [],
+    }
+    route_elapsed: Dict[str, List[float]] = {name: [] for name in route_groups}
+    for record_id, detail in detail_by_id.items():
+        bucket = _route_bucket(logs.get(record_id))
+        if bucket not in route_groups:
+            route_groups[bucket] = []
+            route_elapsed[bucket] = []
+        route_groups[bucket].append(detail)
+        if record_id in elapsed_by_id:
+            route_elapsed[bucket].append(elapsed_by_id[record_id])
+
+    route_breakdown = {
+        name: _status_metrics(route_groups[name], route_elapsed[name])
+        for name in route_groups
+    }
+    sql_fast_details = route_groups["SQL_FAST_CLEAN"]
+    sql_fast_wrong = [item for item in sql_fast_details if item["status"] == "WRONG"]
+    unanswerable_details = [item for item in details if item.get("type") == "unanswerable"]
+    false_answers = [
+        item for item in unanswerable_details
+        if item["status"] == "WRONG" and item.get("predicted_type") not in {"unanswerable", "abstain"}
+    ]
+    by_type = {
+        answer_type: {
+            "count": stats["total"],
+            "wrong": stats["wrong"],
+            "wrong_rate": round(stats["wrong"] / stats["total"], 4) if stats["total"] else 0.0,
+            "penalized_accuracy": stats["penalized_accuracy"],
+        }
+        for answer_type, stats in evaluation["type_breakdown"].items()
+        if stats["total"] > 0
+    }
+    runtime_metrics: Dict[str, Any] = {}
+    metrics_path = logs_root / "runtime_metrics.json" if logs_root.is_dir() else logs_root.parent / "runtime_metrics.json"
+    if metrics_path.is_file():
+        try:
+            loaded_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_metrics, dict):
+                runtime_metrics = loaded_metrics
+        except (json.JSONDecodeError, OSError):
+            runtime_metrics = {}
+    worker_count_value = runtime_metrics.get("worker_count", 1)
+    worker_count = worker_count_value if isinstance(worker_count_value, int) and worker_count_value > 0 else 1
+    load_model_value = runtime_metrics.get("load_model_ms", 0)
+    load_model_ms = float(load_model_value) if isinstance(load_model_value, (int, float)) else 0.0
+    estimated_seconds = load_model_ms / 1000.0 + average_elapsed_ms * 500.0 / (1000.0 * worker_count)
+    return {
+        "overview": {
+            "total_questions": evaluation["total_questions"],
+            "penalized_accuracy": evaluation["penalized_accuracy"],
+            "correct": evaluation["correct"],
+            "wrong": evaluation["wrong"],
+            "abstain": evaluation["abstained"],
+            "avg_elapsed_ms": round(average_elapsed_ms, 3),
+            "p95_elapsed_ms": round(_percentile_95(elapsed_values), 3),
+            "estimated_private_500_seconds": round(estimated_seconds, 3),
+            "estimated_private_500_hours": round(estimated_seconds / 3600.0, 4),
+            "estimated_worker_count": worker_count,
+            "load_model_ms": round(load_model_ms, 3),
+        },
+        "route_breakdown": route_breakdown,
+        "error_analysis": {
+            "sql_fast_clean": {
+                "count": len(sql_fast_details),
+                "wrong": len(sql_fast_wrong),
+                "wrong_rate": round(len(sql_fast_wrong) / len(sql_fast_details), 4) if sql_fast_details else 0.0,
+                "wrong_cases": [
+                    {"id": item["id"], "type": item["type"], "question": item.get("question", "")}
+                    for item in sql_fast_wrong
+                ],
+            },
+            "false_answer_on_unanswerable": {
+                "unanswerable_count": len(unanswerable_details),
+                "wrong_concrete_answers": len(false_answers),
+                "rate": round(len(false_answers) / len(unanswerable_details), 4) if unanswerable_details else 0.0,
+                "cases": [item["id"] for item in false_answers],
+            },
+            "by_type": by_type,
+        },
+        "details": details,
+    }
 
 
 def print_evaluation_report(summary: Dict[str, Any]) -> None:

@@ -70,6 +70,7 @@ except ImportError:
 
 import sqlite3
 from src import calendar_utils
+from src.sql_executor import vn_norm, vn_unaccent
 
 if "calendar_utils" not in sys.modules:
     sys.modules["calendar_utils"] = calendar_utils
@@ -130,6 +131,47 @@ def parse_vnd_amount(value: Any) -> float:
     if not math.isfinite(number):
         raise ValueError("non-finite money value")
     return number
+
+
+parse_vn_number = parse_vnd_amount
+
+
+def parse_vn_date(value: Any, as_of: Optional[Union[str, date, dt]] = None) -> date:
+    try:
+        return parse_mixed_date(value)
+    except Exception:
+        if isinstance(value, str):
+            res = calendar_utils.parse_vietnamese_date(value, as_of=as_of)
+            if res is not None:
+                return res
+            res_rel = calendar_utils.resolve_vietnamese_relative_date(value, as_of=as_of)
+            if res_rel is not None:
+                return res_rel
+        raise
+
+
+def rank_items(
+    items: List[Any],
+    criterion_fn: Optional[Callable[[Any], Any]] = None,
+    code_fn: Optional[Callable[[Any], Any]] = None,
+    descending: bool = True,
+) -> List[Any]:
+    if not items:
+        return []
+    c_fn = criterion_fn or (lambda x: x[1] if isinstance(x, (tuple, list)) and len(x) > 1 else x)
+    k_fn = code_fn or (lambda x: x[0] if isinstance(x, (tuple, list)) and len(x) > 0 else str(x))
+
+    def sort_key(item: Any) -> Tuple[float, str]:
+        c_val = c_fn(item)
+        try:
+            num = float(c_val)
+        except (ValueError, TypeError):
+            num = 0.0
+        code_str = str(k_fn(item))
+        primary = -num if descending else num
+        return (primary, code_str)
+
+    return sorted(items, key=sort_key)
 
 
 def parse_mixed_date(value: Any) -> date:
@@ -309,16 +351,47 @@ def _build_local_namespace(
     data_dir: str,
     file_map: Optional[Dict[str, str]] = None,
     as_of_date: Optional[Union[str, date]] = None,
+    duckdb_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build isolated execution namespace containing data context and analytical libraries."""
     if file_map and "calendar.csv" in file_map:
         calendar_utils.set_calendar_csv_path(file_map["calendar.csv"])
 
+    resolved_as_of = calendar_utils.resolve_as_of_date(as_of_date)
+    raw_data_dir = str(Path(data_dir).resolve()) if data_dir else ""
+    calendar_path = ""
+    if file_map and "calendar.csv" in file_map:
+        calendar_path = str(file_map["calendar.csv"])
+    elif raw_data_dir:
+        cand_cal = Path(raw_data_dir) / "calendar.csv"
+        if cand_cal.exists():
+            calendar_path = str(cand_cal)
+    if not calendar_path:
+        cfg_cal = calendar_utils.get_calendar_csv_path()
+        if cfg_cal:
+            calendar_path = str(cfg_cal)
+        elif Path("/data/calendar.csv").exists():
+            calendar_path = "/data/calendar.csv"
+
+    if not duckdb_path:
+        biz_name = Path(data_dir).name if data_dir else "business"
+        cand_duckdb = Path(f"/tmp/datamate_duckdb/{biz_name}.duckdb")
+        duckdb_path = str(cand_duckdb)
+
+    duckdb_conn = None
+    if _HAS_DUCKDB and Path(duckdb_path).is_file():
+        duckdb_conn = duckdb.connect(str(duckdb_path), read_only=True)
+
     namespace: Dict[str, Any] = {
         "data_dir": data_dir,
         "DATA_DIR": data_dir,
+        "RAW_DATA_DIR": raw_data_dir,
+        "CALENDAR_PATH": calendar_path,
+        "DUCKDB_PATH": str(duckdb_path),
+        "DUCKDB_CONN": duckdb_conn,
         "FILE_MAP": file_map or {},
-        "as_of_date": calendar_utils.resolve_as_of_date(as_of_date),
+        "as_of_date": resolved_as_of,
+        "AS_OF_DATE": str(resolved_as_of),
         "pd": pd,
         "np": np if _HAS_NUMPY else None,
         "duckdb": duckdb if _HAS_DUCKDB else None,
@@ -338,6 +411,11 @@ def _build_local_namespace(
         "fuzzy_match_name": fuzzy_match_name,
         "parse_vnd_amount": parse_vnd_amount,
         "parse_mixed_date": parse_mixed_date,
+        "parse_vn_number": parse_vn_number,
+        "parse_vn_date": parse_vn_date,
+        "vn_norm": vn_norm,
+        "vn_unaccent": vn_unaccent,
+        "rank_items": rank_items,
         "time_context": time_context,
         "resolve_as_of_date": calendar_utils.resolve_as_of_date,
         "parse_vietnamese_date": calendar_utils.parse_vietnamese_date,
@@ -403,6 +481,7 @@ def execute_subprocess(
     as_of_date: Optional[Union[str, date]] = None,
     timeout_seconds: float = 25.0,
     working_dir: Optional[Union[str, Path]] = None,
+    duckdb_path: Optional[Union[str, Path]] = None,
 ) -> SubprocessResult:
     """Execute generated Python script in an isolated subprocess.
 
@@ -437,6 +516,10 @@ def execute_subprocess(
     data_dir_b64 = base64.b64encode(str(data_dir).encode("utf-8")).decode("ascii")
     pkl_b64 = base64.b64encode(str(pkl_path).encode("utf-8")).decode("ascii")
     root_b64 = base64.b64encode(project_root.encode("utf-8")).decode("ascii")
+
+    biz_name = Path(data_dir).name if data_dir else "business"
+    duckdb_file = Path(duckdb_path) if duckdb_path else Path(f"/tmp/datamate_duckdb/{biz_name}.duckdb")
+    duckdb_b64 = base64.b64encode(str(duckdb_file).encode("utf-8")).decode("ascii")
 
     runner_template = f'''# Auto-generated subprocess execution runner
 import base64
@@ -483,6 +566,7 @@ try:
     import calendar_utils
 except ImportError:
     from src import calendar_utils
+from src.sql_executor import vn_norm, vn_unaccent
 from src import executor as packaged_helpers
 from src import schema_parser as _schema_parser
 
@@ -557,6 +641,19 @@ if file_map and "calendar.csv" in file_map:
 
 as_of_date = calendar_utils.resolve_as_of_date(as_of_date_str)
 
+duckdb_path = base64.b64decode("{duckdb_b64}").decode("utf-8")
+duckdb_conn = None
+if duckdb is not None and Path(duckdb_path).is_file():
+    duckdb_conn = duckdb.connect(duckdb_path, read_only=True)
+raw_data_dir = str(Path(data_dir).resolve()) if data_dir else ""
+calendar_path = ""
+if file_map and "calendar.csv" in file_map:
+    calendar_path = str(file_map["calendar.csv"])
+elif raw_data_dir and (Path(raw_data_dir) / "calendar.csv").exists():
+    calendar_path = str(Path(raw_data_dir) / "calendar.csv")
+elif Path("/data/calendar.csv").exists():
+    calendar_path = "/data/calendar.csv"
+
 # Pre-populated execution namespace
 exec_globals = {{
     "__builtins__": {{**vars(__import__("builtins")), "__import__": packaged_helpers._safe_import}},
@@ -580,6 +677,11 @@ exec_globals = {{
     "fuzzy_match_name": packaged_helpers.fuzzy_match_name,
     "parse_vnd_amount": packaged_helpers.parse_vnd_amount,
     "parse_mixed_date": packaged_helpers.parse_mixed_date,
+    "parse_vn_number": packaged_helpers.parse_vn_number,
+    "parse_vn_date": packaged_helpers.parse_vn_date,
+    "vn_norm": vn_norm,
+    "vn_unaccent": vn_unaccent,
+    "rank_items": packaged_helpers.rank_items,
     "time_context": packaged_helpers.time_context,
     "resolve_as_of_date": calendar_utils.resolve_as_of_date,
     "parse_vietnamese_date": calendar_utils.parse_vietnamese_date,
@@ -595,11 +697,17 @@ exec_globals = {{
     "lunar_to_solar": calendar_utils.lunar_to_solar,
     "data_dir": data_dir,
     "DATA_DIR": data_dir,
+    "RAW_DATA_DIR": raw_data_dir,
+    "CALENDAR_PATH": calendar_path,
+    "DUUCKDB_PATH": duckdb_path,
+    "DUCKDB_PATH": duckdb_path,
+    "DUCKDB_CONN": duckdb_conn,
     "FILE_MAP": file_map,
     "as_of_date": as_of_date,
     "AS_OF_DATE": str(as_of_date),
     "result": None,
     "final_result": None,
+    "FINAL_ANSWER": None,
 }}
 
 # Inject direct aliases for business files (e.g. orders_csv = '/path/to/orders.csv')
@@ -614,7 +722,7 @@ try:
     exec(compiled, exec_globals, exec_locals)
 
     extracted_result = None
-    for var_name in ("final_result", "result"):
+    for var_name in ("FINAL_ANSWER", "final_result", "result"):
         if var_name in exec_locals and exec_locals[var_name] is not None:
             extracted_result = exec_locals[var_name]
             break
@@ -635,11 +743,18 @@ try:
                 pickle.dump(str(extracted_result), f, protocol=pickle.HIGHEST_PROTOCOL)
         except Exception:
             pass
+    if duckdb_conn is not None:
+        duckdb_conn.close()
     sys.stdout = original_stdout
     print(captured_output.getvalue(), end="")
     sys.exit(0)
 except Exception as e:
     import traceback
+    if duckdb_conn is not None:
+        try:
+            duckdb_conn.close()
+        except Exception:
+            pass
     sys.stdout = original_stdout
     print(captured_output.getvalue(), end="")
     traceback.print_exc(file=sys.stderr)
@@ -713,6 +828,7 @@ def execute_local(
     as_of_date: Optional[Union[str, date]] = None,
     timeout_seconds: Optional[float] = 25.0,
     use_subprocess: bool = False,
+    duckdb_path: Optional[Union[str, Path]] = None,
 ) -> tuple[bool, Any, str]:
     """Execute a Python code string in an isolated namespace and capture ``final_result``.
 
@@ -745,15 +861,25 @@ def execute_local(
             file_map=file_map,
             as_of_date=as_of_date,
             timeout_seconds=timeout,
+            duckdb_path=duckdb_path,
         )
         return (sub_res.success, sub_res.return_value, sub_res.stderr if not sub_res.success else "")
 
-    namespace = _build_local_namespace(data_dir=data_dir, file_map=file_map, as_of_date=as_of_date)
+    namespace = _build_local_namespace(
+        data_dir=data_dir,
+        file_map=file_map,
+        as_of_date=as_of_date,
+        duckdb_path=str(duckdb_path) if duckdb_path is not None else None,
+    )
 
     def _run() -> tuple[bool, Any, str]:
         try:
             exec(code_str, namespace)
-            extracted = namespace["final_result"] if "final_result" in namespace else namespace.get("result")
+            extracted = None
+            for var_name in ("FINAL_ANSWER", "final_result", "result"):
+                if namespace.get(var_name) is not None:
+                    extracted = namespace[var_name]
+                    break
             return (True, extracted, "")
         except Exception as e:
             tb = traceback.format_exc()
@@ -761,6 +887,10 @@ def execute_local(
             err_msg = str(e) or "Unknown error"
             full_error = f"{err_type}: {err_msg}\n{tb}".strip()
             return (False, None, full_error)
+        finally:
+            duckdb_conn = namespace.get("DUCKDB_CONN")
+            if duckdb_conn is not None:
+                duckdb_conn.close()
 
     if timeout_seconds is None:
         return _run()
@@ -963,6 +1093,7 @@ class SandboxedExecutor:
         as_of_date: Optional[Union[str, date]] = None,
         timeout_seconds: Optional[float] = None,
         working_dir: Optional[Union[str, Path]] = None,
+        duckdb_path: Optional[Union[str, Path]] = None,
     ) -> ExecutionResult:
         """Execute Python script in an isolated subprocess with 25s timeout and pre-imported helpers."""
         timeout = timeout_seconds if timeout_seconds is not None else self.default_timeout_seconds
@@ -972,6 +1103,7 @@ class SandboxedExecutor:
             data_dir=data_dir or ".",
             file_map=file_map,
             as_of_date=as_of_date,
+            duckdb_path=duckdb_path,
             timeout_seconds=timeout,
             working_dir=working_dir,
         )
@@ -1005,12 +1137,30 @@ class SandboxedExecutor:
         data_dir: Optional[str] = None,
         file_map: Optional[Dict[str, str]] = None,
         as_of_date: Optional[Union[str, date]] = None,
+        duckdb_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Construct isolated globals dictionary containing approved tools and data paths."""
         safe_builtins = dict(__builtins__) if isinstance(__builtins__, dict) else dict(__builtins__.__dict__)
         safe_builtins["__import__"] = _safe_import
 
         resolved_as_of = calendar_utils.resolve_as_of_date(as_of_date)
+        raw_data_dir = str(Path(data_dir).resolve()) if data_dir else ""
+        calendar_path = ""
+        if file_map and "calendar.csv" in file_map:
+            calendar_path = str(file_map["calendar.csv"])
+        elif raw_data_dir and (Path(raw_data_dir) / "calendar.csv").exists():
+            calendar_path = str(Path(raw_data_dir) / "calendar.csv")
+        elif Path("/data/calendar.csv").exists():
+            calendar_path = "/data/calendar.csv"
+
+        if not duckdb_path:
+            biz_name = Path(data_dir).name if data_dir else "business"
+            cand_duckdb = Path(f"/tmp/datamate_duckdb/{biz_name}.duckdb")
+            duckdb_path = str(cand_duckdb)
+
+        duckdb_conn = None
+        if _HAS_DUCKDB and Path(duckdb_path).is_file():
+            duckdb_conn = duckdb.connect(str(duckdb_path), read_only=True)
 
         env_globals: Dict[str, Any] = {
             "__builtins__": safe_builtins,
@@ -1037,6 +1187,11 @@ class SandboxedExecutor:
             "fuzzy_match_name": fuzzy_match_name,
             "parse_vnd_amount": parse_vnd_amount,
             "parse_mixed_date": parse_mixed_date,
+            "parse_vn_number": parse_vn_number,
+            "parse_vn_date": parse_vn_date,
+            "vn_norm": vn_norm,
+            "vn_unaccent": vn_unaccent,
+            "rank_items": rank_items,
             "time_context": time_context,
             "resolve_as_of_date": calendar_utils.resolve_as_of_date,
             "parse_vietnamese_date": calendar_utils.parse_vietnamese_date,
@@ -1053,12 +1208,17 @@ class SandboxedExecutor:
             # Data context
             "DATA_DIR": data_dir,
             "data_dir": data_dir,
+            "RAW_DATA_DIR": raw_data_dir,
+            "CALENDAR_PATH": calendar_path,
+            "DUCKDB_PATH": str(duckdb_path),
+            "DUCKDB_CONN": duckdb_conn,
             "FILE_MAP": file_map or {},
             "as_of_date": resolved_as_of,
             "AS_OF_DATE": str(resolved_as_of),
             # Default placeholder for result
             "result": None,
             "final_result": None,
+            "FINAL_ANSWER": None,
         }
 
         # Convenience aliases for file paths directly in globals (e.g. orders_csv = '/path/to/orders.csv')
@@ -1077,6 +1237,7 @@ class SandboxedExecutor:
         as_of_date: Optional[Union[str, date]] = None,
         timeout_seconds: Optional[float] = None,
         use_subprocess: bool = False,
+        duckdb_path: Optional[Union[str, Path]] = None,
     ) -> ExecutionResult:
         """Run code in an isolated sandbox with timeout and exception trapping.
 
@@ -1098,6 +1259,7 @@ class SandboxedExecutor:
                 file_map=file_map,
                 as_of_date=as_of_date,
                 timeout_seconds=timeout_seconds,
+                duckdb_path=duckdb_path,
             )
 
         timeout = timeout_seconds if timeout_seconds is not None else self.default_timeout_seconds
@@ -1110,6 +1272,7 @@ class SandboxedExecutor:
                 data_dir=data_dir,
                 file_map=file_map,
                 as_of_date=as_of_date,
+                duckdb_path=str(duckdb_path) if duckdb_path is not None else None,
             )
 
             # Redirect stdout to capture print outputs
@@ -1126,7 +1289,7 @@ class SandboxedExecutor:
 
                 # 3. Extract result: look for final_result first, then result
                 extracted_result = None
-                for var_name in ("final_result", "result"):
+                for var_name in ("FINAL_ANSWER", "final_result", "result"):
                     if var_name in local_scope and local_scope[var_name] is not None:
                         extracted_result = local_scope[var_name]
                         break
@@ -1169,6 +1332,9 @@ class SandboxedExecutor:
                     duration_seconds=duration,
                 )
             finally:
+                duckdb_conn = global_scope.get("DUCKDB_CONN")
+                if duckdb_conn is not None:
+                    duckdb_conn.close()
                 sys.stdout = old_stdout
 
         worker_res: Dict[str, Any] = {"result_obj": None, "exception": None}

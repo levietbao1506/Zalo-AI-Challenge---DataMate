@@ -216,7 +216,7 @@ class TestVLLMAgent(unittest.TestCase):
         self.assertEqual(call_kwargs["model"], "./models/Qwen3-14B")
         self.assertTrue(call_kwargs["trust_remote_code"])
         self.assertEqual(call_kwargs["tensor_parallel_size"], 1)
-        self.assertEqual(call_kwargs["max_model_len"], 4096)
+        self.assertEqual(call_kwargs["max_model_len"], 32768)
         self.assertEqual(call_kwargs["gpu_memory_utilization"], 0.85)
         self.assertEqual(call_kwargs["seed"], 42)
         self.assertEqual(call_kwargs["max_num_seqs"], 8)
@@ -224,6 +224,7 @@ class TestVLLMAgent(unittest.TestCase):
         mock_sp_cls.assert_called_once()
         self.assertEqual(mock_sp_cls.call_args.kwargs["top_p"], 1.0)
         self.assertEqual(mock_sp_cls.call_args.kwargs["seed"], 42)
+        self.assertEqual(mock_sp_cls.call_args.kwargs["max_tokens"], 8192)
 
     def test_llama_cpp_gguf_initialization_and_generation(self):
         """Verify .gguf model_path initializes llama_cpp backend, generates code via chat completion, and batches sequentially."""

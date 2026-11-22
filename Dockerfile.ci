@@ -1,0 +1,43 @@
+# ==============================================================================
+# Zalo AI Challenge 2026 - DataMate Track
+# Lightweight Dockerfile for CI / Offline Testing (without heavy weights)
+# Base: vllm/vllm-openai:v0.10.1.1
+# ==============================================================================
+
+FROM vllm/vllm-openai:v0.10.1.1
+
+LABEL maintainer="Zalo AI Challenge - DataMate 2026"
+LABEL description="CI Testing container running vLLM, Pandas, DuckDB"
+
+ENTRYPOINT []
+
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    HF_DATASETS_OFFLINE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    NCCL_P2P_DISABLE=1 \
+    PYTHONHASHSEED=42 \
+    VLLM_SEED=42 \
+    VLLM_MAX_NUM_SEQS=8 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TOKENIZERS_PARALLELISM=false \
+    VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    OMP_NUM_THREADS=4
+
+WORKDIR /code
+
+COPY requirements.txt /code/requirements.txt
+RUN pip install --no-cache-dir --break-system-packages -r /code/requirements.txt && \
+    pip install --no-cache-dir --break-system-packages --no-deps nvidia-nccl-cu12==2.27.7
+
+COPY training_code/ /code/training_code/
+COPY predict.sh /code/predict.sh
+COPY README.md /code/README.md
+COPY src/ /code/src/
+COPY tests/ /code/tests/
+
+RUN sed -i 's/\r$//' /code/predict.sh && \
+    chmod +x /code/predict.sh
+
+CMD ["pytest", "tests/"]

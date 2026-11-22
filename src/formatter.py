@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 import json
 import math
 from pathlib import Path
@@ -151,7 +151,7 @@ def format_number(val: Any, round_decimals: int = 2) -> Union[int, float]:
         numeric = Decimal(raw)
         if not numeric.is_finite():
             raise ValueError("NaN and Infinity are invalid")
-        rounded = numeric.quantize(Decimal(1).scaleb(-round_decimals), rounding=ROUND_HALF_UP)
+        rounded = numeric.quantize(Decimal(1).scaleb(-round_decimals), rounding=ROUND_HALF_EVEN)
     except (InvalidOperation, ValueError) as exc:
         raise ValueError(f"Invalid number: {val!r}") from exc
     if rounded == 0:
@@ -614,6 +614,7 @@ def format_submission_record(
     q_type: Optional[str] = None,
     abstain_token: str = DEFAULT_ABSTAIN_TOKEN,
     reason: Optional[str] = None,
+    as_month: bool = False,
 ) -> Dict[str, Any]:
     """Return a valid typed record, or ``{id, type: abstain}`` on invalid input."""
     record_id = str(q_id)
@@ -659,7 +660,7 @@ def format_submission_record(
             if not normalized or normalized.casefold() in {"nan", "none", "null", "inf", "infinity"}:
                 return abstain
         elif q_type == "date":
-            normalized = format_date(answer)
+            normalized = format_date(answer, as_month=as_month)
         elif q_type == "boolean":
             normalized = format_boolean(answer)
         elif q_type == "list":
@@ -708,3 +709,45 @@ def append_submission_line(
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(safe_record, ensure_ascii=False, allow_nan=False) + "\n")
+
+
+def answers_equivalent(ans_a: Any, ans_b: Any) -> bool:
+    from src import evaluator
+
+    def _extract_dict_payload(val: Any) -> Tuple[Optional[str], Any]:
+        if isinstance(val, dict):
+            t = val.get("type")
+            if t == "unanswerable":
+                return "unanswerable", "unanswerable"
+            if t == "abstain":
+                return "abstain", "abstain"
+            if "answer" in val:
+                return t, val["answer"]
+            return t, val
+        return None, val
+
+    type_a, val_a = _extract_dict_payload(ans_a)
+    type_b, val_b = _extract_dict_payload(ans_b)
+
+    if (type_a == "abstain" or evaluator._is_abstain_value(val_a)) and (type_b == "abstain" or evaluator._is_abstain_value(val_b)):
+        return True
+    if (type_a == "abstain" or evaluator._is_abstain_value(val_a)) or (type_b == "abstain" or evaluator._is_abstain_value(val_b)):
+        return False
+
+    if (type_a == "unanswerable" or (isinstance(val_a, str) and val_a.strip().lower() == "unanswerable")) and (
+        type_b == "unanswerable" or (isinstance(val_b, str) and val_b.strip().lower() == "unanswerable")
+    ):
+        return True
+    if (type_a == "unanswerable" or (isinstance(val_a, str) and val_a.strip().lower() == "unanswerable")) or (
+        type_b == "unanswerable" or (isinstance(val_b, str) and val_b.strip().lower() == "unanswerable")
+    ):
+        return False
+
+    if type_a in evaluator.STANDARD_ANSWER_TYPES and type_b in evaluator.STANDARD_ANSWER_TYPES and type_a != type_b:
+        return False
+
+    q_type = type_a if type_a in evaluator.STANDARD_ANSWER_TYPES else type_b
+    if not q_type or q_type not in evaluator.STANDARD_ANSWER_TYPES:
+        q_type = evaluator._infer_type_from_value(val_a)
+
+    return evaluator.is_answer_match(val_a, val_b, q_type=q_type)

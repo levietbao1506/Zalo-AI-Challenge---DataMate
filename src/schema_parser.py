@@ -17,7 +17,10 @@ from pathlib import Path
 import re
 import sqlite3
 import unicodedata
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from .duckdb_store import BusinessDuckDBStore
 
 try:
     import pandas as pd
@@ -1025,6 +1028,87 @@ def build_schema_string(
     parser = SchemaParser(data_dir=data_dir)
     context = parser.parse(business_id=business_id, n_rows=n_rows)
     return context.to_prompt_context(max_readme_chars=max_readme_chars)
+
+
+def build_sql_schema_card(store: "BusinessDuckDBStore", readme_text: str) -> str:
+    """Build a compact deterministic schema card from a populated DuckDB store."""
+    connection = store.connection
+
+    def quote(identifier: str) -> str:
+        return '"' + identifier.replace('"', '""') + '"'
+
+    def json_value(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"), sort_keys=True)
+
+    normalized_readme = re.sub(r"\s+", " ", unicodedata.normalize("NFC", readme_text or "")).strip()[:1500]
+    lines = [f"README: {normalized_readme}" if normalized_readme else "README: -"]
+    for table_name in sorted(store.table_metadata):
+        metadata = store.table_metadata[table_name]
+        columns = connection.execute(f"DESCRIBE SELECT * FROM {quote(table_name)}").fetchall()
+        typed_columns = sorted(((str(row[0]), str(row[1])) for row in columns), key=lambda item: item[0])
+        if table_name == "_calendar":
+            column_summary = ",".join(f"{name}:{data_type}" for name, data_type in typed_columns)
+            ranges: List[str] = []
+            for column_name, data_type in typed_columns:
+                if "DATE" not in data_type.upper() and "TIMESTAMP" not in data_type.upper():
+                    continue
+                minimum, maximum = connection.execute(
+                    f"SELECT MIN({quote(column_name)}), MAX({quote(column_name)}) FROM {quote(table_name)}"
+                ).fetchone()
+                if minimum is not None:
+                    ranges.append(f"{column_name}={minimum}..{maximum}")
+            suffix = f" ranges={';'.join(ranges)}" if ranges else ""
+            lines.append(f"TABLE _calendar rows={metadata.row_count} columns=[{column_summary}]{suffix}")
+            continue
+        origin_parts = [f"source={json_value(metadata.source_file)}"]
+        if metadata.source_sheet is not None:
+            origin_parts.append(f"sheet={json_value(metadata.source_sheet)}")
+        if metadata.source_table is not None:
+            origin_parts.append(f"source_table={json_value(metadata.source_table)}")
+        lines.append(f"TABLE {table_name} {' '.join(origin_parts)} rows={metadata.row_count}")
+        for column_name, data_type in typed_columns:
+            original = metadata.original_columns.get(column_name, column_name)
+            details = [f"COL {column_name} {data_type}"]
+            if original != column_name:
+                details.append(f"original={json_value(original)}")
+            upper_type = data_type.upper()
+            if any(token in upper_type for token in ("INT", "DECIMAL", "DOUBLE", "FLOAT", "REAL", "DATE", "TIMESTAMP")):
+                minimum, maximum = connection.execute(
+                    f"SELECT MIN({quote(column_name)}), MAX({quote(column_name)}) FROM {quote(table_name)}"
+                ).fetchone()
+                if minimum is not None:
+                    details.append(f"range={minimum}..{maximum}")
+            elif any(token in upper_type for token in ("VARCHAR", "CHAR", "TEXT", "STRING")):
+                cardinality = connection.execute(
+                    f"SELECT COUNT(DISTINCT {quote(column_name)}) FROM {quote(table_name)} "
+                    f"WHERE {quote(column_name)} IS NOT NULL"
+                ).fetchone()[0]
+                if cardinality <= 30:
+                    values = [
+                        row[0]
+                        for row in connection.execute(
+                            f"SELECT DISTINCT {quote(column_name)} FROM {quote(table_name)} "
+                            f"WHERE {quote(column_name)} IS NOT NULL ORDER BY {quote(column_name)}"
+                        ).fetchall()
+                    ]
+                    details.append(f"values={json_value(values)}")
+            coercion = metadata.coerced_columns.get(column_name)
+            if coercion:
+                details.append(f"coerced={json_value(coercion)}")
+            lines.append(" ".join(details))
+        ordered_names = [name for name, _ in typed_columns]
+        if ordered_names:
+            select_columns = ",".join(quote(name) for name in ordered_names)
+            order_columns = ",".join(f"{quote(name)} NULLS LAST" for name in ordered_names)
+            samples = connection.execute(
+                f"SELECT {select_columns} FROM {quote(table_name)} ORDER BY {order_columns} LIMIT 3"
+            ).fetchall()
+            for sample in samples:
+                row = {name: value for name, value in zip(ordered_names, sample)}
+                lines.append(f"ROW {json_value(row)}")
+        if metadata.etl_warnings:
+            lines.append(f"WARNINGS {json_value(sorted(metadata.etl_warnings))}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ import tempfile
 import unicodedata
 import unittest
 
+import duckdb
 import pandas as pd
 
 from src.executor import (
@@ -158,6 +159,53 @@ final_result = {"row": row, "ref_year": ref.year}
         )
         self.assertTrue(res.success)
         self.assertEqual(res.return_value, {"row": 42, "ref_year": 2024})
+
+    def test_execute_subprocess_injects_read_only_duckdb_connection(self):
+        database_path = Path(self.data_dir) / "business.duckdb"
+        connection = duckdb.connect(str(database_path))
+        try:
+            connection.execute("CREATE TABLE sales(amount INTEGER)")
+            connection.execute("INSERT INTO sales VALUES (40), (2)")
+        finally:
+            connection.close()
+        result = execute_subprocess(
+            'FINAL_ANSWER = {"type": "number", "answer": DUCKDB_CONN.execute("SELECT SUM(amount) FROM sales").fetchone()[0]}',
+            data_dir=self.data_dir,
+            duckdb_path=database_path,
+        )
+        self.assertTrue(result.success, result.stderr)
+        self.assertEqual(result.return_value, {"type": "number", "answer": 42})
+        denied = execute_subprocess(
+            'DUCKDB_CONN.execute("CREATE TABLE forbidden(value INTEGER)")\nFINAL_ANSWER = {"type": "number", "answer": 1}',
+            data_dir=self.data_dir,
+            duckdb_path=database_path,
+        )
+        self.assertFalse(denied.success)
+        self.assertIn("read-only", denied.stderr.lower())
+
+    def test_local_executors_inject_read_only_duckdb_connection(self):
+        database_path = Path(self.data_dir) / "local.duckdb"
+        connection = duckdb.connect(str(database_path))
+        try:
+            connection.execute("CREATE TABLE values_table(value INTEGER)")
+            connection.execute("INSERT INTO values_table VALUES (20), (22)")
+        finally:
+            connection.close()
+        code = 'FINAL_ANSWER = DUCKDB_CONN.execute("SELECT SUM(value) FROM values_table").fetchone()[0]'
+        success, result, error = execute_local(
+            code,
+            data_dir=self.data_dir,
+            duckdb_path=database_path,
+        )
+        self.assertTrue(success, error)
+        self.assertEqual(result, 42)
+        sandbox_result = SandboxedExecutor().execute(
+            code,
+            data_dir=self.data_dir,
+            duckdb_path=database_path,
+        )
+        self.assertTrue(sandbox_result.success, sandbox_result.error)
+        self.assertEqual(sandbox_result.result, 42)
 
     def test_execute_subprocess_file_map_aliases(self):
         """File aliases in FILE_MAP should be injected directly as variables in subprocess."""

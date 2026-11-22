@@ -15,6 +15,7 @@ import pandas as pd
 
 from src.agent import CodeAgent, DEFAULT_ABSTAIN_THRESHOLD, verification_gate
 from src.evaluator import (
+    analyze_hybrid_results,
     evaluate_submission,
     is_answer_match,
     print_evaluation_report,
@@ -64,6 +65,8 @@ class TestIsAnswerMatch(unittest.TestCase):
         t3 = {"columns": ["Ten", "Tuoi"], "rows": [["An", 21], ["Binh", 25]]}
         self.assertTrue(is_answer_match(t1, t2))
         self.assertFalse(is_answer_match(t1, t3))
+        duplicate_rows = {"columns": ["Ten", "Tuoi"], "rows": [["An", 20], ["An", 20], ["Binh", 25]]}
+        self.assertTrue(is_answer_match(duplicate_rows, t1, q_type="table"))
 
     def test_abstain_matching(self):
         self.assertTrue(is_answer_match("abstain", "abstain"))
@@ -163,6 +166,89 @@ class TestEvaluateSubmission(unittest.TestCase):
         self.assertEqual(summary["wrong"], 1)
         self.assertEqual(summary["penalized_score"], 0.0)
         self.assertEqual(summary["penalized_accuracy"], 0.0)
+
+    def test_unanswerable_record_without_answer_is_correct(self):
+        gt_file = self.temp_path / "gt_unanswerable.jsonl"
+        sub_file = self.temp_path / "sub_unanswerable.jsonl"
+        self._write_jsonl(gt_file, [{"id": "u1", "type": "unanswerable"}])
+        self._write_jsonl(sub_file, [{"id": "u1", "type": "unanswerable", "reason": "Thiếu dữ liệu"}])
+        summary = evaluate_submission(sub_file, gt_file)
+        self.assertEqual(summary["correct"], 1)
+        self.assertEqual(summary["penalized_accuracy"], 1.0)
+
+    def test_adaptive_hybrid_route_analysis(self):
+        answers_file = self.temp_path / "answers.jsonl"
+        submission_file = self.temp_path / "submission.jsonl"
+        logs_dir = self.temp_path / "logs"
+        logs_dir.mkdir()
+        answers = [
+            {"id": "q1", "type": "number", "answer": 10, "question": "simple correct"},
+            {"id": "q2", "type": "number", "answer": 20, "question": "simple wrong"},
+            {"id": "q3", "type": "string", "answer": "A", "question": "escalated"},
+            {"id": "q4", "type": "boolean", "answer": True, "question": "dual matched"},
+            {"id": "q5", "type": "unanswerable", "question": "missing data"},
+            {"id": "q6", "type": "date", "answer": "2024-01-01", "question": "python first"},
+        ]
+        submissions = [
+            {"id": "q1", "type": "number", "answer": 10},
+            {"id": "q2", "type": "number", "answer": 21},
+            {"id": "q3", "type": "abstain"},
+            {"id": "q4", "type": "boolean", "answer": True},
+            {"id": "q5", "type": "number", "answer": 1},
+            {"id": "q6", "type": "date", "answer": "2024-01-01"},
+        ]
+        route_traces = [
+            {"route_initial": "SQL_FAST", "escalated": False, "final_stage": "SQL_FAST"},
+            {"route_initial": "SQL_FAST", "escalated": False, "final_stage": "SQL_FAST"},
+            {"route_initial": "SQL_FAST", "escalated": True, "final_stage": "PYTHON_VERIFY"},
+            {"route_initial": "HYBRID_DUAL", "escalated": False, "final_stage": "HYBRID_DUAL"},
+            {"route_initial": "HYBRID_DUAL", "escalated": False, "final_stage": "ADJUDICATOR"},
+            {"route_initial": "PYTHON_FIRST", "escalated": False, "final_stage": "PYTHON_FIRST"},
+        ]
+        logs = [
+            {
+                "id": f"q{index}",
+                "answer": submissions[index - 1],
+                "elapsed_ms": index * 10,
+                "thinking": None,
+                "code": None,
+                "output": None,
+                "route_trace": route_traces[index - 1],
+            }
+            for index in range(1, 7)
+        ]
+        self._write_jsonl(answers_file, answers)
+        self._write_jsonl(submission_file, submissions)
+        self._write_jsonl(logs_dir / "predictions.jsonl", logs)
+
+        report = analyze_hybrid_results(submission_file, answers_file, logs_dir)
+        overview = report["overview"]
+        self.assertEqual(overview["correct"], 3)
+        self.assertEqual(overview["wrong"], 2)
+        self.assertEqual(overview["abstain"], 1)
+        self.assertAlmostEqual(overview["penalized_accuracy"], 1.0 / 6.0, places=4)
+        self.assertEqual(overview["avg_elapsed_ms"], 35.0)
+        self.assertEqual(overview["p95_elapsed_ms"], 60.0)
+        self.assertEqual(overview["estimated_private_500_seconds"], 17.5)
+        routes = report["route_breakdown"]
+        self.assertEqual(routes["SQL_FAST_CLEAN"]["count"], 2)
+        self.assertEqual(routes["SQL_FAST_CLEAN"]["wrong_rate"], 0.5)
+        self.assertEqual(routes["SQL_FAST_ESCALATED"]["abstain"], 1)
+        self.assertEqual(routes["HYBRID_DUAL_MATCHED"]["correct"], 1)
+        self.assertEqual(routes["HYBRID_DUAL_ADJUDICATOR"]["wrong"], 1)
+        self.assertEqual(routes["PYTHON_FIRST"]["correct"], 1)
+        errors = report["error_analysis"]
+        self.assertEqual(errors["sql_fast_clean"]["wrong_rate"], 0.5)
+        self.assertEqual(errors["false_answer_on_unanswerable"]["rate"], 1.0)
+        self.assertEqual(errors["by_type"]["number"]["wrong_rate"], 0.5)
+        (logs_dir / "runtime_metrics.json").write_text(
+            json.dumps({"worker_count": 2, "load_model_ms": 1000}),
+            encoding="utf-8",
+        )
+        parallel_report = analyze_hybrid_results(submission_file, answers_file, logs_dir)
+        self.assertEqual(parallel_report["overview"]["estimated_worker_count"], 2)
+        self.assertEqual(parallel_report["overview"]["load_model_ms"], 1000.0)
+        self.assertEqual(parallel_report["overview"]["estimated_private_500_seconds"], 9.75)
 
     def test_type_breakdown_and_report_printing(self):
         """Ensure type breakdown dictionary is populated for all standard types and report prints cleanly."""
